@@ -13,9 +13,8 @@ Currently in its early stage, it supports two types of attention analysis for th
 
 Check out our demo video to see VLAExplain in action:
 
-<video src="assets/demos/demo_video.mp4" controls width="100%">
-  Your browser does not support the video tag.
-</video>
+<img src="assets/demos/demo_gif.gif" alt="Demo GIF" width="100%" />
+
 
 ---
 
