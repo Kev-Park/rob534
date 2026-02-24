@@ -11,9 +11,9 @@ Currently in its early stage, it supports two types of attention analysis for th
 
 ## 🎥 Demo
 
-Check out our demo video to see VLAExplain in action:
+Check out our demo to see VLAExplain in action:
 
-<img src="assets/demos/demo_gif.gif" alt="Demo GIF" width="100%" />
+<img src="assets/demo_gif.gif" alt="Demo GIF" width="100%" />
 
 
 ---
