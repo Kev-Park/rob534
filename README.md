@@ -108,6 +108,8 @@ Launch the attention visualization tool with:
 bash run_app.sh
 ```
 
+### Supported Features
+
 | Feature                 | Action Attribution | Cross-Modal Attention |
 |-------------------------|--------------------|-----------------------|
 | Step Selector           | ✅                 | ✅                    |
@@ -133,6 +135,8 @@ bash run_app.sh
 ## 🙌 Support the Project
 
 If you find VLAExplain useful, please give us a ⭐ on GitHub!
+
+We warmly welcome everyone to contribute to the development of VLAExplain! 
 
 ---
 
