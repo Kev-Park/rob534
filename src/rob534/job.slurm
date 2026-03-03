@@ -17,3 +17,6 @@ module load anaconda3/2025.6
 
 conda activate rob534
 
+export HF_HOME="/scratch/network/kp0374/.cache/huggingface"
+
+python lerobot/scripts/serve_policy.py --policy.path lerobot/pi05_base --policy.device cuda --policy.dtype bfloat16 --port 8000
