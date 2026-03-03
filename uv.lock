@@ -456,6 +456,15 @@ wheels = [
 ]
 
 [[package]]
+name = "feetech-servo-sdk"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyserial" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/8e/c53d6f9a8bf3a86a635b58eeb675723f1b040f1665a0681467756c8989aa/feetech-servo-sdk-1.0.0.tar.gz", hash = "sha256:d4d3832e4b1b22a8222133a414db9f868224c2fb639426a1b11d96ddfe84e69c", size = 8392, upload-time = "2022-11-08T03:44:45.269Z" }
+
+[[package]]
 name = "filelock"
 version = "3.25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -857,6 +866,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2d/b8/3278777bcc001e9c6ae35bab57638f036af6931d8630549cc66ea616b4d7/lerobot-0.4.4.tar.gz", hash = "sha256:50ad61441b1e1260010031406ca836a514af20ae1d2c0149892fe040380b1016", size = 842972, upload-time = "2026-02-27T18:07:46.142Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/2d/2c43b7d99346b04925313f485b8f99596aeb8094f556d4312da9f2e1ca60/lerobot-0.4.4-py3-none-any.whl", hash = "sha256:e53800ead8216861540ad3aebaf12e3cf87a399b3c1f234eeead33716c9c24fd", size = 1078897, upload-time = "2026-02-27T18:07:44.028Z" },
+]
+
+[package.optional-dependencies]
+feetech = [
+    { name = "feetech-servo-sdk" },
 ]
 
 [[package]]
@@ -2073,11 +2087,11 @@ name = "rob534"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "lerobot" },
+    { name = "lerobot", extra = ["feetech"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "lerobot", specifier = ">=0.4.4" }]
+requires-dist = [{ name = "lerobot", extras = ["feetech"], specifier = ">=0.4.4" }]
 
 [[package]]
 name = "safetensors"
