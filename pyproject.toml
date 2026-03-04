@@ -8,3 +8,6 @@ dependencies = [
     "grpcio>=1.78.0",
     "lerobot[feetech]>=0.4.4",
 ]
+
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot.git" }
