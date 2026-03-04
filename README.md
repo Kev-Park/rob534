@@ -13,7 +13,8 @@ ROB534 final project @ Princeton. Designed to run on an SO101 (follower + leader
 7. Calibrate the follower (SO101) using the tutorial [here](https://huggingface.co/docs/lerobot/so101) and validate camera functionality using the tutorial [here](https://huggingface.co/docs/lerobot/cameras).
 
 ## Running Async Inference
-1. With the environment activated run ```
+1. With the environment activated run 
+```
 uv run python -m lerobot.async_inference.robot_client \
     --server_address=localhost:8000 \
     --robot.type=so101_follower \ 
