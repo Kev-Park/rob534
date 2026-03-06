@@ -15,11 +15,14 @@ ROB534 final project @ Princeton. Designed to run on an SO101 (follower + leader
 ## Running Async Inference
 1. With the environment activated run 
 ```
-uv run python -m lerobot.async_inference.robot_client \
-    --server_address=localhost:8000 \
-    --robot.type=so101_follower \ 
-    --robot.port=COM11 \
-    --robot.id=kevin_follower \
-    --robot.cameras="{laptop:{type:opencv, index_or_path: 0, width:640, height:480, fps:30}}" \
+uv run python -m lerobot.async_inference.robot_client
+    --server_address=localhost:8000 
+    --robot.type=so101_follower 
+    --robot.port=COM11 
+    --robot.id=kevin_follower 
+    --robot.cameras="{'laptop':{'type':'opencv','index_or_path':0,'width':640,'height':480,'fps':30}}"
     --task="Stack the blocks"
+    --policy_type=pi05
+    --pretrained_name_or_path=lerobot/pi05_base
+    --actions_per_chunk=50
 ```
