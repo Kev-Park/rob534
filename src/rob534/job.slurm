@@ -20,4 +20,4 @@ conda activate rob534
 export HF_HOME="/scratch/network/kp0374/.cache/huggingface"
 
 
-uv run python -m lerobot.async_inference.policy_server   --host=0.0.0.0 --port=8080 --fps=30 --inference_latency=0.033 --obs_queue_timeout=1
+uv run python -m lerobot.async_inference.policy_server   --host=0.0.0.0 --port=8000 --fps=30 --inference_latency=0.033 --obs_queue_timeout=1

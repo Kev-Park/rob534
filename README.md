@@ -26,3 +26,10 @@ uv run python -m lerobot.async_inference.robot_client
     --pretrained_name_or_path=lerobot/pi05_base
     --actions_per_chunk=50
 ```
+
+uv run python -m lerobot.async_inference.policy_server 
+      --host=0.0.0.0 
+      --port=8080 
+      --fps=30 
+      --inference_latency=0.033 
+      --obs_queue_timeout=1
