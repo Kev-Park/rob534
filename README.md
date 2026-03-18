@@ -15,16 +15,18 @@ ROB534 final project @ Princeton. Designed to run on an SO101 (follower + leader
 ## Running Async Inference
 1. With the environment activated run 
 ```
-uv run python -m lerobot.async_inference.robot_client
-    --server_address=localhost:8000 
-    --robot.type=so101_follower 
-    --robot.port=COM11 
-    --robot.id=kevin_follower 
-    --robot.cameras="{'laptop':{'type':'opencv','index_or_path':0,'width':640,'height':480,'fps':30}}"
-    --task="Stack the blocks"
-    --policy_type=pi05
-    --pretrained_name_or_path=lerobot/pi05_base
-    --actions_per_chunk=50
+uv run python -m lerobot.async_inference.robot_client 
+--server_address=localhost:8000 
+--robot.type=so101_follower 
+--robot.port=COM11 
+--robot.id=kevin_follower 
+--robot.cameras="{\"camera1\":{\"type\":\"opencv\",\"index_or_path\":0,\"width\":640,\"height\":480,\"fps\":30}}" 
+--task="stack the blocks" 
+--policy_type=smolvla 
+--pretrained_name_or_path=/scratch/network/kp0374/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205 
+--actions_per_chunk=5 
+--chunk_size_threshold=1 
+--policy_device=cuda
 ```
 
 uv run python -m lerobot.async_inference.policy_server 
