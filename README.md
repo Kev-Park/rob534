@@ -13,7 +13,17 @@ ROB534 final project @ Princeton. Designed to run on an SO101 (follower + leader
 7. Calibrate the follower (SO101) using the tutorial [here](https://huggingface.co/docs/lerobot/so101) and validate camera functionality using the tutorial [here](https://huggingface.co/docs/lerobot/cameras).
 
 ## Running Async Inference
-1. With the environment activated run 
+1. Connect your local device to the cluster you will be running async inference with. Run `ssh -L 8000:localhost:8000 yournetid@nodewithinternetaccess.princeton.edu` **locally**. This will tell your local device to stream outputs from the async inference server's port 8000 to your local port 8000 to act as a communication interface.
+2. With the environment activated run the following command **remotely**; this command will spin up a policy server that will asynchronously run inference. The resultant policy server is generic; it has no policy or task specified as this information will be sent by client.
+```
+uv run python -m lerobot.async_inference.policy_server 
+      --host=0.0.0.0 
+      --port=8000 
+      --fps=30 
+      --inference_latency=0.033 
+      --obs_queue_timeout=1
+```
+3. With the environment activated run the following command **locally**; this command spins up a client for the policy server. The client first tells the async inference server the desired configuration (the specified task, policy, hardware acceleration) and then will send observations + receive actions from the async inference server.
 ```
 uv run python -m lerobot.async_inference.robot_client 
 --server_address=localhost:8000 
@@ -23,17 +33,9 @@ uv run python -m lerobot.async_inference.robot_client
 --robot.cameras="{\"camera1\":{\"type\":\"opencv\",\"index_or_path\":0,\"width\":640,\"height\":480,\"fps\":30}}" 
 --task="stack the blocks" 
 --policy_type=smolvla 
+
 --pretrained_name_or_path=/scratch/network/kp0374/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205 
 --actions_per_chunk=5 
 --chunk_size_threshold=1 
 --policy_device=cuda
 ```
-
-```
-uv run python -m lerobot.async_inference.policy_server 
-      --host=0.0.0.0 
-      --port=8080 
-      --fps=30 
-      --inference_latency=0.033 
-      --obs_queue_timeout=1
-``
