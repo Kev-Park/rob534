@@ -2,4 +2,4 @@ lerobot-teleoperate --robot.type=so101_follower --robot.port=COM5 --robot.id=stu
 
 lerobot-record --robot.type=so101_follower --robot.port=COM5 --robot.id=student_arm --teleop.type=so101_leader --teleop.port=COM4 --teleop.id=teacher_arm --robot.cameras="{front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" --display_data=true --dataset.repo_id=nc8304/so101_test --dataset.num_episodes=5 --dataset.single_task="Testing" --dataset.streaming_encoding=true --dataset.encoder_threads=2
 
-lerobot-replay --robot.type=so101_follower --robot.port=COM5 --robot.id=student_arm --dataset.repo_id=nc8304/so101 --dataset.episode=0
+lerobot-replay-+ --robot.type=so101_follower --robot.port=COM5 --robot.id=student_arm --dataset.repo_id=nc8304/so101 --dataset.episode=0
