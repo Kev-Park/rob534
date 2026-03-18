@@ -9,7 +9,7 @@ ROB534 final project @ Princeton. Designed to run on an SO101 (follower + leader
 3. If storing the environment in `/scratch/`, run `export UV_CACHE_DIR="/scratch/network/YOUR_PUID/.uv_cache` and `export TMPDIR="/scratch/network/YOUR_PUID/.tmp`. Make sure to create the specified directories.
 4. Run `uv sync` to install the dependencies.
 5. If storing the VLA weights in `/scratch/`, run `export HF_HOME="/scratch/network/YOUR_PUID/.cache/huggingface`. Make sure to create the specified directory.
-6. Install the VLA weights using `uv run huggingface-cli download lerobot/pi05_base`.
+6. Install the VLA weights using `uv run hf download lerobot/pi05_base`.
 7. Calibrate the follower (SO101) using the tutorial [here](https://huggingface.co/docs/lerobot/so101) and validate camera functionality using the tutorial [here](https://huggingface.co/docs/lerobot/cameras).
 
 ## Running Async Inference
