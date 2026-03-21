@@ -5,14 +5,14 @@ import subprocess
 
 ROBOT_DEFAULTS = {
     "type":    "so101_follower",
-    "port":    "COM5",
+    "port":    "/dev/tty.usbmodem5AB01813041", #"COM5",
     "id":      "student_arm",
-    "cameras": "{front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}",
+    "cameras": "{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 10}}",
 }
 
 TELEOP_DEFAULTS = {
     "type": "so101_leader",
-    "port": "COM4",
+    "port": "/dev/tty.usbmodem5A7C1216851", #"COM4",
     "id":   "teacher_arm",
 }
 
@@ -44,6 +44,7 @@ def teleoperate(
         f"--teleop.port={teleop['port']}",
         f"--teleop.id={teleop['id']}",
         f"--robot.cameras={robot['cameras']}",
+        f"--display_data=true"
     ])
 
 

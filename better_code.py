@@ -1,5 +1,9 @@
 import robot_control as rc
 
+REPO_IDS = {
+    "skywalker": "SkywalkerLi/so101_03_21_26_demo1",
+    "nicole": "nc8304/so101_031626"
+}
 
 def do_teleoperate():
     rc.teleoperate()
@@ -14,5 +18,5 @@ def do_replay(repo_id="nc8304/so101", episode=0):
 
 if __name__ == "__main__":
     #do_teleoperate()
-    do_record(repo_id="nc8304/so101_031826_demo1", num_episodes=100, single_task="1st Training ", resume=False) #if file exsists make new one
+    do_record(repo_id=REPO_IDS["skywalker"], num_episodes=100, single_task="1st Training ", resume=False) #if file exsists make new one
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
