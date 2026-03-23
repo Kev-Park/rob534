@@ -33,7 +33,6 @@ uv run python -m lerobot.async_inference.robot_client
 --robot.cameras="{\"camera1\":{\"type\":\"opencv\",\"index_or_path\":0,\"width\":640,\"height\":480,\"fps\":30}}" 
 --task="stack the blocks" 
 --policy_type=smolvla 
-
 --pretrained_name_or_path=/scratch/network/kp0374/.cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205 
 --actions_per_chunk=5 
 --chunk_size_threshold=1 
