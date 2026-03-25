@@ -22,7 +22,7 @@ for 10 episodes.
 
 ```
 lerobot-eval \
-    --policy.path=lerobot/diffusion_pusht \
+    --policy.pretrained_path=lerobot/diffusion_pusht \
     --env.type=pusht \
     --eval.batch_size=10 \
     --eval.n_episodes=10 \
@@ -33,7 +33,7 @@ lerobot-eval \
 OR, you want to evaluate a model checkpoint from the LeRobot training script for 10 episodes.
 ```
 lerobot-eval \
-    --policy.path=outputs/train/diffusion_pusht/checkpoints/005000/pretrained_model \
+    --policy.pretrained_path=outputs/train/diffusion_pusht/checkpoints/005000/pretrained_model \
     --env.type=pusht \
     --eval.batch_size=10 \
     --eval.n_episodes=10 \

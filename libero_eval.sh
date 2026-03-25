@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Set policy path and other configuration variables
+# Set pretrained policy path and other configuration variables
 POLICY_PATH=""
 OUTPUT_DIR="./outputs/"
 DATA_DIR="./analyzer_data/"
@@ -11,6 +11,11 @@ N_ACTION_STEPS=10
 export LEROBOT_DATA_DIR="$DATA_DIR"
 export TORCH_CUDAGRAPHS_DISABLE="1"
 
+if [ -z "$POLICY_PATH" ]; then
+    echo "Error: POLICY_PATH is empty. Set it to your pretrained policy directory (contains config.json and model.safetensors)."
+    exit 1
+fi
+
 
 # Directly run the python command
 echo "Running evaluation..."
@@ -20,7 +25,7 @@ python lerobot/src/lerobot/scripts/lerobot_eval.py \
     --env.task_ids="$TASK_IDS" \
     --eval.batch_size=1 \
     --eval.n_episodes=1 \
-    --policy.path="$POLICY_PATH" \
+    --policy.pretrained_path="$POLICY_PATH" \
     --policy.n_action_steps="$N_ACTION_STEPS" \
     --output_dir="$OUTPUT_DIR" \
     --env.max_parallel_tasks=1

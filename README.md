@@ -76,6 +76,8 @@ cp src/policies/pi05/infer/lerobot_eval.py lerobot/src/lerobot/scripts/lerobot_e
 
 ### Run Inference & Collect Attention Data
 
+Before running, edit `libero_eval.sh` and set `POLICY_PATH` to your pretrained policy directory (it should contain `config.json` and `model.safetensors`).
+
 ```bash
 bash libero_eval.sh
 ```
