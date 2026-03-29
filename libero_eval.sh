@@ -6,6 +6,7 @@ OUTPUT_DIR="./outputs/"
 DATA_DIR="./analyzer_data/"
 TASK_IDS="[0]"
 N_ACTION_STEPS=10
+RENAME_MAP='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.right_wrist_0_rgb"}'
 
 # Export environment variable for LEROBOT_DATA_DIR
 export LEROBOT_DATA_DIR="$DATA_DIR"
@@ -27,6 +28,7 @@ python lerobot/src/lerobot/scripts/lerobot_eval.py \
     --eval.n_episodes=1 \
     --policy.path="$POLICY_PATH" \
     --policy.n_action_steps="$N_ACTION_STEPS" \
+    --rename_map="$RENAME_MAP" \
     --output_dir="$OUTPUT_DIR" \
     --env.max_parallel_tasks=1
 
