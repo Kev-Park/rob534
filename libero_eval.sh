@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set pretrained policy path and other configuration variables
-POLICY_PATH=""
+POLICY_PATH="/scratch/gpfs/TSILVER/kp0374/.cache/huggingface/hub/models--lerobot--pi05_base/snapshots/9e55186ad36e66b95cda57bc47818d9e6237ae30"
 OUTPUT_DIR="./outputs/"
 DATA_DIR="./analyzer_data/"
 TASK_IDS="[0]"
