@@ -25,7 +25,7 @@ python lerobot/src/lerobot/scripts/lerobot_eval.py \
     --env.task_ids="$TASK_IDS" \
     --eval.batch_size=1 \
     --eval.n_episodes=1 \
-    --policy.pretrained_path="$POLICY_PATH" \
+    --policy.path="$POLICY_PATH" \
     --policy.n_action_steps="$N_ACTION_STEPS" \
     --output_dir="$OUTPUT_DIR" \
     --env.max_parallel_tasks=1
