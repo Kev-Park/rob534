@@ -18,7 +18,7 @@ class Settings:
     """System configuration class"""
     
     # Model path configuration
-    TOKENIZER_PATH = os.getenv("TOKENIZER_PATH", "/mnt/data/myapp/model/paligemma-3b-pt-224")
+    TOKENIZER_PATH = os.getenv("TOKENIZER_PATH", "google/paligemma-3b-pt-224")
     
     # Data path configuration
     DATA_MAIN_PATH = Path(os.getenv("LEROBOT_DATA_DIR"))
@@ -101,15 +101,27 @@ class Settings:
     @classmethod
     def validate_paths(cls):
         """Validate whether all paths exist"""
+        # TOKENIZER_PATH can be either a local filesystem path or a Hugging Face model id.
+        # Only enforce existence checks for local paths.
+        missing_paths = []
+
+        tokenizer_path = (cls.TOKENIZER_PATH or "").strip()
+        if not tokenizer_path:
+            missing_paths.append("TOKENIZER_PATH (empty)")
+        else:
+            tokenizer_is_local = os.path.isabs(tokenizer_path) or tokenizer_path.startswith((".", "~"))
+            if tokenizer_is_local:
+                expanded_tokenizer_path = Path(os.path.expanduser(tokenizer_path))
+                if not expanded_tokenizer_path.exists():
+                    missing_paths.append(str(expanded_tokenizer_path))
+
         paths_to_check = [
-            cls.TOKENIZER_PATH,
             cls.RAW_IMAGE_DIR,
             cls.EXPERT_ATTN_DIR,
             cls.LANGUAGE_INFO_PATH,
-            cls.LANGUAGE_ATTN_DIR
+            cls.LANGUAGE_ATTN_DIR,
         ]
-        
-        missing_paths = []
+
         for path in paths_to_check:
             if not Path(path).exists():
                 missing_paths.append(str(path))
