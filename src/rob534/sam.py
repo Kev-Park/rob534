@@ -15,6 +15,8 @@ SCORE_THRESHOLD = float(os.environ.get("SAM3_SCORE_THRESHOLD", "0.05"))
 # Mask threshold binarizes per-pixel mask logits.
 MASK_THRESHOLD = float(os.environ.get("SAM3_MASK_THRESHOLD", "0.5"))
 PRINT_DEBUG = os.environ.get("SAM3_DEBUG", "1") == "1"
+TRACK_SINGLE_INSTANCE = os.environ.get("SAM3_SINGLE_INSTANCE", "1") == "1"
+TRACK_IOU_WEIGHT = float(os.environ.get("SAM3_TRACK_IOU_WEIGHT", "0.5"))
 MODEL_REF = os.environ.get("SAM3_MODEL_REF", "facebook/sam3")
 MODEL_PATH = os.environ.get("SAM3_MODEL_PATH")
 HF_CACHE_DIR = os.environ.get("HF_HOME")
@@ -60,6 +62,14 @@ def resolve_local_sam3_source() -> str:
 MODEL_SOURCE = resolve_local_sam3_source()
 
 
+def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    intersection = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 0.0
+    return float(intersection / union)
+
+
 def resolve_video_path(path_value: str, *, must_exist: bool) -> Path:
     candidate = Path(path_value).expanduser()
     if candidate.is_absolute():
@@ -83,7 +93,7 @@ print(f"Input video: {VIDEO_INPUT_PATH}")
 print(f"Output video: {VIDEO_OUTPUT_PATH}")
 print(
     f"Prompt='{TEXT_PROMPT}', score_threshold={SCORE_THRESHOLD}, "
-    f"mask_threshold={MASK_THRESHOLD}"
+    f"mask_threshold={MASK_THRESHOLD}, single_instance={TRACK_SINGLE_INSTANCE}"
 )
 
 # 1. Load SAM 3 from Hugging Face
@@ -140,6 +150,7 @@ print(f"Processing video with prompt: '{TEXT_PROMPT}'...")
 
 frame_idx = 0
 masked_frame_count = 0
+previous_mask: np.ndarray | None = None
 
 try:
     frame = first_frame
@@ -175,8 +186,25 @@ try:
         has_masks = masks is not None and len(masks) > 0
 
         if has_masks:
-            # Combine all instance masks into one boolean mask
-            combined_mask = torch.any(masks, dim=0).cpu().numpy().astype(bool)
+            candidate_masks = masks.detach().cpu().numpy().astype(bool)
+            scores = results.get("scores")
+            if scores is None or len(scores) != len(candidate_masks):
+                score_values = np.ones(len(candidate_masks), dtype=np.float32)
+            else:
+                score_values = scores.detach().cpu().numpy()
+
+            if TRACK_SINGLE_INSTANCE:
+                if previous_mask is None:
+                    selected_idx = int(np.argmax(score_values))
+                else:
+                    iou_values = np.array([mask_iou(previous_mask, m) for m in candidate_masks], dtype=np.float32)
+                    rank_values = score_values + (TRACK_IOU_WEIGHT * iou_values)
+                    selected_idx = int(np.argmax(rank_values))
+                combined_mask = candidate_masks[selected_idx]
+                previous_mask = combined_mask.copy()
+            else:
+                combined_mask = np.any(candidate_masks, axis=0)
+                previous_mask = None
 
             # Apply a semi-transparent blue tint to the mask area
             mask_color = np.array([255, 100, 0], dtype=np.uint8)  # BGR tint
@@ -185,6 +213,8 @@ try:
                 np.full_like(overlay[combined_mask], mask_color), 0.5, 0
             )
             masked_frame_count += 1
+        else:
+            previous_mask = None
 
         if frame_idx % 30 == 0:
             if PRINT_DEBUG:
@@ -197,7 +227,10 @@ try:
                 max_score = float(debug_scores.max().item()) if debug_scores is not None and len(debug_scores) > 0 else 0.0
                 kept = 0 if masks is None else len(masks)
                 total = 0 if debug_scores is None else len(debug_scores)
-                print(f"frame={frame_idx} masks={kept} candidates={total} max_score={max_score:.4f}")
+                print(
+                    f"frame={frame_idx} masks={kept} candidates={total} "
+                    f"max_score={max_score:.4f} tracked_single={TRACK_SINGLE_INSTANCE}"
+                )
             else:
                 instance_count = 0 if masks is None else len(masks)
                 print(f"frame={frame_idx} masks={instance_count}")
