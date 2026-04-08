@@ -1,6 +1,7 @@
 import cv2
 import torch
 import numpy as np
+import os
 from PIL import Image
 from transformers import Sam3Processor, Sam3Model
 
@@ -9,14 +10,46 @@ TEXT_PROMPT = "the block gripped by the gripper"
 VIDEO_INPUT = "file-000.mp4"
 VIDEO_OUTPUT = "file-000-segmented.mp4"
 MASK_THRESHOLD = 0.3
+MODEL_REF = os.environ.get("SAM3_MODEL_REF", "facebook/sam3")
+HF_CACHE_DIR = os.environ.get("HF_HOME")
+
+# Default to local-only loading on cluster jobs, or when offline env vars are set.
+SAM3_LOCAL_ONLY = os.environ.get("SAM3_LOCAL_ONLY")
+if SAM3_LOCAL_ONLY is None:
+    SAM3_LOCAL_ONLY = (
+        os.environ.get("HF_HUB_OFFLINE") == "1"
+        or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+        or os.environ.get("SLURM_JOB_ID") is not None
+    )
+else:
+    SAM3_LOCAL_ONLY = SAM3_LOCAL_ONLY == "1"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 # 1. Load SAM 3 from Hugging Face
 # SAM 3 natively understands text, so no Grounding DINO is needed.
-model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-processor = Sam3Processor.from_pretrained("facebook/sam3")
+print(
+    f"Loading SAM3 from '{MODEL_REF}' "
+    f"(local_only={SAM3_LOCAL_ONLY}, cache_dir={HF_CACHE_DIR})"
+)
+try:
+    model = Sam3Model.from_pretrained(
+        MODEL_REF,
+        cache_dir=HF_CACHE_DIR,
+        local_files_only=SAM3_LOCAL_ONLY,
+    ).to(device)
+    processor = Sam3Processor.from_pretrained(
+        MODEL_REF,
+        cache_dir=HF_CACHE_DIR,
+        local_files_only=SAM3_LOCAL_ONLY,
+    )
+except OSError as exc:
+    raise RuntimeError(
+        "Failed to load SAM3 locally. On an internet-enabled node, pre-download with: "
+        "uv run hf download facebook/sam3 --repo-type model. "
+        "Then rerun this job with HF_HOME pointing at that cache and offline env vars enabled."
+    ) from exc
 
 # 2. Open Video
 cap = cv2.VideoCapture(VIDEO_INPUT)

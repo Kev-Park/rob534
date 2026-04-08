@@ -18,6 +18,10 @@ module load anaconda3/2025.6
 #conda activate rob534
 
 export HF_HOME="/scratch/gpfs/TSILVER/kp0374/.cache/huggingface"
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export SAM3_LOCAL_ONLY=1
+export SAM3_MODEL_REF="facebook/sam3"
 
  
 #uv run python -m lerobot.async_inference.policy_server   --host=0.0.0.0 --port=8000 --fps=30 --inference_latency=0.033 --obs_queue_timeout=1
