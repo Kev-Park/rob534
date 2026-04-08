@@ -55,8 +55,28 @@ def resolve_local_sam3_source() -> str:
 
 MODEL_SOURCE = resolve_local_sam3_source()
 
+
+def resolve_video_path(path_value: str, *, must_exist: bool) -> Path:
+    candidate = Path(path_value).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate
+    else:
+        resolved = (Path.cwd() / candidate)
+
+    resolved = resolved.resolve()
+    if must_exist and not resolved.is_file():
+        raise FileNotFoundError(f"Video path does not exist: {resolved}")
+    return resolved
+
+
+VIDEO_INPUT_PATH = resolve_video_path(os.environ.get("SAM3_VIDEO_INPUT", VIDEO_INPUT), must_exist=True)
+VIDEO_OUTPUT_PATH = resolve_video_path(os.environ.get("SAM3_VIDEO_OUTPUT", VIDEO_OUTPUT), must_exist=False)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+print(f"Working directory: {Path.cwd()}")
+print(f"Input video: {VIDEO_INPUT_PATH}")
+print(f"Output video: {VIDEO_OUTPUT_PATH}")
 
 # 1. Load SAM 3 from Hugging Face
 # SAM 3 natively understands text, so no Grounding DINO is needed.
@@ -85,13 +105,28 @@ except OSError as exc:
     ) from exc
 
 # 2. Open Video
-cap = cv2.VideoCapture(VIDEO_INPUT)
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps    = cap.get(cv2.CAP_PROP_FPS)
+cap = cv2.VideoCapture(str(VIDEO_INPUT_PATH))
+if not cap.isOpened():
+    raise RuntimeError(f"Failed to open video: {VIDEO_INPUT_PATH}")
+
+ret, first_frame = cap.read()
+if not ret:
+    cap.release()
+    raise RuntimeError(
+        "Failed to decode first frame from input video. The cluster OpenCV/FFmpeg build likely cannot decode AV1. "
+        "Pre-convert input to H.264 (for example with src/rob534/utils.py)."
+    )
+
+height, width = first_frame.shape[:2]
+fps = cap.get(cv2.CAP_PROP_FPS)
+if fps <= 0:
+    fps = 30.0
 
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(VIDEO_OUTPUT, fourcc, fps, (width, height))
+out = cv2.VideoWriter(str(VIDEO_OUTPUT_PATH), fourcc, fps, (width, height))
+if not out.isOpened():
+    cap.release()
+    raise RuntimeError(f"Failed to open output writer: {VIDEO_OUTPUT_PATH}")
 
 print(f"Processing video with prompt: '{TEXT_PROMPT}'...")
 
@@ -99,10 +134,12 @@ frame_idx = 0
 masked_frame_count = 0
 
 try:
+    frame = first_frame
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if frame is None:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
         # Convert BGR (OpenCV) to RGB (PIL)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -146,6 +183,7 @@ try:
 
         out.write(overlay)
         frame_idx += 1
+        frame = None
 
 except KeyboardInterrupt:
     print("Interrupted by user; finalizing partial video output...")
@@ -154,5 +192,5 @@ finally:
     out.release()
     print(
         f"Finished. wrote_frames={frame_idx}, masked_frames={masked_frame_count}, "
-        f"output={VIDEO_OUTPUT}"
+        f"output={VIDEO_OUTPUT_PATH}"
     )
