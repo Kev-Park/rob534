@@ -2,6 +2,7 @@ import cv2
 import torch
 import numpy as np
 import os
+from pathlib import Path
 from PIL import Image
 from transformers import Sam3Processor, Sam3Model
 
@@ -11,6 +12,7 @@ VIDEO_INPUT = "file-000.mp4"
 VIDEO_OUTPUT = "file-000-segmented.mp4"
 MASK_THRESHOLD = 0.3
 MODEL_REF = os.environ.get("SAM3_MODEL_REF", "facebook/sam3")
+MODEL_PATH = os.environ.get("SAM3_MODEL_PATH")
 HF_CACHE_DIR = os.environ.get("HF_HOME")
 
 # Default to local-only loading on cluster jobs, or when offline env vars are set.
@@ -24,31 +26,62 @@ if SAM3_LOCAL_ONLY is None:
 else:
     SAM3_LOCAL_ONLY = SAM3_LOCAL_ONLY == "1"
 
+
+def resolve_local_sam3_source() -> str:
+    """Resolve a local SAM3 snapshot path when the repo was downloaded ahead of time."""
+    if MODEL_PATH:
+        candidate = Path(MODEL_PATH).expanduser()
+        if candidate.is_dir():
+            return str(candidate)
+
+    candidate = Path(MODEL_REF).expanduser()
+    if candidate.is_dir():
+        return str(candidate)
+
+    if HF_CACHE_DIR:
+        snapshots_dir = Path(HF_CACHE_DIR).expanduser() / "hub" / "models--facebook--sam3" / "snapshots"
+        if snapshots_dir.is_dir():
+            snapshots = sorted(
+                (path for path in snapshots_dir.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for snapshot_dir in snapshots:
+                if (snapshot_dir / "config.json").is_file():
+                    return str(snapshot_dir)
+
+    return MODEL_REF
+
+
+MODEL_SOURCE = resolve_local_sam3_source()
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 # 1. Load SAM 3 from Hugging Face
 # SAM 3 natively understands text, so no Grounding DINO is needed.
 print(
-    f"Loading SAM3 from '{MODEL_REF}' "
+    f"Loading SAM3 from '{MODEL_SOURCE}' "
     f"(local_only={SAM3_LOCAL_ONLY}, cache_dir={HF_CACHE_DIR})"
 )
 try:
     model = Sam3Model.from_pretrained(
-        MODEL_REF,
+        MODEL_SOURCE,
         cache_dir=HF_CACHE_DIR,
         local_files_only=SAM3_LOCAL_ONLY,
     ).to(device)
     processor = Sam3Processor.from_pretrained(
-        MODEL_REF,
+        MODEL_SOURCE,
         cache_dir=HF_CACHE_DIR,
         local_files_only=SAM3_LOCAL_ONLY,
     )
 except OSError as exc:
     raise RuntimeError(
-        "Failed to load SAM3 locally. On an internet-enabled node, pre-download with: "
+        "Failed to load SAM3 locally. Make sure the full repository snapshot exists under "
+        "HF_HOME/hub/models--facebook--sam3/snapshots/<sha>/ and contains config.json plus processor files. "
+        "If you need to refresh the cache, download the complete repo on an internet-enabled node with: "
         "uv run hf download facebook/sam3 --repo-type model. "
-        "Then rerun this job with HF_HOME pointing at that cache and offline env vars enabled."
+        "You can also set SAM3_MODEL_PATH to the exact local snapshot directory."
     ) from exc
 
 # 2. Open Video
