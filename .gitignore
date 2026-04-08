@@ -209,4 +209,8 @@ __marimo__/
 # camera test outputs
 outputs/
 
+# slurm output
 *.out
+
+# segmentation result
+file-000-segmented.mp4
