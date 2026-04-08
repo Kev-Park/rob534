@@ -5,10 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "grpcio>=1.78.0",
-    "lerobot[feetech]>=0.4.4",
-    "transformers>=5.3.0",
+    "opencv-python>=4.13.0.92",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+    "transformers>=5.4.0",
 ]
 
+[[tool.uv.index]]
+name = "pytorch-cu121" 
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
 [tool.uv.sources]
-lerobot = { git = "https://github.com/huggingface/lerobot.git" }
+torch = { index = "pytorch-cu121" }
