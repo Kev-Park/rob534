@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=pi05     # create a short name for your job
+#SBATCH --job-name=sam     # create a short name for your job
 #SBATCH --nodes=1                # node count
 #SBATCH --ntasks=1               # total number of tasks across all nodes
 #SBATCH --cpus-per-task=8        # cpu-cores per task (>1 if multi-threaded tasks)
@@ -15,7 +15,7 @@
 module purge
 module load anaconda3/2025.6
 
-conda activate rob534
+#conda activate rob534
 
 export HF_HOME="/scratch/network/kp0374/.cache/huggingface"
 
