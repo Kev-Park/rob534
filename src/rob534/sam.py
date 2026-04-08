@@ -7,10 +7,14 @@ from PIL import Image
 from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration ---
-TEXT_PROMPT = "the block gripped by the gripper"
+TEXT_PROMPT = "the block being grasped"
 VIDEO_INPUT = "file-000-h264.mp4"
 VIDEO_OUTPUT = "file-000-segmented.mp4"
-MASK_THRESHOLD = 0.3
+# Score threshold filters predicted instances before mask extraction.
+SCORE_THRESHOLD = float(os.environ.get("SAM3_SCORE_THRESHOLD", "0.05"))
+# Mask threshold binarizes per-pixel mask logits.
+MASK_THRESHOLD = float(os.environ.get("SAM3_MASK_THRESHOLD", "0.5"))
+PRINT_DEBUG = os.environ.get("SAM3_DEBUG", "1") == "1"
 MODEL_REF = os.environ.get("SAM3_MODEL_REF", "facebook/sam3")
 MODEL_PATH = os.environ.get("SAM3_MODEL_PATH")
 HF_CACHE_DIR = os.environ.get("HF_HOME")
@@ -77,6 +81,10 @@ print(f"Using device: {device}")
 print(f"Working directory: {Path.cwd()}")
 print(f"Input video: {VIDEO_INPUT_PATH}")
 print(f"Output video: {VIDEO_OUTPUT_PATH}")
+print(
+    f"Prompt='{TEXT_PROMPT}', score_threshold={SCORE_THRESHOLD}, "
+    f"mask_threshold={MASK_THRESHOLD}"
+)
 
 # 1. Load SAM 3 from Hugging Face
 # SAM 3 natively understands text, so no Grounding DINO is needed.
@@ -155,7 +163,8 @@ try:
         # Returns masks for each detected instance of the prompt target
         results = processor.post_process_instance_segmentation(
             outputs,
-            threshold=MASK_THRESHOLD,
+            threshold=SCORE_THRESHOLD,
+            mask_threshold=MASK_THRESHOLD,
             target_sizes=[(height, width)]
         )[0]
 
@@ -178,8 +187,20 @@ try:
             masked_frame_count += 1
 
         if frame_idx % 30 == 0:
-            instance_count = 0 if masks is None else len(masks)
-            print(f"frame={frame_idx} masks={instance_count}")
+            if PRINT_DEBUG:
+                debug_results = processor.post_process_object_detection(
+                    outputs,
+                    threshold=0.0,
+                    target_sizes=[(height, width)],
+                )[0]
+                debug_scores = debug_results.get("scores")
+                max_score = float(debug_scores.max().item()) if debug_scores is not None and len(debug_scores) > 0 else 0.0
+                kept = 0 if masks is None else len(masks)
+                total = 0 if debug_scores is None else len(debug_scores)
+                print(f"frame={frame_idx} masks={kept} candidates={total} max_score={max_score:.4f}")
+            else:
+                instance_count = 0 if masks is None else len(masks)
+                print(f"frame={frame_idx} masks={instance_count}")
 
         out.write(overlay)
         frame_idx += 1
