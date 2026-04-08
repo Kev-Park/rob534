@@ -8,7 +8,7 @@ from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration ---
 TEXT_PROMPT = "the block gripped by the gripper"
-VIDEO_INPUT = "file-000.mp4"
+VIDEO_INPUT = "file-000-h264.mp4"
 VIDEO_OUTPUT = "file-000-segmented.mp4"
 MASK_THRESHOLD = 0.3
 MODEL_REF = os.environ.get("SAM3_MODEL_REF", "facebook/sam3")
