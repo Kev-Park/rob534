@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8        # cpu-cores per task (>1 if multi-threaded tasks)
 #SBATCH --mem=32G         # memory per cpu-core (4G is default)
 #SBATCH --gres=gpu:1             # number of GPUs per node
-#SBATCH --constraint="intel&gpu40"
+#SBATCH --constraint=gpu40
 #SBATCH --time=1:00:00          # total run time limit (HH:MM:SS)
 #SBATCH --mail-type=begin        # send email when job begins
 #SBATCH --mail-type=end          # send email when job ends
@@ -17,7 +17,7 @@ module load anaconda3/2025.6
 
 #conda activate rob534
 
-export HF_HOME="/scratch/network/kp0374/.cache/huggingface"
+export HF_HOME="/scratch/gpfs/TSILVER/kp0374/.cache/huggingface"
 
  
 #uv run python -m lerobot.async_inference.policy_server   --host=0.0.0.0 --port=8000 --fps=30 --inference_latency=0.033 --obs_queue_timeout=1
