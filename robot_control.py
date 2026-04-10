@@ -5,14 +5,14 @@ import subprocess
 
 ROBOT_DEFAULTS = {
     "type":    "so101_follower",
-    "port":    "/dev/tty.usbmodem5AB01813041", #"COM5",
+    "port":    "COM5", #"/dev/tty.usbmodem5AB01813041",
     "id":      "student_arm",
     "cameras": "{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 10}}",
 }
 
 TELEOP_DEFAULTS = {
     "type": "so101_leader",
-    "port": "/dev/tty.usbmodem5A7C1216851", #"COM4",
+    "port": "COM4", #"/dev/tty.usbmodem5A7C1216851",
     "id":   "teacher_arm",
 }
 
