@@ -7,7 +7,7 @@ from PIL import Image
 from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration ---
-TEXT_PROMPT = "the colorful block in contact with the black fingers"#"the block actively being grasped"
+TEXT_PROMPT = "the block held by black fingers"#"the colorful block in contact with the black fingers"#"the block actively being grasped"
 VIDEO_INPUT = "file-000-h264.mp4"
 VIDEO_OUTPUT = "file-000-segmented.mp4"
 # Score threshold filters predicted instances before mask extraction.
