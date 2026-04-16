@@ -41,8 +41,8 @@ def transcode_av1_to_h264(input_path: Path, output_path: Path) -> Path:
 
 
 def main() -> None:
-	default_input = Path("file-000.mp4").resolve()
-	default_output = default_input.with_name("file-000-h264.mp4")
+	default_input = Path("orange1.mp4").resolve()
+	default_output = default_input.with_name("orange1_h264.mp4")
 
 	input_path = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else default_input
 	output_path = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else default_output

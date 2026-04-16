@@ -7,9 +7,11 @@ from PIL import Image
 from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration ---
-TEXT_PROMPT = "gripped block"#"the colorful block in contact with the black fingers"#"the block actively being grasped"
-VIDEO_INPUT = "file-000-h264.mp4"
-VIDEO_OUTPUT = "file-000-segmented.mp4"
+TEXT_PROMPT = "orange block"#"the colorful block in contact with the black fingers"#"the block actively being grasped"
+VIDEO_PAIRS = [
+    ("orange_h264.mp4", "orange_segmented.mp4"),
+    ("orange1_h264.mp4", "orange1_segmented.mp4"),
+]
 # Score threshold filters predicted instances before mask extraction.
 SCORE_THRESHOLD = float(os.environ.get("SAM3_SCORE_THRESHOLD", "0.05"))
 # Mask threshold binarizes per-pixel mask logits.
@@ -83,14 +85,9 @@ def resolve_video_path(path_value: str, *, must_exist: bool) -> Path:
     return resolved
 
 
-VIDEO_INPUT_PATH = resolve_video_path(os.environ.get("SAM3_VIDEO_INPUT", VIDEO_INPUT), must_exist=True)
-VIDEO_OUTPUT_PATH = resolve_video_path(os.environ.get("SAM3_VIDEO_OUTPUT", VIDEO_OUTPUT), must_exist=False)
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 print(f"Working directory: {Path.cwd()}")
-print(f"Input video: {VIDEO_INPUT_PATH}")
-print(f"Output video: {VIDEO_OUTPUT_PATH}")
 print(
     f"Prompt='{TEXT_PROMPT}', score_threshold={SCORE_THRESHOLD}, "
     f"mask_threshold={MASK_THRESHOLD}, single_instance={TRACK_SINGLE_INSTANCE}"
@@ -122,129 +119,135 @@ except OSError as exc:
         "You can also set SAM3_MODEL_PATH to the exact local snapshot directory."
     ) from exc
 
-# 2. Open Video
-cap = cv2.VideoCapture(str(VIDEO_INPUT_PATH))
-if not cap.isOpened():
-    raise RuntimeError(f"Failed to open video: {VIDEO_INPUT_PATH}")
 
-ret, first_frame = cap.read()
-if not ret:
-    cap.release()
-    raise RuntimeError(
-        "Failed to decode first frame from input video. The cluster OpenCV/FFmpeg build likely cannot decode AV1. "
-        "Pre-convert input to H.264 (for example with src/rob534/utils.py)."
-    )
+def process_video(video_input_path: Path, video_output_path: Path) -> None:
+    """Segment a single video using the loaded SAM3 model."""
+    print(f"\n--- Processing: {video_input_path} -> {video_output_path} ---")
 
-height, width = first_frame.shape[:2]
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps <= 0:
-    fps = 30.0
+    cap = cv2.VideoCapture(str(video_input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_input_path}")
 
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(str(VIDEO_OUTPUT_PATH), fourcc, fps, (width, height))
-if not out.isOpened():
-    cap.release()
-    raise RuntimeError(f"Failed to open output writer: {VIDEO_OUTPUT_PATH}")
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        raise RuntimeError(
+            f"Failed to decode first frame from {video_input_path}. The cluster OpenCV/FFmpeg build likely cannot decode AV1. "
+            "Pre-convert input to H.264 (for example with src/rob534/utils.py)."
+        )
 
-print(f"Processing video with prompt: '{TEXT_PROMPT}'...")
+    height, width = first_frame.shape[:2]
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
 
-frame_idx = 0
-masked_frame_count = 0
-previous_mask: np.ndarray | None = None
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(video_output_path), fourcc, fps, (width, height))
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError(f"Failed to open output writer: {video_output_path}")
 
-try:
-    frame = first_frame
-    while cap.isOpened():
-        if frame is None:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    frame_idx = 0
+    masked_frame_count = 0
+    previous_mask: np.ndarray | None = None
 
-        # Convert BGR (OpenCV) to RGB (PIL)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
+    try:
+        frame = first_frame
+        while cap.isOpened():
+            if frame is None:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-        # 3. Inference: Detect and Segment based on text
-        inputs = processor(images=pil_img, text=TEXT_PROMPT, return_tensors="pt").to(device)
+            # Convert BGR (OpenCV) to RGB (PIL)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
 
-        with torch.no_grad():
-            outputs = model(**inputs)
+            # Inference: Detect and Segment based on text
+            inputs = processor(images=pil_img, text=TEXT_PROMPT, return_tensors="pt").to(device)
 
-        # 4. Post-processing
-        # Returns masks for each detected instance of the prompt target
-        results = processor.post_process_instance_segmentation(
-            outputs,
-            threshold=SCORE_THRESHOLD,
-            mask_threshold=MASK_THRESHOLD,
-            target_sizes=[(height, width)]
-        )[0]
+            with torch.no_grad():
+                outputs = model(**inputs)
 
-        # 5. Create Overlay
-        # We'll create a single combined mask for all detected instances
-        overlay = frame.copy()
-        masks = results.get("masks")
-        has_masks = masks is not None and len(masks) > 0
+            # Post-processing
+            results = processor.post_process_instance_segmentation(
+                outputs,
+                threshold=SCORE_THRESHOLD,
+                mask_threshold=MASK_THRESHOLD,
+                target_sizes=[(height, width)]
+            )[0]
 
-        if has_masks:
-            candidate_masks = masks.detach().cpu().numpy().astype(bool)
-            scores = results.get("scores")
-            if scores is None or len(scores) != len(candidate_masks):
-                score_values = np.ones(len(candidate_masks), dtype=np.float32)
-            else:
-                score_values = scores.detach().cpu().numpy()
+            # Create Overlay
+            overlay = frame.copy()
+            masks = results.get("masks")
+            has_masks = masks is not None and len(masks) > 0
 
-            if TRACK_SINGLE_INSTANCE:
-                if previous_mask is None:
-                    selected_idx = int(np.argmax(score_values))
+            if has_masks:
+                candidate_masks = masks.detach().cpu().numpy().astype(bool)
+                scores = results.get("scores")
+                if scores is None or len(scores) != len(candidate_masks):
+                    score_values = np.ones(len(candidate_masks), dtype=np.float32)
                 else:
-                    iou_values = np.array([mask_iou(previous_mask, m) for m in candidate_masks], dtype=np.float32)
-                    rank_values = score_values + (TRACK_IOU_WEIGHT * iou_values)
-                    selected_idx = int(np.argmax(rank_values))
-                combined_mask = candidate_masks[selected_idx]
-                previous_mask = combined_mask.copy()
+                    score_values = scores.detach().cpu().numpy()
+
+                if TRACK_SINGLE_INSTANCE:
+                    if previous_mask is None:
+                        selected_idx = int(np.argmax(score_values))
+                    else:
+                        iou_values = np.array([mask_iou(previous_mask, m) for m in candidate_masks], dtype=np.float32)
+                        rank_values = score_values + (TRACK_IOU_WEIGHT * iou_values)
+                        selected_idx = int(np.argmax(rank_values))
+                    combined_mask = candidate_masks[selected_idx]
+                    previous_mask = combined_mask.copy()
+                else:
+                    combined_mask = np.any(candidate_masks, axis=0)
+                    previous_mask = None
+
+                mask_color = np.array([255, 100, 0], dtype=np.uint8)  # BGR tint
+                overlay[combined_mask] = cv2.addWeighted(
+                    overlay[combined_mask], 0.5,
+                    np.full_like(overlay[combined_mask], mask_color), 0.5, 0
+                )
+                masked_frame_count += 1
             else:
-                combined_mask = np.any(candidate_masks, axis=0)
                 previous_mask = None
 
-            # Apply a semi-transparent blue tint to the mask area
-            mask_color = np.array([255, 100, 0], dtype=np.uint8)  # BGR tint
-            overlay[combined_mask] = cv2.addWeighted(
-                overlay[combined_mask], 0.5,
-                np.full_like(overlay[combined_mask], mask_color), 0.5, 0
-            )
-            masked_frame_count += 1
-        else:
-            previous_mask = None
+            if frame_idx % 30 == 0:
+                if PRINT_DEBUG:
+                    debug_results = processor.post_process_object_detection(
+                        outputs,
+                        threshold=0.0,
+                        target_sizes=[(height, width)],
+                    )[0]
+                    debug_scores = debug_results.get("scores")
+                    max_score = float(debug_scores.max().item()) if debug_scores is not None and len(debug_scores) > 0 else 0.0
+                    kept = 0 if masks is None else len(masks)
+                    total = 0 if debug_scores is None else len(debug_scores)
+                    print(
+                        f"[{video_input_path.name}] frame={frame_idx} masks={kept} candidates={total} "
+                        f"max_score={max_score:.4f} tracked_single={TRACK_SINGLE_INSTANCE}"
+                    )
+                else:
+                    instance_count = 0 if masks is None else len(masks)
+                    print(f"[{video_input_path.name}] frame={frame_idx} masks={instance_count}")
 
-        if frame_idx % 30 == 0:
-            if PRINT_DEBUG:
-                debug_results = processor.post_process_object_detection(
-                    outputs,
-                    threshold=0.0,
-                    target_sizes=[(height, width)],
-                )[0]
-                debug_scores = debug_results.get("scores")
-                max_score = float(debug_scores.max().item()) if debug_scores is not None and len(debug_scores) > 0 else 0.0
-                kept = 0 if masks is None else len(masks)
-                total = 0 if debug_scores is None else len(debug_scores)
-                print(
-                    f"frame={frame_idx} masks={kept} candidates={total} "
-                    f"max_score={max_score:.4f} tracked_single={TRACK_SINGLE_INSTANCE}"
-                )
-            else:
-                instance_count = 0 if masks is None else len(masks)
-                print(f"frame={frame_idx} masks={instance_count}")
+            out.write(overlay)
+            frame_idx += 1
+            frame = None
 
-        out.write(overlay)
-        frame_idx += 1
-        frame = None
+    except KeyboardInterrupt:
+        print("Interrupted by user; finalizing partial video output...")
+    finally:
+        cap.release()
+        out.release()
+        print(
+            f"Finished {video_input_path.name}: wrote_frames={frame_idx}, masked_frames={masked_frame_count}, "
+            f"output={video_output_path}"
+        )
 
-except KeyboardInterrupt:
-    print("Interrupted by user; finalizing partial video output...")
-finally:
-    cap.release()
-    out.release()
-    print(
-        f"Finished. wrote_frames={frame_idx}, masked_frames={masked_frame_count}, "
-        f"output={VIDEO_OUTPUT_PATH}"
-    )
+
+# 2. Process all videos
+for video_input, video_output in VIDEO_PAIRS:
+    input_path = resolve_video_path(video_input, must_exist=True)
+    output_path = resolve_video_path(video_output, must_exist=False)
+    process_video(input_path, output_path)
