@@ -16,6 +16,18 @@ from datetime import datetime
 import cv2
 
 
+def _open_writer(path: str, fps: float, size: tuple[int, int]) -> cv2.VideoWriter:
+    """Try H.264 first (plays in QuickTime, browsers, GitHub), fall back to mp4v."""
+    for codec in ("avc1", "H264", "mp4v"):
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(path, fourcc, fps, size)
+        if writer.isOpened():
+            print(f"Using codec: {codec}")
+            return writer
+        writer.release()
+    raise RuntimeError(f"Could not open VideoWriter for {path} with any codec")
+
+
 def record_video(
     camera_index: int = 0,
     fps: int = 30,
@@ -33,30 +45,36 @@ def record_video(
             "Check that the USB camera is connected and not in use by another app."
         )
 
-    # Request the camera settings (the driver may silently override).
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+    # Grab one real frame to determine actual size (drivers silently override requests).
+    ret, probe = cap.read()
+    if not ret or probe is None:
+        cap.release()
+        raise RuntimeError("Camera opened but returned no frames.")
+    actual_h, actual_w = probe.shape[:2]
+
+    reported_fps = cap.get(cv2.CAP_PROP_FPS)
+    actual_fps = reported_fps if reported_fps and reported_fps > 1 else float(fps)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(output_dir, f"rollout_{timestamp}.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, actual_fps, (actual_w, actual_h))
-    if not writer.isOpened():
+    try:
+        writer = _open_writer(out_path, actual_fps, (actual_w, actual_h))
+    except RuntimeError:
         cap.release()
-        raise RuntimeError(f"Could not open VideoWriter for {out_path}")
+        raise
+    writer.write(probe)  # don't lose the frame we used to probe size
 
     print(f"Recording to {out_path} ({actual_w}x{actual_h} @ {actual_fps:.1f} fps)")
     print("Press 'q' in the preview window to stop."
           + (f" Auto-stop after {duration}s." if duration else ""))
 
     start = time.time()
-    frames = 0
+    frames = 1  # probe frame already written
     try:
         while True:
             ret, frame = cap.read()
