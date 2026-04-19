@@ -12,11 +12,29 @@ def do_teleoperate():
 def do_record(repo_id="nc8304/so101_v2", num_episodes=5, single_task="Testing", resume=True):
     rc.record(repo_id=repo_id, num_episodes=num_episodes, single_task=single_task, resume=resume)
 
+def do_eval(policy_path, repo_id="SkywalkerLi/eval_so101", num_episodes=5, single_task="Testing", resume=False):
+    rc.eval(policy_path=policy_path, repo_id=repo_id, num_episodes=num_episodes, single_task=single_task, resume=resume)
+
+def do_smol_vla_eval(
+    policy_path,
+    repo_id="SkywalkerLi/eval_smolvla_cube",
+    single_task="Grab the cube",
+    num_episodes=1,
+):
+    rc.smol_vla_eval(
+        policy_path=policy_path,
+        repo_id=repo_id,
+        single_task=single_task,
+        num_episodes=num_episodes,
+    )
+
 def do_replay(repo_id="nc8304/so101", episode=0):
     rc.replay(repo_id=repo_id, episode=episode)
 
 
 if __name__ == "__main__":
     #do_teleoperate()
-    do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
+    #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
+    #do_eval(policy_path="SkywalkerLi/act-so101")
+    do_smol_vla_eval(policy_path="SkywalkerLi/smol_vla")
