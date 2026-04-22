@@ -1,0 +1,16 @@
+{
+  "pickup": {
+    "frame": 11,
+    "time_s": 0.367
+  },
+  "hold": {
+    "frame": 34,
+    "time_s": 1.133
+  },
+  "drop": {
+    "frame": 58,
+    "time_s": 1.933
+  },
+  "roi_frac": 0.3,
+  "threshold": 3.5343098044395447
+}

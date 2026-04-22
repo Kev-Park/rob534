@@ -37,13 +37,13 @@ import pandas as pd
 from tqdm import tqdm
 
 # ── config ─────────────────────────────────────────────────────────────────────
-ORIG_ROOT   = Path(r"C:\Users\calle\.cache\huggingface\lerobot\nc8304\so101_combined")
+ORIG_ROOT   = Path(r"C:\Users\calle\.cache\huggingface\hub\datasets--nc8304--so101_combined_cubeONLY\snapshots\acc242c231f60171a5b2833442d176cd793ea8c9")
 BATCH_ROOT  = Path(__file__).parent.parent / "outputs" / "batch"
 OUTPUT_ROOT = Path(__file__).parent.parent / "outputs" / "augmented_datasets"
 
 VIDEO_KEY   = "observation.images.front"
 FPS         = 30
-VCODEC      = "libsvtav1"
+VCODEC      = "av1_nvenc"
 PIX_FMT     = "yuv420p"
 
 # (chunk_index, file_index) pairs that exist in the original dataset

@@ -25,11 +25,11 @@ from huggingface_hub import HfApi, whoami
 from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-ORIG_REPO_ID    = "nc8304/so101_combined"
+ORIG_REPO_ID    = "nc8304/so101_combined_cubeONLY"
 DEFAULT_REPO_ID = "nc8304/so101_color_augmented"
 AUG_ROOT        = Path(__file__).parent.parent / "outputs" / "augmented_datasets"
 MERGE_ROOT      = Path(__file__).parent.parent / "outputs" / "merged_dataset"
-ORIG_CACHE      = Path.home() / ".cache" / "huggingface" / "lerobot" / "nc8304" / "so101_combined"
+ORIG_CACHE      = Path.home() / ".cache" / "huggingface" / "hub" / "datasets--nc8304--so101_combined_cubeONLY" / "snapshots" / "acc242c231f60171a5b2833442d176cd793ea8c9"
 
 
 def list_built_variants():
