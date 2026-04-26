@@ -20,16 +20,43 @@ Within each sub-trajectory, a sliding window of `window_size` frames
 is stepped forward by `stride = window_size * (1 - overlap)` frames
 so every important transition appears in multiple training samples.
 
-Usage
-─────
+Basic Usage (video frame indices only)
+───────────────────────────────────────
     from phase_episode_sampler import iter_phase_windows
 
     for sample in iter_phase_windows("outputs/episode_phases.csv",
                                       window_size=50, overlap=0.25):
-        ep    = sample["episode_index"]   # int   – which episode
-        frames = sample["frames"]          # list  – frame indices in this window
-        seg   = sample["segment"]         # str   – 'approach' | 'carry' | 'full'
+        ep     = sample["episode_index"]   # int  – which episode
+        frames = sample["frames"]          # list – frame indices in this window
+        seg    = sample["segment"]         # str  – 'approach' | 'carry' | 'full'
         # load frames[0]…frames[-1] from your dataset and feed to the model
+
+With Motor Data
+───────────────
+Pass the data_df DataFrame (from load_meta()) to get the robot joint
+positions and actions for every frame in each window:
+
+    from episode_labeler import load_meta
+    from phase_episode_sampler import iter_phase_windows
+
+    _, data_df = load_meta()   # loads the full LeRobot parquet
+
+    for sample in iter_phase_windows(window_size=50, overlap=0.25,
+                                      data_df=data_df):
+        ep     = sample["episode_index"]
+        frames = sample["frames"]
+        seg    = sample["segment"]
+        motor  = sample["motor_data"]   # dict, or None if data_df not supplied
+
+        state  = motor["observation.state"]  # shape (window_size, 6)  – joint °
+        action = motor["action"]             # shape (window_size, 6)  – commanded
+        # axis 1 layout: [joint0, joint1, joint2, joint3, joint4, gripper]
+        #   index 5 = gripper
+
+Choose which motor columns to pull with motor_keys (default: both):
+    for sample in iter_phase_windows(data_df=data_df,
+                                      motor_keys=("observation.state",)):
+        state = sample["motor_data"]["observation.state"]  # shape (window_size, 6)
 """
 
 import pandas as pd
@@ -47,6 +74,8 @@ def iter_phase_windows(
     overlap: float = 0.25,
     segments: tuple[str, ...] = ("approach", "carry", "full"),
     skip_missing: bool = True,
+    data_df: pd.DataFrame | None = None,
+    motor_keys: tuple[str, ...] = ("observation.state", "action"),
 ):
     """
     Iterate over overlapping training windows across all episodes.
@@ -78,17 +107,34 @@ def iter_phase_windows(
         was not detected (episodes 4 and 75 in this dataset).
         If False, those episodes raise a ValueError.
 
+    data_df : pd.DataFrame or None
+        The data parquet loaded from load_meta() (second return value).
+        When provided, each yielded sample includes a "motor_data" dict
+        with the robot joint readings for every frame in the window.
+        When None (default), "motor_data" is None in every sample.
+
+    motor_keys : tuple of str
+        Which columns to extract from data_df.
+        Default: ("observation.state", "action")
+          "observation.state" – measured joint positions, shape (window_size, 6)
+          "action"            – commanded joint positions, shape (window_size, 6)
+        Joint axis layout: [joint0, joint1, joint2, joint3, joint4, gripper]
+          index 5 = gripper
+
     Yields
     ------
     dict with keys:
-        "episode_index"  int   – episode number (0-based)
-        "segment"        str   – which sub-trajectory ('approach'|'carry'|'full')
-        "frames"         list  – frame indices [start, start+1, …, start+window_size-1]
-        "window_start"   int   – first frame index in this window
-        "window_end"     int   – last frame index (exclusive)
-        "pickup_frame"   int   – pickup frame for this episode
-        "drop_frame"     int   – drop frame for this episode
-        "n_frames"       int   – total episode length
+        "episode_index"  int              – episode number (0-based)
+        "segment"        str              – 'approach' | 'carry' | 'full'
+        "frames"         list[int]        – frame indices [start … start+window_size-1]
+        "window_start"   int              – first frame index (inclusive)
+        "window_end"     int              – last frame index (exclusive)
+        "pickup_frame"   int | None       – pickup frame for this episode
+        "drop_frame"     int | None       – drop frame for this episode
+        "n_frames"       int              – total episode length
+        "motor_data"     dict | None      – motor arrays keyed by column name,
+                                           or None if data_df was not supplied.
+                                           Each array has shape (window_size, n_joints).
     """
 
     # ── load phase labels ──────────────────────────────────────────────────────
@@ -100,6 +146,16 @@ def iter_phase_windows(
 
     # how far to step between consecutive windows
     stride = max(1, int(window_size * (1 - overlap)))
+
+    # ── pre-group motor data by episode for fast per-window lookup ─────────────
+    # Grouping once here avoids re-scanning the full DataFrame for every window.
+    if data_df is not None:
+        ep_data: dict[int, pd.DataFrame] = {
+            ep: grp.sort_values("frame_index").reset_index(drop=True)
+            for ep, grp in data_df.groupby("episode_index")
+        }
+    else:
+        ep_data = {}
 
     # ── iterate episodes ───────────────────────────────────────────────────────
     for _, row in df.iterrows():
@@ -136,6 +192,9 @@ def iter_phase_windows(
             "full":     n_frames,
         }
 
+        # ── pre-fetch motor rows for this episode (if requested) ──────────────
+        ep_rows = ep_data.get(ep)   # sorted DataFrame or None
+
         # ── slide windows through each requested sub-trajectory ───────────────
         for seg_name in segments:
             seg_end = segment_ends[seg_name]
@@ -151,6 +210,26 @@ def iter_phase_windows(
             # slide the window from frame 0 to seg_end
             start = 0
             while start + window_size <= seg_end:
+
+                # ── extract motor data for this window ────────────────────────
+                if ep_rows is not None:
+                    fi   = ep_rows["frame_index"].values   # sorted int array
+                    mask = (fi >= start) & (fi < start + window_size)
+                    window_rows = ep_rows[mask]
+                    motor_data: dict | None = {}
+                    for key in motor_keys:
+                        if key not in window_rows.columns:
+                            continue
+                        vals = window_rows[key].values
+                        if len(vals) == 0:
+                            motor_data[key] = np.empty((0,))
+                        elif isinstance(vals[0], np.ndarray):
+                            motor_data[key] = np.stack(vals)   # (window_size, n_joints)
+                        else:
+                            motor_data[key] = vals.astype(float)
+                else:
+                    motor_data = None
+
                 yield {
                     "episode_index": ep,
                     "segment":       seg_name,
@@ -160,6 +239,7 @@ def iter_phase_windows(
                     "pickup_frame":  pickup_frame,
                     "drop_frame":    drop_frame,
                     "n_frames":      n_frames,
+                    "motor_data":    motor_data,
                 }
                 start += stride
 
@@ -174,17 +254,19 @@ def phase_windows_dataframe(
 ) -> pd.DataFrame:
     """
     Same as iter_phase_windows but returns a DataFrame instead of a generator.
-    Each row is one training window (without the 'frames' list column).
+    Each row is one training window (without the 'frames' or 'motor_data' columns).
 
     Useful for inspecting the full sample plan before training.
+    For motor data, use iter_phase_windows() with data_df= directly.
 
     Example
     -------
         df = phase_windows_dataframe(window_size=50, overlap=0.25)
         print(df.groupby("segment")["episode_index"].count())
     """
+    skip_keys = {"frames", "motor_data"}
     rows = [
-        {k: v for k, v in sample.items() if k != "frames"}
+        {k: v for k, v in sample.items() if k not in skip_keys}
         for sample in iter_phase_windows(phases_csv, window_size, overlap, segments)
     ]
     return pd.DataFrame(rows)
