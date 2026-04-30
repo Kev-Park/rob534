@@ -128,17 +128,17 @@ def resolve_policy_path(hf_model_id: str) -> str:
 def repo_id_from_policy(policy_path: str) -> str:
     """Derive a local/hub dataset repo_id from the policy path.
 
-    SkywalkerLi/smolvla-phase-split            -> SkywalkerLi/smolvla-phase-split_eval
+    SkywalkerLi/smolvla-phase-split            -> SkywalkerLi/eval_smolvla-phase-split
     .../models--SkywalkerLi--smolvla-phase-split/snapshots/abc  -> same
     """
     for part in Path(policy_path).parts:
         if part.startswith("models--"):
             _, namespace, model_name = part.split("--", 2)
-            return f"{namespace}/{model_name}_eval"
+            return f"{namespace}/eval_{model_name}"
     if "/" in policy_path:
         namespace, model_name = policy_path.split("/", 1)
-        return f"{namespace}/{model_name}_eval"
-    return f"{policy_path}_eval"
+        return f"{namespace}/eval_{model_name}"
+    return f"eval_{policy_path}"
 
 
 def do_smol_vla_eval(
@@ -160,20 +160,18 @@ def do_smol_vla_eval(
     subprocess.Popen(["rerun", "--serve-web"])
     threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
-    go_home()
-
-    # Policy is loaded once for all episodes. Between episodes lerobot
-    # pauses for reset_time_s seconds — use that window to reset the cube
-    # and manually reposition the arm (servos hold, so give them a light push).
-    rc.smol_vla_eval(
-        policy_path=policy_path,
-        repo_id=repo_id,
-        single_task=single_task,
-        num_episodes=num_episodes,
-        reset_time_s=reset_time_s,
-        resume=False,
-        display_data=True,
-    )
+    for i in range(num_episodes):
+        go_home()
+        print(f"\n  Episode {i + 1}/{num_episodes}")
+        rc.smol_vla_eval(
+            policy_path=policy_path,
+            repo_id=repo_id,
+            single_task=single_task,
+            num_episodes=1,
+            reset_time_s=0,
+            resume=(i > 0),
+            display_data=True,
+        )
 
     go_home()
 
