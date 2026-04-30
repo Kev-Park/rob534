@@ -8,6 +8,57 @@ from pathlib import Path
 
 import robot_control as rc
 
+# ── Home position ─────────────────────────────────────────────────────────────
+# Joint angles in degrees the robot returns to between episodes.
+# Adjust these values to match your desired rest/start position.
+HOME_POS = {
+    "shoulder_pan.pos":    3.6,
+    "shoulder_lift.pos":  -92.4,
+    "elbow_flex.pos":     97.5,
+    "wrist_flex.pos":     76.7,
+    "wrist_roll.pos":    -87.6,
+    "gripper.pos":         3.2,
+}
+
+
+def go_home(home_pos: dict = None, port: str = "COM5",
+            steps: int = 30, step_delay: float = 0.1):
+    """
+    Smoothly move the arm to home_pos (defaults to HOME_POS).
+
+    Movement is interpolated over `steps` steps with `step_delay` seconds
+    between each — total duration = steps * step_delay (default ~1.5 s).
+
+    Args:
+        home_pos:   Target joint angles dict. Defaults to HOME_POS.
+        port:       Serial port the arm is on.
+        steps:      Number of interpolation steps (more = smoother/slower).
+        step_delay: Seconds between steps (larger = slower).
+    """
+    from lerobot.robots.so_follower.so_follower import SOFollower
+    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+
+    if home_pos is None:
+        home_pos = HOME_POS
+
+    config = SOFollowerRobotConfig(port=port, id="student_arm", use_degrees=True)
+    robot = SOFollower(config)
+    robot.connect(calibrate=False)
+
+    # Read current position so we can interpolate from it
+    obs = robot.get_observation()
+    current = {k: v for k, v in obs.items() if k.endswith(".pos")}
+
+    print(f"  Moving to home position ({steps} steps × {step_delay}s)...")
+    for i in range(1, steps + 1):
+        t = i / steps
+        interp = {k: current[k] + t * (home_pos[k] - current[k]) for k in home_pos}
+        robot.send_action(interp)
+        time.sleep(step_delay)
+
+    robot.disconnect()
+    print("  Home position reached.")
+
 
 def _wait_and_open_viewer(port=9090, timeout=30):
     start = time.time()
@@ -54,12 +105,51 @@ def _check_starvation():
     print("        every 50 steps; the robot executes at ~26 Hz between calls.")
 
 
+def resolve_policy_path(hf_model_id: str) -> str:
+    """
+    Given a HuggingFace model ID (e.g. 'SkywalkerLi/smolvla-phase-split'),
+    return the local snapshot path if already cached, otherwise return the
+    HF model ID so lerobot can download it.
+    """
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    namespace, model_name = hf_model_id.split("/", 1)
+    cache_dir = hf_cache / f"models--{namespace}--{model_name}"
+    snapshots_dir = cache_dir / "snapshots"
+    if snapshots_dir.exists():
+        snapshots = sorted(snapshots_dir.iterdir())
+        if snapshots:
+            local_path = snapshots[-1]  # most recent snapshot
+            print(f"  Found local cache: {local_path}")
+            return str(local_path)
+    print(f"  Not cached locally, will download: {hf_model_id}")
+    return hf_model_id
+
+
+def repo_id_from_policy(policy_path: str) -> str:
+    """Derive a local/hub dataset repo_id from the policy path.
+
+    SkywalkerLi/smolvla-phase-split            -> SkywalkerLi/smolvla-phase-split_eval
+    .../models--SkywalkerLi--smolvla-phase-split/snapshots/abc  -> same
+    """
+    for part in Path(policy_path).parts:
+        if part.startswith("models--"):
+            _, namespace, model_name = part.split("--", 2)
+            return f"{namespace}/{model_name}_eval"
+    if "/" in policy_path:
+        namespace, model_name = policy_path.split("/", 1)
+        return f"{namespace}/{model_name}_eval"
+    return f"{policy_path}_eval"
+
+
 def do_smol_vla_eval(
     policy_path,
-    repo_id="SkywalkerLi/eval_smolvla_cube",
-    single_task="Grab the cube",
+    repo_id=None,
+    single_task="Grab the cube and drop it ",
     num_episodes=1,
+    reset_time_s=10,
 ):
+    if repo_id is None:
+        repo_id = repo_id_from_policy(policy_path)
     dataset_path = Path.home() / ".cache/huggingface/lerobot" / repo_id
     if dataset_path.exists():
         print(f"Removing existing dataset: {dataset_path}")
@@ -69,13 +159,23 @@ def do_smol_vla_eval(
     subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
     subprocess.Popen(["rerun", "--serve-web"])
     threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+
+    go_home()
+
+    # Policy is loaded once for all episodes. Between episodes lerobot
+    # pauses for reset_time_s seconds — use that window to reset the cube
+    # and manually reposition the arm (servos hold, so give them a light push).
     rc.smol_vla_eval(
         policy_path=policy_path,
         repo_id=repo_id,
         single_task=single_task,
         num_episodes=num_episodes,
+        reset_time_s=reset_time_s,
+        resume=False,
         display_data=True,
     )
+
+    go_home()
 
 def do_replay(repo_id="nc8304/so101", episode=0):
     rc.replay(repo_id=repo_id, episode=episode)
@@ -156,4 +256,4 @@ if __name__ == "__main__":
     #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
     #do_eval(policy_path="SkywalkerLi/act-so101")
-    do_smol_vla_eval(policy_path="C:/Users/calle/PycharmProjects/RobotArm/models/smol_vla")
+    do_smol_vla_eval(policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),num_episodes=10)
