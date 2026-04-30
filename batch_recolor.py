@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 from segment_orange import get_orange_mask, best_square_contour, make_contour_mask
@@ -74,6 +75,7 @@ def segment_video(input_path: str, out_dir: str):
         w = csv.writer(f)
         w.writerow(["frame", "x", "y", "width", "height", "area", "sq_score", "object_present"])
         idx = 0
+        pbar = tqdm(total=total, desc="  segmenting", unit="fr", disable=False)
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -92,8 +94,8 @@ def segment_video(input_path: str, out_dir: str):
                 w.writerow([idx, "", "", "", "", "", "", 0])
                 bbox_records.append({"frame": idx, "object_present": False})
             idx += 1
-            if idx % 1000 == 0:
-                print(f"    {idx}/{total}...")
+            pbar.update(1)
+        pbar.close()
 
     cap.release()
     with open(os.path.join(out_dir, "bboxes.json"), "w") as f:
@@ -114,12 +116,10 @@ def build_mask_video(masks_dir: str, mask_video_path: str, total: int,
     writer = cv2.VideoWriter(mask_video_path, cv2.VideoWriter_fourcc(*"XVID"),
                              fps, (W, H), isColor=False)
     blank = np.zeros((H, W), dtype=np.uint8)
-    for i in range(total):
+    for i in tqdm(range(total), desc="  packing masks", unit="fr", disable=False):
         mp = os.path.join(masks_dir, f"mask_{i:06d}.png")
         m  = cv2.imread(mp, cv2.IMREAD_GRAYSCALE) if os.path.exists(mp) else blank
         writer.write(m)
-        if i % 5000 == 0 and i > 0:
-            print(f"    {i}/{total}...")
     writer.release()
     print(f"  [masks] done.")
 
@@ -194,6 +194,7 @@ def recolor_all(input_path: str, masks_dir: str, recolor_dir: str,
         cap_mask = cv2.VideoCapture(mask_video)
 
         frame_buf, mask_buf, idx = [], [], 0
+        pbar = tqdm(total=total, desc=f"  pass {g_idx}/{n_groups}", unit="fr", disable=False)
 
         def flush(fb, mb):
             outs = gpu_blend_batch(np.stack(fb), np.stack(mb), ca_pairs, dilate)
@@ -215,11 +216,11 @@ def recolor_all(input_path: str, masks_dir: str, recolor_dir: str,
             frame_buf.append(frame)
             mask_buf.append(m)
             idx += 1
+            pbar.update(1)
             if len(frame_buf) >= batch_size:
                 flush(frame_buf, mask_buf)
                 frame_buf, mask_buf = [], []
-            if idx % 5000 == 0:
-                print(f"    {idx}/{total}...")
+        pbar.close()
 
         cap_src.release()
         cap_mask.release()

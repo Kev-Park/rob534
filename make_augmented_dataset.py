@@ -113,7 +113,7 @@ def transcode_to_mp4(src: Path, dst: Path, n_frames: int):
         out_c.start_encoding()
 
         written = 0
-        bar = tqdm(total=n_frames, desc=f"  transcode {dst.name}", leave=False)
+        bar = tqdm(total=n_frames, desc=f"  transcode {dst.name}", leave=False, disable=False)
         for pkt in in_c.demux(in_v):
             if written >= n_frames:
                 break
@@ -265,12 +265,12 @@ def main():
     args = parser.parse_args()
 
     if args.all:
-        for color in COLORS:
-            for alpha in ALPHAS:
-                try:
-                    make_dataset(color, alpha)
-                except Exception as e:
-                    print(f"  [error] {color}_a{alpha:.1f}: {e}", file=sys.stderr)
+        combos = [(c, a) for c in COLORS for a in ALPHAS]
+        for color, alpha in tqdm(combos, desc="variants", unit="variant", disable=False):
+            try:
+                make_dataset(color, alpha)
+            except Exception as e:
+                print(f"  [error] {color}_a{alpha:.1f}: {e}", file=sys.stderr)
     else:
         if args.alpha is None:
             parser.error("--alpha is required when using --color")

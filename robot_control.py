@@ -1,4 +1,12 @@
 import subprocess
+import sys
+from pathlib import Path
+
+# Use the lerobot-record from the same Python environment as this script
+_VENV_SCRIPTS = Path(sys.executable).parent
+LEROBOT_RECORD = str(_VENV_SCRIPTS / "lerobot-record")
+LEROBOT_TELEOP = str(_VENV_SCRIPTS / "lerobot-teleoperate")
+LEROBOT_REPLAY = str(_VENV_SCRIPTS / "lerobot-replay")
 
 
 # ── Shared defaults ────────────────────────────────────────────────────────────
@@ -13,7 +21,7 @@ ROBOT_DEFAULTS = {
 # SmolVLA expects `observation.images.camera1`, so we name the camera directly `camera1`.
 SMOLVLA_ROBOT_DEFAULTS = {
     **ROBOT_DEFAULTS,
-    "cameras": "{camera1: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 10}}",
+    "cameras": "{camera1: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, warmup_s: 10}}", #index0 for sky
 }
 
 TELEOP_DEFAULTS = {
@@ -42,7 +50,7 @@ def teleoperate(
         teleoperate()
     """
     _run([
-        "lerobot-teleoperate",
+        LEROBOT_TELEOP,
         f"--robot.type={robot['type']}",
         f"--robot.port={robot['port']}",
         f"--robot.id={robot['id']}",
@@ -77,7 +85,7 @@ def record(
         record(repo_id="nc8304/so101", resume=True)
     """
     cmd = [
-        "lerobot-record",
+        LEROBOT_RECORD,
         f"--robot.type={robot['type']}",
         f"--robot.port={robot['port']}",
         f"--robot.id={robot['id']}",
@@ -121,7 +129,7 @@ def eval(
              repo_id="eval/so101_eval", num_episodes=10)
     """
     cmd = [
-        "lerobot-record",
+        LEROBOT_RECORD,
         f"--robot.type={robot['type']}",
         f"--robot.port={robot['port']}",
         f"--robot.id={robot['id']}",
@@ -149,7 +157,7 @@ def smol_vla_eval(
     num_episodes:       int  = 10,
     episode_time_s:     int  = 60,
     reset_time_s:       int  = 10,
-    policy_device:      str  = "mps",
+    policy_device:      str  = "cuda",
     push_to_hub:        bool = False,
     display_data:       bool = True,
     resume:             bool = False,
@@ -170,7 +178,7 @@ def smol_vla_eval(
         )
     """
     cmd = [
-        "lerobot-record",
+        LEROBOT_RECORD,
         f"--robot.type={robot['type']}",
         f"--robot.port={robot['port']}",
         f"--robot.id={robot['id']}",
@@ -203,7 +211,7 @@ def replay(
         replay(repo_id="nc8304/so101", episode=2)
     """
     _run([
-        "lerobot-replay",
+        LEROBOT_REPLAY,
         f"--robot.type={robot['type']}",
         f"--robot.port={robot['port']}",
         f"--robot.id={robot['id']}",

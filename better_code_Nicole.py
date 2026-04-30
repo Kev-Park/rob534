@@ -14,8 +14,8 @@ REPO_IDS = {
 =======
     "skywalker": "SkywalkerLi/so101_03_21_26_data_v1",
     "nicole": "nc8304/so101_031626"
-}
->>>>>>> 14e63057c1ef513d907434559b0a9d1fbc777f90
+
+
 
 NICOLE_ROBOT = {**rc.ROBOT_DEFAULTS, "port": "COM5", "cameras": "{front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}"}
 NICOLE_TELEOP = {**rc.TELEOP_DEFAULTS, "port": "COM4"}

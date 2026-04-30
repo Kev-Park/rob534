@@ -2,7 +2,7 @@
 HuggingFace data pipeline utilities.
 
 Operations:
-  1. combine   -- merge source datasets into nc8304/so101_combined_cubeONLY
+  1. combine   -- merge source datasets idata from huggingface nto nc8304/so101_combined_cubeONLY
   2. augment   -- recolor + build augmented variants + push to nc8304/so101_color_augmented
 """
 
