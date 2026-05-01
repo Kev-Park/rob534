@@ -7,18 +7,7 @@ import webbrowser
 from pathlib import Path
 
 import robot_control as rc
-
-# ── Home position ─────────────────────────────────────────────────────────────
-# Joint angles in degrees the robot returns to between episodes.
-# Adjust these values to match your desired rest/start position.
-HOME_POS = {
-    "shoulder_pan.pos":    3.6,
-    "shoulder_lift.pos":  -92.4,
-    "elbow_flex.pos":     97.5,
-    "wrist_flex.pos":     76.7,
-    "wrist_roll.pos":    -87.6,
-    "gripper.pos":         3.2,
-}
+from motor_commands import load_home, PORT
 
 
 def go_home(home_pos: dict = None, port: str = "COM5",
@@ -39,7 +28,7 @@ def go_home(home_pos: dict = None, port: str = "COM5",
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
     if home_pos is None:
-        home_pos = HOME_POS
+        home_pos = load_home()
 
     config = SOFollowerRobotConfig(port=port, id="student_arm", use_degrees=True)
     robot = SOFollower(config)
@@ -58,6 +47,36 @@ def go_home(home_pos: dict = None, port: str = "COM5",
 
     robot.disconnect()
     print("  Home position reached.")
+
+
+def get_current_pos(port: str = "COM5"):
+    """
+    Connect to the arm, read joint positions, print them ready to paste into HOME_POS, then disconnect.
+    """
+    from lerobot.robots.so_follower.so_follower import SOFollower
+    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+
+    config = SOFollowerRobotConfig(port=port, id="student_arm", use_degrees=True)
+    robot = SOFollower(config)
+    robot.connect(calibrate=False)
+    obs = robot.get_observation()
+    robot.disconnect()
+
+    pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
+    print("\nCurrent joint positions (paste into HOME_POS):")
+    print("HOME_POS = {")
+    for k, v in pos.items():
+        print(f'    "{k}": {v:.1f},')
+    print("}")
+    return pos
+
+
+def _rerun_is_running(port=9090):
+    try:
+        with socket.create_connection(("localhost", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 def _wait_and_open_viewer(port=9090, timeout=30):
@@ -119,8 +138,12 @@ def resolve_policy_path(hf_model_id: str) -> str:
         snapshots = sorted(snapshots_dir.iterdir())
         if snapshots:
             local_path = snapshots[-1]  # most recent snapshot
-            print(f"  Found local cache: {local_path}")
-            return str(local_path)
+            # Only use local cache if weights are actually present (not just config.json)
+            if any(local_path.glob("*.safetensors")):
+                print(f"  Found local cache: {local_path}")
+                return str(local_path)
+            else:
+                print(f"  Cache snapshot has no weights, will download: {hf_model_id}")
     print(f"  Not cached locally, will download: {hf_model_id}")
     return hf_model_id
 
@@ -141,39 +164,194 @@ def repo_id_from_policy(policy_path: str) -> str:
     return f"eval_{policy_path}"
 
 
+def _go_home_with_robot(robot, steps: int = 30, step_delay: float = 0.1):
+    """Move to saved home position using an already-connected robot (no serial reconnect)."""
+    home = load_home()
+    obs = robot.get_observation()
+    current = {k: v for k, v in obs.items() if k.endswith(".pos")}
+    print(f"  Moving to home position ({steps} steps × {step_delay}s)...")
+    for i in range(1, steps + 1):
+        t = i / steps
+        interp = {k: current[k] + t * (home[k] - current[k]) for k in home}
+        robot.send_action(interp)
+        time.sleep(step_delay)
+    print("  Home position reached.")
+
+
 def do_smol_vla_eval(
     policy_path,
     repo_id=None,
     single_task="Grab the cube and drop it ",
     num_episodes=1,
-    reset_time_s=10,
+    episode_time_s=60,
 ):
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+    from lerobot.datasets.utils import combine_feature_dicts
+    from lerobot.datasets.video_utils import VideoEncodingManager
+    from lerobot.policies.factory import make_policy, make_pre_post_processors
+    from lerobot.processor import make_default_processors
+    from lerobot.processor.rename_processor import rename_stats
+    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+    from lerobot.robots.so_follower.so_follower import SOFollower
+    from lerobot.scripts.lerobot_record import record_loop
+    from lerobot.utils.control_utils import (init_keyboard_listener, sanity_check_dataset_name,
+                                               sanity_check_dataset_robot_compatibility)
+    from lerobot.utils.utils import init_logging, log_say
+    from lerobot.utils.visualization_utils import init_rerun
+
     if repo_id is None:
         repo_id = repo_id_from_policy(policy_path)
     dataset_path = Path.home() / ".cache/huggingface/lerobot" / repo_id
-    if dataset_path.exists():
-        print(f"Removing existing dataset: {dataset_path}")
+    # Only resume if the dataset is complete (has actual data, not just a partial/failed folder)
+    resuming = (dataset_path / "meta" / "tasks.parquet").exists()
+    if resuming:
+        print(f"  Found existing dataset at {dataset_path} — resuming (appending episodes).")
+    elif dataset_path.exists():
+        print(f"  Found incomplete dataset at {dataset_path} — starting fresh.")
         shutil.rmtree(dataset_path)
 
     _check_starvation()
-    subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
-    subprocess.Popen(["rerun", "--serve-web"])
-    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+    if _rerun_is_running():
+        print("  Rerun viewer already running on :9090, skipping restart.")
+    else:
+        subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
+        subprocess.Popen(["rerun", "--serve-web"])
+        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
-    for i in range(num_episodes):
-        go_home()
-        print(f"\n  Episode {i + 1}/{num_episodes}")
-        rc.smol_vla_eval(
-            policy_path=policy_path,
-            repo_id=repo_id,
-            single_task=single_task,
-            num_episodes=1,
-            reset_time_s=0,
-            resume=(i > 0),
-            display_data=True,
+    init_logging()
+    init_rerun(session_name="recording")
+
+    # ── One-time setup ────────────────────────────────────────────────────────
+    # Everything below is created ONCE and reused across all episodes.
+    # Previously we called lerobot-record as a subprocess per episode, which
+    # meant reloading weights (~20-30s) and re-warming the camera (10s) every
+    # single episode. Now we call lerobot's Python API directly so the robot
+    # connection, camera, and policy weights stay in memory for the full run.
+
+    # Robot + camera: opened once, camera warms up once (warmup_s=2).
+    robot_cfg = SOFollowerRobotConfig(
+        port="COM5",
+        id="student_arm",
+        use_degrees=True,
+        cameras={
+            "camera1": OpenCVCameraConfig(
+                index_or_path=1, fps=30, width=640, height=480, warmup_s=2,
+            )
+        },
+    )
+    robot = SOFollower(robot_cfg)
+
+    policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
+    policy_cfg.pretrained_path = policy_path
+    policy_cfg.device = "cuda"
+    # The policy was trained on a cluster whose local path is baked into config.json.
+    # Override it to the public HF model ID so transformers can find it locally.
+    if hasattr(policy_cfg, "vlm_model_name") and policy_cfg.vlm_model_name.startswith("/"):
+        policy_cfg.vlm_model_name = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=True,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=True,
+        ),
+    )
+
+    if resuming:
+        # Load existing dataset and append to it.
+        dataset = LeRobotDataset(repo_id, root=dataset_path)
+        dataset.start_image_writer(num_processes=0, num_threads=4)
+        sanity_check_dataset_robot_compatibility(dataset, robot, 30, dataset_features)
+        print(f"  Resuming from episode {dataset.num_episodes} ({dataset.num_frames} frames so far).")
+    else:
+        # Fresh dataset — created for the first time.
+        sanity_check_dataset_name(repo_id, policy_cfg)
+        dataset = LeRobotDataset.create(
+            repo_id,
+            fps=30,
+            robot_type=robot.name,
+            features=dataset_features,
+            use_videos=True,
+            image_writer_processes=0,
+            image_writer_threads=4,
         )
 
-    go_home()
+    # Policy weights loaded once here — SmolVLA-500M takes ~20-30s to load.
+    # All episodes share the same policy object in GPU memory.
+    print("  Loading policy weights (once for all episodes)...")
+    policy = make_policy(policy_cfg, ds_meta=dataset.meta)
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy_cfg,
+        pretrained_path=policy_path,
+        dataset_stats=rename_stats(dataset.meta.stats, {}),
+        preprocessor_overrides={
+            "device_processor": {"device": "cuda"},
+            "rename_observations_processor": {"rename_map": {}},
+        },
+    )
+
+    # Connect robot and camera once — stays open for all episodes.
+    robot.connect()
+    listener, events = init_keyboard_listener()
+
+    try:
+        with VideoEncodingManager(dataset):
+            for i in range(num_episodes):
+                # Reset events so any stray keypress during go_home doesn't
+                # immediately exit the first control loop iteration.
+                events["exit_early"] = False
+                events["rerecord_episode"] = False
+
+                # Move arm to home position before each episode so every
+                # episode starts from the same known configuration.
+                # home_pos is loaded from home_pos.json (set via motor_commands.py reset_home).
+                _go_home_with_robot(robot)
+                print(f"\n  Episode {i + 1}/{num_episodes}")
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=30,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    dataset=dataset,
+                    control_time_s=episode_time_s,
+                    single_task=single_task,
+                    display_data=True,
+                )
+
+                frames_collected = (
+                    dataset.episode_buffer is not None
+                    and dataset.episode_buffer.get("size", 0) > 0
+                )
+                if frames_collected:
+                    dataset.save_episode()
+                else:
+                    print(f"  WARNING: Episode {i + 1} collected no frames — skipping save.")
+                    if dataset.episode_buffer is not None:
+                        dataset.clear_episode_buffer()
+
+                if events["stop_recording"]:
+                    break
+    finally:
+        # Move back to home before disconnecting so the arm parks cleanly.
+        _go_home_with_robot(robot)
+        robot.disconnect()
+        listener.stop()
+        dataset.finalize()
 
 def do_replay(repo_id="nc8304/so101", episode=0):
     rc.replay(repo_id=repo_id, episode=episode)
@@ -250,8 +428,14 @@ if __name__ == "__main__":
 
     print("=" * 50)
 
+    #get_current_pos()
     #do_teleoperate()
     #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
     #do_eval(policy_path="SkywalkerLi/act-so101")
-    do_smol_vla_eval(policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),num_episodes=10)
+    do_smol_vla_eval(
+        policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        repo_id="SkywalkerLi/eval_smolvla-aug",
+        num_episodes=10,
+        episode_time_s=45,
+    )

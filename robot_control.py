@@ -21,7 +21,7 @@ ROBOT_DEFAULTS = {
 # SmolVLA expects `observation.images.camera1`, so we name the camera directly `camera1`.
 SMOLVLA_ROBOT_DEFAULTS = {
     **ROBOT_DEFAULTS,
-    "cameras": "{camera1: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, warmup_s: 10}}", #index0 for sky
+    "cameras": "{camera1: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, warmup_s: 2}}", #index0 for sky
 }
 
 TELEOP_DEFAULTS = {
