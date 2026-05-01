@@ -143,7 +143,7 @@ def smol_vla_eval(
     repo_id:            str  = "SkywalkerLi/eval_smolvla_cube",
     single_task:        str  = "Grab the cube",
     num_episodes:       int  = 10,
-    episode_time_s:     int  = 60,
+    episode_time_s:     int  = 100,
     reset_time_s:       int  = 10,
     policy_device:      str  = "mps",
     push_to_hub:        bool = False,
