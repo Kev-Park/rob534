@@ -8,6 +8,7 @@ from pathlib import Path
 
 import robot_control as rc
 from motor_commands import load_home, PORT
+from struggle_monitor import LiveStruggleMonitor
 
 
 def go_home(home_pos: dict = None, port: str = "COM5",
@@ -184,6 +185,10 @@ def do_smol_vla_eval(
     single_task="Grab the cube and drop it ",
     num_episodes=1,
     episode_time_s=60,
+    use_struggle_monitor=False,
+    struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
+    struggle_check_interval=2.0,
+    struggle_threshold=0.6,
 ):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -304,6 +309,30 @@ def do_smol_vla_eval(
     robot.connect()
     listener, events = init_keyboard_listener()
 
+    # ── Struggle monitor (optional) ───────────────────────────────────────────
+    monitor = None
+    if use_struggle_monitor:
+        monitor = LiveStruggleMonitor(
+            key_file=struggle_key_file,
+            model="gemini-2.5-flash",
+            check_interval=struggle_check_interval,
+            struggle_threshold=struggle_threshold,
+        )
+        monitor.start()
+        monitor.start_capture(camera_index=1)
+        print("  [StruggleMonitor] watching camera — will flag struggling episodes")
+
+    def _struggle_watcher(stop_evt):
+        """Background thread: sets exit_early when monitor signals struggling."""
+        while not stop_evt.is_set():
+            if monitor and monitor.is_struggling():
+                sig = monitor.get_signal()
+                print(f"\n  [StruggleMonitor] STRUGGLING — exiting episode early")
+                print(f"  Reason: {sig['reason']}  (conf={sig['confidence']:.2f})")
+                events["exit_early"] = True
+                break
+            stop_evt.wait(timeout=0.25)
+
     try:
         with VideoEncodingManager(dataset):
             for i in range(num_episodes):
@@ -311,6 +340,17 @@ def do_smol_vla_eval(
                 # immediately exit the first control loop iteration.
                 events["exit_early"] = False
                 events["rerecord_episode"] = False
+
+                if monitor:
+                    monitor.reset_signal()
+
+                # Watcher thread for this episode
+                watcher_stop = threading.Event()
+                if monitor:
+                    watcher = threading.Thread(
+                        target=_struggle_watcher, args=(watcher_stop,), daemon=True
+                    )
+                    watcher.start()
 
                 # Move arm to home position before each episode so every
                 # episode starts from the same known configuration.
@@ -333,6 +373,10 @@ def do_smol_vla_eval(
                     display_data=True,
                 )
 
+                # Stop the per-episode watcher
+                if monitor:
+                    watcher_stop.set()
+
                 frames_collected = (
                     dataset.episode_buffer is not None
                     and dataset.episode_buffer.get("size", 0) > 0
@@ -347,6 +391,8 @@ def do_smol_vla_eval(
                 if events["stop_recording"]:
                     break
     finally:
+        if monitor:
+            monitor.stop()
         # Move back to home before disconnecting so the arm parks cleanly.
         _go_home_with_robot(robot)
         robot.disconnect()
@@ -438,4 +484,5 @@ if __name__ == "__main__":
         repo_id="SkywalkerLi/eval_smolvla-aug",
         num_episodes=10,
         episode_time_s=45,
+        use_struggle_monitor=True,
     )
