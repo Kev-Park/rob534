@@ -64,6 +64,7 @@ import json
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -140,6 +141,10 @@ Count carefully from the frames:
   drop_attempts   : how many times did the gripper open to release the block AFTER
                     a successful pickup? (1 = one clean drop, 2+ = retries)
                     Do NOT count the initial open-gripper approach as a drop attempt.
+  task_accomplished: has the robot fully completed the task? For pick-and-place this
+                    means the block is now at rest in/at the target (e.g. through a
+                    hole, inside a container, on a mark). Set true ONLY when the block
+                    is visibly at rest in the target at the END of this window.
 
 NORMAL BEHAVIOUR — do NOT penalise these:
   - A single re-grasp: the gripper briefly re-closes to improve grip (pickup_attempts = 2 is fine)
@@ -157,6 +162,7 @@ Return ONLY JSON with fields:
   interrupt_probability (float 0-1),
   pickup_attempts (int),
   drop_attempts (int),
+  task_accomplished (bool),
   reason (one sentence explaining the score).
 """
 
@@ -177,9 +183,11 @@ INTERRUPT_SCHEMA = {      # matches INTERRUPT_PROMPT
         "interrupt_probability": {"type": "number"},
         "pickup_attempts":       {"type": "integer"},
         "drop_attempts":         {"type": "integer"},
+        "task_accomplished":     {"type": "boolean"},
         "reason":                {"type": "string"},
     },
-    "required": ["interrupt_probability", "pickup_attempts", "drop_attempts", "reason"],
+    "required": ["interrupt_probability", "pickup_attempts", "drop_attempts",
+                 "task_accomplished", "reason"],
 }
 
 # Sentinel values returned before the first Gemini call completes.
@@ -188,6 +196,7 @@ _DEFAULT_INTERRUPT = {
     "interrupt_probability": 0.0,
     "pickup_attempts": 0,
     "drop_attempts": 0,
+    "task_accomplished": False,
     "reason": "no assessment yet",
 }
 
@@ -430,6 +439,118 @@ class _EpisodeScorer:
         return p_filtered, round(time_factor, 2), round(p_cap, 2)
 
 
+# ── Episode state tracking ────────────────────────────────────────────────────
+
+@dataclass
+class EpisodeState:
+    """Per-episode summary accumulated across all Gemini checks.
+
+    Designed to track policy quality across training iterations — e.g. comparing
+    clean-pickup rate or success-window distribution before and after teacher training.
+
+    Fields
+    ------
+    target_reached   : block was successfully placed at the target.
+    clean_pickup     : single pickup attempt (no retries); None if no pickup seen yet.
+    pickup_attempts  : total pickup attempts (max seen across all checks this episode).
+    clean_drop       : single drop attempt (no retries); None if no drop seen yet.
+    drop_recorrected : had a failed drop (≥2 attempts) but still completed the task.
+    max_probability  : peak interrupt_probability seen this episode.
+    avg_probability  : mean interrupt_probability across all checks.
+    success_window   : when task was first accomplished —
+                       "first_15s" (0–15 s), "next_15s" (15–30 s), "last" (>30 s),
+                       or None (task not completed).
+    """
+    target_reached:    bool        = False
+    clean_pickup:      bool | None = None
+    pickup_attempts:   int         = 0
+    clean_drop:        bool | None = None
+    drop_recorrected:  bool | None = None
+    max_probability:   float       = 0.0
+    avg_probability:   float       = 0.0
+    success_window:    str | None  = None
+
+    def __str__(self) -> str:
+        return (
+            f"target_reached={self.target_reached}"
+            f"  pickup_attempts={self.pickup_attempts}  clean_pickup={self.clean_pickup}"
+            f"  clean_drop={self.clean_drop}  drop_recorrected={self.drop_recorrected}"
+            f"  max_p={self.max_probability:.3f}  avg_p={self.avg_probability:.3f}"
+            f"  success_window={self.success_window}"
+        )
+
+
+class EpisodeStateTracker:
+    """Accumulates per-check Gemini results into an EpisodeState summary.
+
+    Call ``update()`` with each Gemini result and the elapsed episode time.
+    Call ``get_state()`` at any point (typically episode end) for the summary.
+    """
+
+    _WIN1: float = 15.0   # boundary between first and second window (seconds)
+    _WIN2: float = 30.0   # boundary between second and last window (seconds)
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._probs:            list[float]  = []
+        self._max_picks:        int          = 0
+        self._max_drops:        int          = 0
+        self._first_success_t:  float | None = None
+        self._drops_at_success: int          = 0   # drop count when task first accomplished
+
+    def update(self, result: dict, ep_elapsed: float) -> None:
+        """Ingest one Gemini check result. ep_elapsed = seconds since episode start."""
+        p = float(result.get("interrupt_probability", 0.0))
+        self._probs.append(p)
+
+        picks = int(result.get("pickup_attempts", 0))
+        drops = int(result.get("drop_attempts",   0))
+        self._max_picks = max(self._max_picks, picks)
+        self._max_drops = max(self._max_drops, drops)
+
+        if result.get("task_accomplished", False) and self._first_success_t is None:
+            self._first_success_t  = ep_elapsed
+            self._drops_at_success = drops
+
+    def get_state(self) -> EpisodeState:
+        """Return accumulated EpisodeState (safe to call at any time)."""
+        n     = len(self._probs)
+        avg_p = float(np.mean(self._probs)) if n else 0.0
+        max_p = float(max(self._probs))     if n else 0.0
+
+        # None = we haven't seen any pickup/drop yet (can't assess quality)
+        clean_pickup: bool | None = (self._max_picks == 1) if self._max_picks > 0 else None
+        clean_drop:   bool | None = (self._max_drops == 1) if self._max_drops > 0 else None
+
+        # Re-correction: had ≥2 drop attempts but the task was still accomplished
+        drop_recorrected: bool | None = None
+        if self._first_success_t is not None and self._max_drops > 0:
+            drop_recorrected = self._drops_at_success >= 2
+
+        t = self._first_success_t
+        if t is None:
+            success_window: str | None = None
+        elif t <= self._WIN1:
+            success_window = "first_15s"
+        elif t <= self._WIN2:
+            success_window = "next_15s"
+        else:
+            success_window = "last"
+
+        return EpisodeState(
+            target_reached   = self._first_success_t is not None,
+            clean_pickup     = clean_pickup,
+            pickup_attempts  = self._max_picks,
+            clean_drop       = clean_drop,
+            drop_recorrected = drop_recorrected,
+            max_probability  = round(max_p, 3),
+            avg_probability  = round(avg_p, 3),
+            success_window   = success_window,
+        )
+
+
 # ── Live monitor ──────────────────────────────────────────────────────────────
 
 class LiveStruggleMonitor:
@@ -489,6 +610,9 @@ class LiveStruggleMonitor:
         self._capture_thread: threading.Thread | None = None
         self._capture_fps: float = fps
 
+        self._state_tracker: EpisodeStateTracker = EpisodeStateTracker()
+        self._episode_start: float               = time.time()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def push_frame(self, frame: np.ndarray) -> None:
@@ -521,11 +645,17 @@ class LiveStruggleMonitor:
         """Return the current EMA struggle score (0–1)."""
         return self._struggle_score
 
+    def get_episode_state(self) -> EpisodeState:
+        """Return the accumulated episode state summary (safe to call at any time)."""
+        return self._state_tracker.get_state()
+
     def reset_signal(self) -> None:
-        """Clear all signals and the EMA score. Call at the start of each episode."""
+        """Clear all signals, EMA score, and episode state. Call at the start of each episode."""
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
+        self._state_tracker.reset()
+        self._episode_start  = time.time()
 
     def start(self) -> None:
         """Start the background Gemini monitoring thread."""
@@ -613,12 +743,15 @@ class LiveStruggleMonitor:
                         self._ema_alpha * p
                         + (1 - self._ema_alpha) * self._struggle_score
                     )
+                    ep_elapsed = time.time() - self._episode_start
+                    self._state_tracker.update(result, ep_elapsed)
                     status = "INTERRUPT" if self.is_struggling() else "ok     "
                     print(
                         f"[StruggleMonitor] {status}"
                         f"  p={p:.2f}  ema={self._struggle_score:.2f}"
                         f"  picks={result['pickup_attempts']}"
                         f"  drops={result['drop_attempts']}"
+                        f"  done={result.get('task_accomplished', False)}"
                         f"  | {result['reason']}"
                     )
                 except Exception as e:
@@ -957,6 +1090,7 @@ def test_on_dataset(
         state_buf:  deque = deque(maxlen=buffer_size)
 
         scorer              = _EpisodeScorer(ema_alpha)
+        ep_tracker          = EpisodeStateTracker()
         n_checks            = 0
         first_interrupt_ts: float | None = None
         last_result         = _DEFAULT_INTERRUPT.copy()
@@ -1001,6 +1135,7 @@ def test_on_dataset(
                     )
                     last_result = result
                     n_checks   += 1
+                    ep_tracker.update(result, ep_elapsed)
 
                     p_raw                          = float(result["interrupt_probability"])
                     p_filtered, time_factor, p_cap = scorer.update(p_raw, ep_elapsed)
@@ -1040,6 +1175,7 @@ def test_on_dataset(
         lab             = labels.get(ep_idx, {})
         final_interrupt = scorer.struggle_score >= interrupt_threshold
         mean_prob       = float(np.mean(all_probs)) if all_probs else 0.0
+        ep_state        = ep_tracker.get_state()
 
         rows.append({
             "episode_index":         ep_idx,
@@ -1052,6 +1188,16 @@ def test_on_dataset(
             "final_pickup_attempts": last_result["pickup_attempts"],
             "final_drop_attempts":   last_result["drop_attempts"],
             "final_reason":          last_result["reason"],
+            # Episode state (for cross-iteration policy comparison)
+            "target_reached":        ep_state.target_reached,
+            "clean_pickup":          ep_state.clean_pickup,
+            "pickup_attempts":       ep_state.pickup_attempts,
+            "clean_drop":            ep_state.clean_drop,
+            "drop_recorrected":      ep_state.drop_recorrected,
+            "max_probability":       ep_state.max_probability,
+            "avg_probability":       ep_state.avg_probability,
+            "success_window":        ep_state.success_window,
+            # Ground-truth labels
             "label_success":         lab.get("success", None),
             "label_pick":            lab.get("pick",    None),
             "label_drop":            lab.get("drop",    None),

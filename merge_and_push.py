@@ -124,6 +124,38 @@ def push(repo_id: str, merged_root: Path):
     print(f"\nDone: https://huggingface.co/datasets/{repo_id}")
 
 
+def merge_dirs(repo_id: str, dirs: list[str]) -> Path:
+    """Merge a list of arbitrary local LeRobot dataset directories."""
+    roots    = [Path(d) for d in dirs]
+    repo_ids = [f"local/{r.name}" for r in roots]
+
+    print(f"Merging {len(roots)} dataset(s) -> {repo_id}")
+    total_eps = total_frames = 0
+    for r in roots:
+        info = json.load(open(r / "meta" / "info.json"))
+        eps, frames = info["total_episodes"], info["total_frames"]
+        total_eps    += eps
+        total_frames += frames
+        print(f"  {r.name:55s}  {eps:3d} eps  {frames:6d} frames")
+    print(f"\n  TOTAL: {total_eps} episodes, {total_frames} frames")
+    print(f"  Output: {MERGE_ROOT}\n")
+
+    if MERGE_ROOT.exists():
+        print(f"[info] Removing existing merge at {MERGE_ROOT}")
+        shutil.rmtree(MERGE_ROOT)
+
+    aggregate_datasets(
+        repo_ids=repo_ids,
+        aggr_repo_id=repo_id,
+        roots=roots,
+        aggr_root=MERGE_ROOT,
+    )
+
+    merged_info = json.load(open(MERGE_ROOT / "meta" / "info.json"))
+    print(f"\nMerge complete: {merged_info['total_episodes']} episodes, {merged_info['total_frames']} frames")
+    return MERGE_ROOT
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge augmented datasets and push to HuggingFace")
     parser.add_argument("--repo_id",     default=DEFAULT_REPO_ID,
@@ -132,9 +164,14 @@ def main():
                         help="Exclude the original orange-color dataset")
     parser.add_argument("--dry_run",     action="store_true",
                         help="Merge locally but do not push to HuggingFace")
+    parser.add_argument("--dirs",        nargs="+", default=None,
+                        help="Merge arbitrary local dataset directories instead of augmented pipeline")
     args = parser.parse_args()
 
-    merged_root = merge(args.repo_id, include_original=not args.no_original)
+    if args.dirs:
+        merged_root = merge_dirs(args.repo_id, args.dirs)
+    else:
+        merged_root = merge(args.repo_id, include_original=not args.no_original)
 
     if merged_root is None:
         return
@@ -148,4 +185,26 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # ── Press-play config ─────────────────────────────────────────────────────
+    HF_NAMESPACE  = "SkywalkerLi"          # folder in lerobot cache to scan
+    DATASET_PREFIX = "eval_smolvla_aug"  # match all dirs with this prefix
+    PLAY_REPO_ID   = "nc8304/eval_smolvla-aug"  # push target
+    # ─────────────────────────────────────────────────────────────────────────
+
+    cache = Path.home() / ".cache/huggingface/lerobot" / HF_NAMESPACE
+    found = sorted(
+        d for d in cache.iterdir()
+        if d.is_dir()
+        and d.name.startswith(DATASET_PREFIX)
+        and (d / "meta" / "info.json").exists()
+    )
+
+    if not found:
+        print(f"[error] No datasets matching '{DATASET_PREFIX}' found in {cache}")
+    else:
+        print(f"Found {len(found)} dataset(s) matching '{DATASET_PREFIX}':")
+        for d in found:
+            print(f"  {d.name}")
+        print()
+        merged = merge_dirs(PLAY_REPO_ID, [str(d) for d in found])
+        push(PLAY_REPO_ID, merged)

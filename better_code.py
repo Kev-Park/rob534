@@ -224,7 +224,7 @@ def do_smol_vla_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
-        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
     init_rerun(session_name="recording")
@@ -316,7 +316,7 @@ def do_smol_vla_eval(
             key_file=struggle_key_file,
             model="gemini-2.5-flash",
             check_interval=struggle_check_interval,
-            struggle_threshold=struggle_threshold,
+            interrupt_threshold=struggle_threshold,
         )
         monitor.start()
         monitor.start_capture(camera_index=1)
@@ -335,7 +335,11 @@ def do_smol_vla_eval(
 
     try:
         with VideoEncodingManager(dataset):
-            for i in range(num_episodes):
+            saved = 0       # episodes actually committed to disk
+            attempts = 0    # total record_loop runs (including redos)
+            is_redo = False
+            while saved < num_episodes:
+                attempts += 1
                 # Reset events so any stray keypress during go_home doesn't
                 # immediately exit the first control loop iteration.
                 events["exit_early"] = False
@@ -356,7 +360,8 @@ def do_smol_vla_eval(
                 # episode starts from the same known configuration.
                 # home_pos is loaded from home_pos.json (set via motor_commands.py reset_home).
                 _go_home_with_robot(robot)
-                print(f"\n  Episode {i + 1}/{num_episodes}")
+                redo_tag = f"  [redo]" if is_redo else ""
+                print(f"\n  Episode {saved + 1}/{num_episodes}{redo_tag}")
                 record_loop(
                     robot=robot,
                     events=events,
@@ -373,20 +378,32 @@ def do_smol_vla_eval(
                     display_data=True,
                 )
 
-                # Stop the per-episode watcher
+                # Stop the per-episode watcher and print episode summary
                 if monitor:
                     watcher_stop.set()
+                    ep_state = monitor.get_episode_state()
+                    print(f"\n  [EpisodeState] {ep_state}")
 
                 frames_collected = (
                     dataset.episode_buffer is not None
                     and dataset.episode_buffer.get("size", 0) > 0
                 )
-                if frames_collected:
-                    dataset.save_episode()
-                else:
-                    print(f"  WARNING: Episode {i + 1} collected no frames — skipping save.")
+                if events.get("rerecord_episode"):
+                    # Discard regardless of buffer state — user pressed left/rerecord.
+                    print(f"  Re-recording episode {saved + 1} (attempt {attempts})")
                     if dataset.episode_buffer is not None:
                         dataset.clear_episode_buffer()
+                    is_redo = True
+                elif frames_collected:
+                    dataset.save_episode()
+                    saved += 1
+                    is_redo = False
+                else:
+                    print(f"  WARNING: Episode {saved + 1} collected no frames — skipping save.")
+                    if dataset.episode_buffer is not None:
+                        dataset.clear_episode_buffer()
+                    saved += 1   # count it as done to avoid infinite loop on persistent failure
+                    is_redo = False
 
                 if events["stop_recording"]:
                     break
@@ -480,9 +497,9 @@ if __name__ == "__main__":
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
     #do_eval(policy_path="SkywalkerLi/act-so101")
     do_smol_vla_eval(
-        policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        repo_id="SkywalkerLi/eval_smolvla-aug",
-        num_episodes=10,
+        policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
+        repo_id="SkywalkerLi/eval_smolvla-phase-split-new-prompts_05",
+        num_episodes=4,
         episode_time_s=45,
-        use_struggle_monitor=True,
+        use_struggle_monitor=False,
     )

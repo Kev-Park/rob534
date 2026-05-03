@@ -143,12 +143,21 @@ def _duplicate_buffer(source_dataset, target_dataset) -> int:
     skip_keys = {"size", "frame_index", "episode_index", "index", "task_index", "timestamp"}
     data_keys = [k for k in buf if k not in skip_keys]
 
+    import numpy as np
+    from PIL import Image as PILImage
+
     for i in range(n_frames):
         frame = {}
         for k in data_keys:
             val = buf[k]
             if hasattr(val, "__len__") and i < len(val):
-                frame[k] = val[i]
+                v = val[i]
+                # VideoEncodingManager stores image frames as file paths (strings).
+                # Reload the actual pixel data before passing to the target dataset.
+                # Only do this for image keys — other string values (e.g. "task") pass through as-is.
+                if isinstance(v, str) and "image" in k:
+                    v = np.array(PILImage.open(v))
+                frame[k] = v
         if frame:
             target_dataset.add_frame(frame)
 
@@ -253,7 +262,7 @@ def do_ab_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
-        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
     init_rerun(session_name="recording")
@@ -484,3 +493,16 @@ def do_ab_eval(
         # Must be called on both so neither dataset is left incomplete.
         dataset_a.finalize()
         dataset_b.finalize()
+
+
+if __name__ == "__main__":
+    from better_code import resolve_policy_path
+
+    do_ab_eval(
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        repo_id_b="SkywalkerLi/eval_smolvla-phase-split_policyb",
+        repo_id_a="SkywalkerLi/eval_smolvla-aug_policya",
+        num_episodes=10,
+        episode_time_s=45,
+    )
