@@ -258,20 +258,30 @@ def do_smol_vla_eval(
     # connection, camera, and policy weights stay in memory for the full run.
 
     # Robot + camera: opened once, camera warms up once (warmup_s=2).
-    # When use_edge_removed is on, the policy was trained on observation.images.front,
-    # so we name the camera "front" to match — same hardware (index_or_path=1).
-    camera_key = "front" if use_edge_removed else "camera1"
+    # Always configure only one physical camera (camera1) to avoid opening the
+    # same device multiple times. When use_edge_removed is on, the policy expects
+    # camera1/camera2/camera3 — we inject synthetic feature entries for camera2/3
+    # and copy frames from camera1 in the monkey-patch below.
+    cameras = {
+        "camera1": OpenCVCameraConfig(index_or_path=CAMERA_INDEX, fps=30, width=640, height=480, warmup_s=2),
+    }
     robot_cfg = SOFollowerRobotConfig(
         port=PORT,
         id="student_arm",
         use_degrees=True,
-        cameras={
-            camera_key: OpenCVCameraConfig(
-                index_or_path=CAMERA_INDEX, fps=30, width=640, height=480, warmup_s=2,
-            )
-        },
+        cameras=cameras,
     )
     robot = SOFollower(robot_cfg)
+
+    # Inject synthetic camera2/camera3 observation features so dataset_features
+    # and make_policy see all three cameras the edge-removed policy was trained on.
+    # observation_features uses short keys ("camera1"), not the full dotted path.
+    if use_edge_removed:
+        obs_feats = robot.observation_features  # triggers @cached_property — returns mutable dict
+        cam1_feat = obs_feats.get("camera1")
+        if cam1_feat is not None:
+            obs_feats["camera2"] = cam1_feat
+            obs_feats["camera3"] = cam1_feat
 
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.pretrained_path = policy_path
@@ -336,14 +346,16 @@ def do_smol_vla_eval(
         _orig_get_obs = robot.get_observation
         def _get_obs_edge_removed():
             obs = _orig_get_obs()
-            full_key = f"observation.images.{camera_key}"
-            frame = obs.get(full_key)
+            # get_observation returns short keys ("camera1"), not full dotted paths
+            frame = obs.get("camera1")
             if frame is not None:
-                obs[full_key] = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
+                processed = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
+                obs["camera1"] = processed
+                obs["camera2"] = processed
+                obs["camera3"] = processed
             return obs
         robot.get_observation = _get_obs_edge_removed
-        print(f"  [edge-removed] applying Sobel(ksize={edge_ksize}, thr={edge_threshold}) "
-              f"to '{camera_key}' frames live.")
+        print(f"  [edge-removed] Sobel(ksize={edge_ksize}, thr={edge_threshold}) — camera1 frame replicated to camera2/camera3")
 
     listener, events = init_keyboard_listener()
 
