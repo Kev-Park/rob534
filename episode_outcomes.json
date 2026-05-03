@@ -1,0 +1,210 @@
+{
+  "episode_0000.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0001.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully grasps and lifts the orange cube. It then begins to transport the cube, but the video ends before the arm reaches the target drop-off location. Because the arm did not bring the block over the correct region within the observed time, this is classified as a failure to move the block."
+  },
+  "episode_0002.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0003.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0004.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube and held it for a few seconds. However, it failed to transport the cube to the target region, dropping it prematurely near the top edge of the workspace, far from the intended hole."
+  },
+  "episode_0005.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube, moved it directly over the correct square-shaped hole in the target region, and released it. The cube fell cleanly through the hole."
+  },
+  "episode_0006.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube and transported it to the target area. However, it moved the cube over the incorrect rectangular hole and dropped it there, instead of moving it over the correct cube-shaped hole."
+  },
+  "episode_0007.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the block and transported it directly over the correct square-shaped hole. However, upon release, the block did not fall through the hole but instead landed on the surface of the target board."
+  },
+  "episode_0008.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it over the correct square-shaped hole. However, when the gripper released the block, it hit the top edge of the target board and bounced off, failing to fall through the hole."
+  },
+  "episode_0009.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the orange cube, moved it directly over the square-shaped hole, and released it. The cube fell cleanly through the hole, completing the task as intended."
+  },
+  "episode_0010.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube, moved it directly over the correct square-shaped hole, and released it. The cube fell cleanly through the hole."
+  },
+  "episode_0011.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully grasped the cube, transported it directly over the square-shaped hole, and released it. The cube fell cleanly through the hole as intended."
+  },
+  "episode_0012.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0013.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0014.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0015.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it to the target area. However, it failed to position the block over the correct square-shaped hole, instead releasing it over the triangular hole to the left, causing the block to land on the surface."
+  },
+  "episode_0016.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully grasped the block and lifted it. However, it failed to transport the block to the correct target area, instead dropping it far to the left, near the edge of the workspace."
+  },
+  "episode_0017.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it over the correct square-shaped hole. However, upon release, the block hit the edge of the hole and landed on the surface next to it, rather than falling through."
+  },
+  "episode_0018.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube, moved it directly over the correct square-shaped hole, and released it. The cube fell cleanly through the hole."
+  },
+  "episode_0019.mp4": {
+    "outcome": "failure_to_pick_up_block",
+    "confidence": 1.0,
+    "reasoning": "The robot gripper initially grasps the cube and lifts it from the surface. However, the grasp is not secure, and the cube slips out and falls back to the workspace near the pickup location before the arm begins to transport it to the target region."
+  },
+  "episode_0020.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0021.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0022.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0023.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the orange cube, moved it directly over the square-shaped hole, and released it. The cube fell cleanly through the hole, indicating a successful completion of the task."
+  },
+  "episode_0024.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the block and transported it over the correct square-shaped hole. However, upon release, the block hit the edge of the hole and fell behind the target board instead of falling through it."
+  },
+  "episode_0025.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0026.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0027.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the orange cube, moved it directly over the square-shaped hole, and released it. The cube fell cleanly through the hole, successfully completing the task."
+  },
+  "episode_0028.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0029.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0030.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picks up the block and moves it directly over the correct square-shaped hole. However, it never opens its gripper to release the block into the hole."
+  },
+  "episode_0031.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it over the correct square-shaped hole. However, when the gripper released the block, it hit the edge of the hole and landed on the surface of the target board instead of falling through."
+  },
+  "episode_0032.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0033.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0034.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0035.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0036.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it over the correct square-shaped hole. However, upon release, the block hit the edge of the hole and bounced onto the surface of the target instead of falling through."
+  },
+  "episode_0037.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0038.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picks up the cube and moves it directly over the correct square-shaped hole. However, the gripper never opens to release the cube, thus failing the drop portion of the task."
+  },
+  "episode_0039.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0040.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube, moved it directly over the square-shaped hole in the target region, and released it. The cube fell cleanly through the hole, indicating a successful completion of the task."
+  },
+  "episode_0041.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully grasped and lifted the block. However, it failed to transport the block over the correct target hole. The arm moved the block to the left of the target fixture and dropped it there, completely missing the intended drop zone."
+  },
+  "episode_0042.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the block and transported it over the correct square-shaped hole. However, upon release, the block landed on the surface of the target area next to the hole, rather than falling through it."
+  },
+  "episode_0043.mp4": {
+    "outcome": "failure_to_move_block_over_correct_region",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the block and moved it to the target area. However, it failed to position the block over the correct square-shaped hole, releasing it too far to the right, causing the block to land on the solid surface of the target."
+  },
+  "episode_0044.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube, moved it directly over the correct square-shaped hole, and released it. The cube fell cleanly through the hole."
+  },
+  "episode_0045.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot successfully picked up the block and transported it over the correct target hole. However, upon release, the block landed on the surface next to the hole and did not fall through."
+  },
+  "episode_0046.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  },
+  "episode_0047.mp4": {
+    "outcome": "failure_to_drop_block",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully picked up the cube and transported it directly over the correct square-shaped hole. However, the gripper never opened to release the block. The video ends with the arm still holding the cube in position."
+  },
+  "episode_0048.mp4": {
+    "outcome": "success",
+    "confidence": 1.0,
+    "reasoning": "The robot arm successfully grasped the orange cube, transported it directly over the square-shaped hole, and released it. The cube fell cleanly through the hole as intended."
+  },
+  "episode_0049.mp4": {
+    "error": "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"
+  }
+}

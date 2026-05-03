@@ -137,6 +137,17 @@ def _duplicate_buffer(source_dataset, target_dataset) -> int:
     if buf is None or buf.get("size", 0) == 0:
         return 0
 
+    # When use_videos=True the image writer spills each frame to disk and the
+    # buffer entry is replaced with the on-disk PNG path. Wait for any pending
+    # writes so those paths point at files that actually exist before we read
+    # them back.
+    iw = getattr(source_dataset, "image_writer", None)
+    if iw is not None and hasattr(iw, "wait_until_done"):
+        iw.wait_until_done()
+
+    import numpy as np
+    from PIL import Image
+
     n_frames = buf["size"]
 
     # Skip keys that the dataset manages internally
@@ -147,8 +158,14 @@ def _duplicate_buffer(source_dataset, target_dataset) -> int:
         frame = {}
         for k in data_keys:
             val = buf[k]
-            if hasattr(val, "__len__") and i < len(val):
-                frame[k] = val[i]
+            if not (hasattr(val, "__len__") and i < len(val)):
+                continue
+            v = val[i]
+            # Path strings only show up for image features; load them back
+            # into ndarrays so the target's add_frame() accepts them.
+            if isinstance(v, str) and k.startswith("observation.images."):
+                v = np.array(Image.open(v))
+            frame[k] = v
         if frame:
             target_dataset.add_frame(frame)
 
@@ -248,12 +265,12 @@ def do_ab_eval(
 
     # Start rerun visualization on port 9090. Skip if already running so we
     # don't clear the view from a previous session.
-    if _rerun_is_running():
-        print("  Rerun viewer already running on :9090, skipping restart.")
-    else:
-        subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
-        subprocess.Popen(["rerun", "--serve-web"])
-        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+    # if _rerun_is_running():
+    #     print("  Rerun viewer already running on :9090, skipping restart.")
+    # else:
+    #     subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
+    #     subprocess.Popen(["rerun", "--serve-web"])
+    #     threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
     init_rerun(session_name="recording")
@@ -266,12 +283,12 @@ def do_ab_eval(
     # SO-101 arm on COM5 + OpenCV camera at index 1.
     # camera name "camera1" must match observation.images.camera1 in the policy.
     robot_cfg = SOFollowerRobotConfig(
-        port="COM5",
+        port="/dev/tty.usbmodem5AB01813041",#"COM5",
         id="student_arm",
         use_degrees=True,
         cameras={
             "camera1": OpenCVCameraConfig(
-                index_or_path=1, fps=30, width=640, height=480, warmup_s=2,
+                index_or_path=0, fps=30, width=640, height=480, warmup_s=2,
             )
         },
     )
@@ -299,7 +316,7 @@ def do_ab_eval(
         """Load policy config and fix any cluster-specific paths baked into it."""
         cfg = PreTrainedConfig.from_pretrained(policy_path)
         cfg.pretrained_path = policy_path
-        cfg.device = "cuda"
+        cfg.device = "mps"
         # Policies trained on a compute cluster may have an absolute path like
         # /scratch/gpfs/... baked into config.json for the VLM backbone.
         # Override it to the public HF model ID so it resolves locally.
@@ -351,7 +368,7 @@ def do_ab_eval(
         pretrained_path=policy_path_a,
         dataset_stats=rename_stats(dataset_a.meta.stats, {}),
         preprocessor_overrides={
-            "device_processor": {"device": "cuda"},
+            "device_processor": {"device": "mps"},
             "rename_observations_processor": {"rename_map": {}},
         },
     )
@@ -366,7 +383,7 @@ def do_ab_eval(
         pretrained_path=policy_path_b,
         dataset_stats=rename_stats(dataset_b.meta.stats, {}),
         preprocessor_overrides={
-            "device_processor": {"device": "cuda"},
+            "device_processor": {"device": "mps"},
             "rename_observations_processor": {"rename_map": {}},
         },
     )

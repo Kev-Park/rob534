@@ -13,7 +13,7 @@ LEROBOT_REPLAY = str(_VENV_SCRIPTS / "lerobot-replay")
 
 ROBOT_DEFAULTS = {
     "type":    "so101_follower",
-    "port":    "COM5", #"/dev/tty.usbmodem5AB01813041",
+    "port":    "/dev/tty.usbmodem5AB01813041", #"COM5", 
     "id":      "student_arm",
     "cameras": "{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 10}}",
 }
@@ -26,7 +26,7 @@ SMOLVLA_ROBOT_DEFAULTS = {
 
 TELEOP_DEFAULTS = {
     "type": "so101_leader",
-    "port": "COM4", #"/dev/tty.usbmodem5A7C1216851",
+    "port": "/dev/tty.usbmodem5A7C1216851", #"COM4"
     "id":   "teacher_arm",
 }
 
@@ -66,10 +66,10 @@ def record(
     repo_id:            str  = "nc8304/so101_test2",
     num_episodes:       int  = 5,
     single_task:        str  = "Testing",
-    display_data:       bool = True,
+    display_data:       bool = False,
     display_ip:         str  = "127.0.0.1",
     display_port:       int  = 9876,
-    streaming_encoding: bool = True,
+    streaming_encoding: bool = False,
     encoder_threads:    int  = 2,
     resume:             bool = False,
     robot=ROBOT_DEFAULTS,
@@ -114,8 +114,8 @@ def eval(
     repo_id:            str  = "eval/so101_eval",
     num_episodes:       int  = 5,
     single_task:        str  = "Testing",
-    display_data:       bool = True,
-    streaming_encoding: bool = True,
+    display_data:       bool = False,
+    streaming_encoding: bool = False,
     encoder_threads:    int  = 2,
     resume:             bool = False,
     robot=ROBOT_DEFAULTS,

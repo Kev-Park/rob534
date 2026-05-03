@@ -1,10 +1,10 @@
-"""Read a video from ./rollouts/ and classify the robot arm failure mode with Gemini Flash.
+"""Read a video from ./rollouts/ and classify the rollout outcome with Gemini Pro.
 
 Usage:
     export GEMINI_API_KEY=...
     python analyze_rollout.py                               # uses most recent video in rollouts/
     python analyze_rollout.py rollouts/rollout_XYZ.mp4      # analyze a specific file
-    python analyze_rollout.py --model gemini-2.5-flash
+    python analyze_rollout.py --model gemini-2.5-pro
 
 Requirements:
     pip install google-genai
@@ -20,41 +20,65 @@ from google import genai
 from google.genai import types
 
 
-FAILURE_MODES = [
+OUTCOMES = [
+    "success",
     "failure_to_pick_up_block",
     "failure_to_move_block_over_correct_region",
     "failure_to_drop_block",
 ]
 
-PROMPT = """You are reviewing a video of a robotic arm attempting a pick-and-place task:
-pick up a block, move it over the correct target region, and drop it there.
+PROMPT = """You are reviewing a video of a robotic arm attempting a pick-and-place task.
+The task is to pick up a cube and drop it into a cube-shaped hole in the target region.
+The rollout is only a success if the cube actually FALLS THROUGH the hole — landing on
+top of the hole, next to it, or bouncing off the edge does NOT count as success.
 
-The rollout failed. Identify which ONE of the following failure modes best matches what you see:
+Classify the rollout into exactly ONE of the following outcomes:
 
-1. failure_to_pick_up_block
-   The arm never successfully grasped the block. It may have missed, knocked the block,
-   closed the gripper on empty air, or dropped the block immediately at the pickup point.
+1. success
+   The arm grasped the cube, carried it over the hole, released it, and the cube
+   visibly fell THROUGH the cube-shaped hole (disappearing into / below the target).
+   If the cube lands on top of, beside, or bounces off the hole, this is NOT success.
 
-2. failure_to_move_block_over_correct_region
-   The arm did grasp the block, but failed to bring it over the correct target region.
-   It moved to the wrong place, stopped short, or dropped the block in transit.
+2. failure_to_pick_up_block
+   The arm never got a solid, stable grasp of the cube. This includes:
+     - Missing the cube entirely or closing the gripper on empty air
+     - Just nudging, knocking, or brushing the cube without lifting it
+     - The cube slipping out of the gripper immediately or within the first ~1s of lifting
+     - Only partially gripping it so the cube falls back to the table near the pickup point
+   IMPORTANT: if the cube ever falls out of the gripper before the arm has clearly
+   transported it across to the target area, classify this as failure_to_pick_up_block,
+   NOT failure_to_move_block_over_correct_region. A drop near the pickup zone is a
+   pickup failure, not a transport failure.
 
-3. failure_to_drop_block
-   The arm grasped the block AND moved it over the correct region, but failed to release it.
-   The gripper never opened, opened too late, or the block stayed stuck to the gripper.
+3. failure_to_move_block_over_correct_region
+   The arm got a SOLID grasp of the cube and held it stably while moving, but failed
+   to bring it over the cube-shaped hole. Use this only when the gripper clearly
+   transports the cube some distance and the failure is about WHERE it goes — wrong
+   target, stops short, overshoots, or the cube only escapes the gripper near/over
+   the wrong region after sustained transport.
 
-Classify strictly — pick the earliest failure in the sequence pickup -> transport -> release.
-Return ONLY a JSON object with fields: failure_mode, confidence (0-1), reasoning (1-3 sentences).
+4. failure_to_drop_block
+   The arm grasped the cube, carried it cleanly over the hole, but failed to release
+   it (gripper stayed closed) OR released it but the cube landed on top of / beside
+   the hole instead of falling through.
+
+Decision order:
+  - First check pickup: was the grasp solid and sustained? If no → failure_to_pick_up_block.
+  - Then check transport: did it reach the hole? If no → failure_to_move_block_over_correct_region.
+  - Then check release: did the cube actually fall through the hole? If yes → success,
+    otherwise → failure_to_drop_block.
+
+Return ONLY a JSON object with fields: outcome, confidence (0-1), reasoning (1-3 sentences).
 """
 
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "failure_mode": {"type": "string", "enum": FAILURE_MODES},
+        "outcome": {"type": "string", "enum": OUTCOMES},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
     },
-    "required": ["failure_mode", "confidence", "reasoning"],
+    "required": ["outcome", "confidence", "reasoning"],
 }
 
 
@@ -82,7 +106,7 @@ def wait_for_file_active(client: genai.Client, file_obj, timeout: float = 120.0)
     return file_obj
 
 
-def analyze_video(video_path: Path, model: str = "gemini-2.5-flash") -> dict:
+def analyze_video(video_path: Path, model: str = "gemini-2.5-pro", fps: float = 5.0) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment.")
@@ -93,11 +117,17 @@ def analyze_video(video_path: Path, model: str = "gemini-2.5-flash") -> dict:
     uploaded = client.files.upload(file=str(video_path))
     uploaded = wait_for_file_active(client, uploaded)
 
-    print(f"Calling {model}...")
+    # Wrap the file as a Part so we can override the default 1 fps sampling rate.
+    video_part = types.Part(
+        file_data=types.FileData(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
+        video_metadata=types.VideoMetadata(fps=fps),
+    )
+
+    print(f"Calling {model} (sampling at {fps} fps)...")
     try:
         response = client.models.generate_content(
             model=model,
-            contents=[uploaded, PROMPT],
+            contents=[video_part, PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=RESPONSE_SCHEMA,
@@ -121,7 +151,9 @@ def main():
         help="Path to video. If omitted, picks the newest .mp4 in rollouts/."
     )
     parser.add_argument("--rollouts-dir", default="rollouts")
-    parser.add_argument("--model", default="gemini-2.5-flash")
+    parser.add_argument("--model", default="gemini-2.5-pro")
+    parser.add_argument("--fps", type=float, default=5.0,
+                        help="Frame sampling rate sent to Gemini (default 5.0; Gemini default is 1.0)")
     args = parser.parse_args()
 
     video_path = Path(args.video) if args.video else latest_rollout(args.rollouts_dir)
@@ -130,7 +162,7 @@ def main():
         sys.exit(1)
 
     print(f"Analyzing: {video_path}")
-    result = analyze_video(video_path, model=args.model)
+    result = analyze_video(video_path, model=args.model, fps=args.fps)
 
     print("\n=== Result ===")
     print(json.dumps(result, indent=2))

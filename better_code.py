@@ -90,7 +90,7 @@ def _wait_and_open_viewer(port=9090, timeout=30):
     webbrowser.open(f"http://localhost:{port}/?url=rerun%2Bhttp%3A%2F%2Flocalhost%3A9876%2Fproxy")
 
 REPO_IDS = {
-    "skywalker": "SkywalkerLi/so101_03_21_26_data_v1",
+    "skywalker": "SkywalkerLi/so101_05_02_26_data_v1",
     "nicole": "nc8304/so101_031626"
 }
 
@@ -233,12 +233,12 @@ def do_smol_vla_eval(
 
     # Robot + camera: opened once, camera warms up once (warmup_s=2).
     robot_cfg = SOFollowerRobotConfig(
-        port="COM5",
+        port="/dev/tty.usbmodem5AB01813041",
         id="student_arm",
         use_degrees=True,
         cameras={
             "camera1": OpenCVCameraConfig(
-                index_or_path=1, fps=30, width=640, height=480, warmup_s=2,
+                index_or_path=0, fps=30, width=640, height=480, warmup_s=2,
             )
         },
     )
@@ -430,12 +430,36 @@ if __name__ == "__main__":
 
     #get_current_pos()
     #do_teleoperate()
-    #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
+    # do_record(repo_id=REPO_IDS["skywalker"], num_episodes=20, single_task="drop cube in the target region", resume=False) #if file exsists make new one
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
     #do_eval(policy_path="SkywalkerLi/act-so101")
-    do_smol_vla_eval(
-        policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        repo_id="SkywalkerLi/eval_smolvla-aug",
-        num_episodes=10,
+    # do_smol_vla_eval(
+    #     policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+    #     repo_id="SkywalkerLi/eval_smolvla-aug",
+    #     num_episodes=10,
+    #     episode_time_s=45,
+    # )
+
+    # from ab_eval import do_ab_eval
+    # from better_code import resolve_policy_path
+
+    # do_ab_eval(
+    #        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+    #        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+    #        repo_id_a="SkywalkerLi/eval_smolvla-aug",
+    #        repo_id_b="SkywalkerLi/eval_smolvla-phase-split",
+    #        num_episodes=20,       # total episodes across both policies
+    #        episode_time_s=45,     # max seconds per episode
+    # )
+
+    from student_teacher_failure_analysis import do_student_teacher_failure_analysis
+    from better_code import resolve_policy_path
+
+    do_student_teacher_failure_analysis(
+        student_policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        teacher_policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
+        repo_id_student="SkywalkerLi/eval_smolvla-aug",
+        repo_id_teacher="SkywalkerLi/eval_smolvla-phase-split-new-prompts",
+        num_student_episodes=2,
         episode_time_s=45,
     )
