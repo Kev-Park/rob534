@@ -1,22 +1,62 @@
 """
-Live policy struggle monitor using Gemini.
+struggle_monitor — Gemini-based interrupt detector for robot manipulation policies
+==================================================================================
 
-A background thread watches a rolling window of camera frames and
-periodically asks Gemini whether the robot is struggling. Your control
-loop just calls is_struggling() — no Gemini latency on the hot path.
+Motivation
+----------
+Imitation-learning policies for robot manipulation can fail silently. When a
+pick-and-place policy starts looping, drops the block repeatedly, or gets stuck,
+a human operator needs to notice and switch to a different policy. Detecting this
+automatically with classical heuristics alone is hard: jerk and Lyapunov metrics
+flag erratic motion but lack the semantic understanding to tell apart a hesitant
+but ultimately successful grasp from a genuine failure.
+
+We use Gemini as a vision-language supervisor. Every few seconds it receives a
+short clip (12 frames evenly sampled from a 20-second rolling window) alongside
+two supplementary text blocks derived from the robot's sensor stream:
+
+  * Stability block  — rolling jerk and Lyapunov trend computed from joint actions
+                       and observation states.
+  * Gripper block    — raw gripper-angle trace with numerically counted open/close
+                       events. This is supplementary: Gemini is asked to count
+                       pickup/drop attempts from the *video*; the sensor trace
+                       lets it cross-check its visual read.
+
+From the frames Gemini estimates ``interrupt_probability`` (0–1) and counts
+``pickup_attempts`` / ``drop_attempts``. The raw probability is post-processed
+before driving the interrupt decision:
+
+  1. **Time ramp** — probability is linearly scaled from 0 at episode start to
+     its full value after ``TIME_RAMP_END_S`` seconds. This prevents the first
+     check (during the approach phase) from triggering a false positive.
+  2. **Probability cap** — the scaled value is capped at ``P_CAP_MIN`` early in
+     the episode, rising to ``P_CAP_MAX`` after ``CAP_RAMP_END_S`` seconds. High
+     probabilities are only allowed after the arm has had time to fail repeatedly.
+  3. **Median filter** — a 3-check rolling median kills isolated spike assessments.
+  4. **EMA** — an exponential moving average smooths the trend over time.
+     ``is_struggling()`` fires when the EMA score crosses ``interrupt_threshold``.
 
 Quick start
-───────────
-    monitor = LiveStruggleMonitor(key_file=r"C:/Users/calle/Desktop/gem.txt")
+-----------
+    monitor = LiveStruggleMonitor(key_file=r"C:/path/to/gem.txt")
     monitor.start()
 
     # inside your control loop (called every step):
-    monitor.push_frame(bgr_frame)        # numpy BGR uint8 from camera
+    monitor.push_frame(bgr_frame)               # numpy BGR uint8
+    monitor.push_observation(action, state)     # 1-D float32 arrays
+
     if monitor.is_struggling():
-        print(monitor.get_signal())      # {"struggling", "confidence", "reason"}
-        switch_policy()
+        detail = monitor.get_interrupt()        # {interrupt_probability, pickup_attempts,
+        switch_policy()                         #  drop_attempts, reason}
 
     monitor.stop()
+
+Batch evaluation
+----------------
+    python struggle_monitor.py batch --dataset nc8304/my-dataset --video-dir ./vids
+
+    Runs the interrupt monitor over every episode in a LeRobot dataset, compares
+    to ground-truth labels, and optionally renders annotated 3-panel videos.
 """
 
 import glob
@@ -35,8 +75,25 @@ from huggingface_hub import snapshot_download
 
 from analyze_rollout import load_api_key
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
 
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# Time ramp: scale interrupt probability linearly from 0 → 1 over the first N
+# seconds. Prevents early-episode checks from firing before the arm has had a
+# chance to attempt the task.
+TIME_RAMP_END_S: float = 30.0
+
+# Probability cap: Gemini's raw output is capped at P_CAP_MIN early in the
+# episode and rises to P_CAP_MAX by CAP_RAMP_END_S, so very high probabilities
+# are only possible after sustained struggle.
+P_CAP_MIN:      float = 0.75
+P_CAP_MAX:      float = 0.90
+CAP_RAMP_END_S: float = 60.0
+
+
+# ── Prompts & schemas ─────────────────────────────────────────────────────────
+
+# Legacy prompt — used by assess_frames (binary struggling judgment).
 STRUGGLE_PROMPT = """You are watching a sequence of frames from a live robot arm
 doing a pick-and-place task. The frames are evenly sampled from the last few seconds.
 {stability_block}
@@ -60,6 +117,7 @@ Not struggling:
 Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
 """
 
+# Primary prompt — used by assess_interrupt (probabilistic, 20-second window).
 INTERRUPT_PROMPT = """You are a supervisor watching 20 seconds of a robot arm doing a
 pick-and-place task. The frames span the FULL 20-second window so you can see the
 outcome of any attempt — use this to count successes and failures.
@@ -102,7 +160,8 @@ Return ONLY JSON with fields:
   reason (one sentence explaining the score).
 """
 
-RESPONSE_SCHEMA = {
+# JSON schemas for structured Gemini output.
+RESPONSE_SCHEMA = {       # legacy — matches STRUGGLE_PROMPT
     "type": "object",
     "properties": {
         "struggling": {"type": "boolean"},
@@ -112,7 +171,7 @@ RESPONSE_SCHEMA = {
     "required": ["struggling", "confidence", "reason"],
 }
 
-INTERRUPT_SCHEMA = {
+INTERRUPT_SCHEMA = {      # matches INTERRUPT_PROMPT
     "type": "object",
     "properties": {
         "interrupt_probability": {"type": "number"},
@@ -123,8 +182,7 @@ INTERRUPT_SCHEMA = {
     "required": ["interrupt_probability", "pickup_attempts", "drop_attempts", "reason"],
 }
 
-# ── Default signals ───────────────────────────────────────────────────────────
-
+# Sentinel values returned before the first Gemini call completes.
 _DEFAULT_SIGNAL = {"struggling": False, "confidence": 0.0, "reason": "no assessment yet"}
 _DEFAULT_INTERRUPT = {
     "interrupt_probability": 0.0,
@@ -133,77 +191,37 @@ _DEFAULT_INTERRUPT = {
     "reason": "no assessment yet",
 }
 
-# Time ramp: scale interrupt probability linearly from 0 → 1 over the first N seconds.
-# Prevents early-episode checks from triggering high probabilities before the arm
-# has had a chance to attempt the task.
-TIME_RAMP_END_S: float = 30.0
 
-# Probability cap: Gemini's raw output is capped at P_CAP_MIN early in the episode.
-# The cap rises linearly to P_CAP_MAX between TIME_RAMP_END_S and CAP_RAMP_END_S,
-# allowing very high probabilities only after sustained struggle.
-P_CAP_MIN:      float = 0.75   # max allowed p before CAP_RAMP_END_S
-P_CAP_MAX:      float = 0.90   # max allowed p after CAP_RAMP_END_S
-CAP_RAMP_END_S: float = 60.0   # seconds at which cap reaches P_CAP_MAX
-
-
-# ── Core assessment function ──────────────────────────────────────────────────
-
-def _build_gripper_block(gripper: np.ndarray, threshold: float = 20.0) -> str:
-    """Format the raw gripper position signal as a text block for the prompt.
-
-    Also numerically counts pickup/drop attempts so Gemini can cross-check.
-    """
-    n = len(gripper)
-    if n < 2:
-        return ""
-
-    ups   = [i for i in range(1, n) if gripper[i-1] < threshold <= gripper[i]]
-    downs = [i for i in range(1, n) if gripper[i-1] >= threshold > gripper[i]]
-
-    # Summarise gripper trajectory as compact string (sampled at ~20 points)
-    step = max(1, n // 20)
-    sampled = gripper[::step]
-    trace = "  ".join(f"{v:.1f}" for v in sampled)
-
-    return (
-        f"\n--- GRIPPER SIGNAL (last {n} frames, threshold={threshold}°) ---\n"
-        f"  Closes (pickup events) detected: {len(downs)}\n"
-        f"  Opens  (drop events)   detected: {len(ups)}\n"
-        f"  Sampled trace (deg): {trace}\n"
-        f"--- END GRIPPER ---\n"
-    )
-
+# ── Sensor signal helpers ─────────────────────────────────────────────────────
 
 def _build_stability_block(actions: np.ndarray, states: np.ndarray) -> str:
-    """Compute rolling Lyapunov/jerk metrics and format as a text block for the prompt.
+    """Compute rolling jerk / Lyapunov metrics and format as a prompt text block.
 
     Args:
         actions: (T, D_a) float32 array of recent actions.
         states:  (T, D_s) float32 array of recent observation states.
 
     Returns:
-        Formatted stability context string to inject into STRUGGLE_PROMPT.
+        Formatted stability context string, or "" if insufficient data.
     """
     if len(actions) < 5:
         return ""
 
-    # Jerk
-    delta     = np.diff(actions, axis=0)
-    jerk      = np.linalg.norm(delta, axis=1)
-    mean_jerk = float(jerk.mean())
-    cur_jerk  = float(jerk[-1])
+    delta      = np.diff(actions, axis=0)
+    jerk       = np.linalg.norm(delta, axis=1)
+    mean_jerk  = float(jerk.mean())
+    cur_jerk   = float(jerk[-1])
     jerk_ratio = cur_jerk / (mean_jerk + 1e-9)
-    jerk_tag  = f"HIGH ({jerk_ratio:.1f}x baseline)" if jerk_ratio > 2.0 else "normal"
+    jerk_tag   = f"HIGH ({jerk_ratio:.1f}x baseline)" if jerk_ratio > 2.0 else "normal"
 
-    # Lyapunov  V(t) = ||s_t - s_latest||^2  (goal approx = most recent state)
-    s_ref = states[-1]
-    V     = np.sum((states - s_ref) ** 2, axis=1)
-    dV    = np.diff(V)
-    viol_rate   = float((dV > 0).mean())
-    lyap_trend  = "DIVERGING" if viol_rate > 0.5 else "CONVERGING"
+    # Lyapunov proxy: V(t) = ||s_t - s_latest||^2, goal approximated as most recent state.
+    s_ref      = states[-1]
+    V          = np.sum((states - s_ref) ** 2, axis=1)
+    dV         = np.diff(V)
+    viol_rate  = float((dV > 0).mean())
+    lyap_trend = "DIVERGING" if viol_rate > 0.5 else "CONVERGING"
     lyap_detail = f"V increased {viol_rate*100:.0f}% of recent steps"
 
-    # Discontinuities
     thresh = mean_jerk + 3.0 * float(jerk.std())
     n_disc = int((jerk > thresh).sum())
 
@@ -216,6 +234,50 @@ def _build_stability_block(actions: np.ndarray, states: np.ndarray) -> str:
     )
 
 
+def _build_gripper_block(gripper: np.ndarray, threshold: float = 20.0) -> str:
+    """Format the gripper angle signal as a supplementary text block for the prompt.
+
+    Gemini is asked to count pickup/drop attempts from the video frames; this
+    block provides the raw sensor trace so it can cross-check its visual read.
+
+    Args:
+        gripper:   1-D float32 array of gripper angles (degrees).
+        threshold: Angle (degrees) above which the gripper is considered closed.
+
+    Returns:
+        Formatted gripper context string, or "" if fewer than 2 samples.
+    """
+    n = len(gripper)
+    if n < 2:
+        return ""
+
+    closes = [i for i in range(1, n) if gripper[i-1] < threshold <= gripper[i]]
+    opens  = [i for i in range(1, n) if gripper[i-1] >= threshold > gripper[i]]
+
+    step    = max(1, n // 20)
+    trace   = "  ".join(f"{v:.1f}" for v in gripper[::step])
+
+    return (
+        f"\n--- GRIPPER SIGNAL (last {n} frames, threshold={threshold}°) ---\n"
+        f"  Closes (pickup events) detected: {len(closes)}\n"
+        f"  Opens  (drop events)   detected: {len(opens)}\n"
+        f"  Sampled trace (deg): {trace}\n"
+        f"--- END GRIPPER ---\n"
+    )
+
+
+# ── Gemini assessment functions ───────────────────────────────────────────────
+
+def _encode_frames(frames: list[np.ndarray], jpeg_quality: int) -> list:
+    """Encode a list of BGR frames as inline JPEG Parts for a Gemini request."""
+    parts = []
+    for frame in frames:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if ok:
+            parts.append(types.Part.from_bytes(data=bytes(buf), mime_type="image/jpeg"))
+    return parts
+
+
 def assess_frames(
     frames: list[np.ndarray],
     client: genai.Client,
@@ -224,15 +286,9 @@ def assess_frames(
     actions: np.ndarray | None = None,
     states:  np.ndarray | None = None,
 ) -> dict:
-    """Send frames (+ optional stability metrics) to Gemini for a struggle assessment.
+    """Binary struggle assessment (legacy).
 
-    Args:
-        frames:       List of BGR uint8 numpy arrays (camera frames).
-        client:       Authenticated genai.Client.
-        model:        Gemini model ID.
-        jpeg_quality: JPEG compression quality (lower = faster upload).
-        actions:      (T, D_a) recent action array for stability context.
-        states:       (T, D_s) recent state array for stability context.
+    Sends frames and optional stability metrics to Gemini using STRUGGLE_PROMPT.
 
     Returns:
         {"struggling": bool, "confidence": float, "reason": str}
@@ -240,25 +296,17 @@ def assess_frames(
     if not frames:
         return _DEFAULT_SIGNAL.copy()
 
-    # Build stability block if data is available
     stability_block = ""
     if actions is not None and states is not None and len(actions) >= 5:
         stability_block = _build_stability_block(actions, states)
 
-    prompt = STRUGGLE_PROMPT.format(stability_block=stability_block)
-
-    # Encode frames as inline JPEG image parts
-    parts = []
-    for frame in frames:
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-        if not ok:
-            continue
-        parts.append(types.Part.from_bytes(data=bytes(buf), mime_type="image/jpeg"))
-
+    parts = _encode_frames(frames, jpeg_quality)
     if not parts:
         return _DEFAULT_SIGNAL.copy()
 
-    parts.append(types.Part.from_text(text=prompt))
+    parts.append(types.Part.from_text(text=STRUGGLE_PROMPT.format(
+        stability_block=stability_block,
+    )))
 
     response = client.models.generate_content(
         model=model,
@@ -269,7 +317,6 @@ def assess_frames(
             temperature=0.2,
         ),
     )
-
     return json.loads(response.text)
 
 
@@ -283,9 +330,15 @@ def assess_interrupt(
     gripper: np.ndarray | None = None,
     gripper_threshold: float = 20.0,
 ) -> dict:
-    """Send 20 seconds of frames + motor/convergence/gripper data to Gemini.
+    """Probabilistic interrupt assessment over a 20-second window.
 
-    Returns interrupt_probability (0-1), pickup_attempts, drop_attempts, reason.
+    Sends frames to Gemini (primary signal) together with supplementary stability
+    and gripper sensor blocks. Gemini counts pickup/drop attempts from the video
+    and returns an interrupt probability.
+
+    Returns:
+        {"interrupt_probability": float, "pickup_attempts": int,
+         "drop_attempts": int, "reason": str}
     """
     if not frames:
         return _DEFAULT_INTERRUPT.copy()
@@ -298,22 +351,14 @@ def assess_interrupt(
     if gripper is not None and len(gripper) >= 2:
         gripper_block = _build_gripper_block(gripper, gripper_threshold)
 
-    prompt = INTERRUPT_PROMPT.format(
-        stability_block=stability_block,
-        gripper_block=gripper_block,
-    )
-
-    parts = []
-    for frame in frames:
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-        if not ok:
-            continue
-        parts.append(types.Part.from_bytes(data=bytes(buf), mime_type="image/jpeg"))
-
+    parts = _encode_frames(frames, jpeg_quality)
     if not parts:
         return _DEFAULT_INTERRUPT.copy()
 
-    parts.append(types.Part.from_text(text=prompt))
+    parts.append(types.Part.from_text(text=INTERRUPT_PROMPT.format(
+        stability_block=stability_block,
+        gripper_block=gripper_block,
+    )))
 
     response = client.models.generate_content(
         model=model,
@@ -324,31 +369,88 @@ def assess_interrupt(
             temperature=0.2,
         ),
     )
-
     return json.loads(response.text)
 
 
-# ── Background monitor ────────────────────────────────────────────────────────
+# ── Probability post-processing ───────────────────────────────────────────────
+
+class _EpisodeScorer:
+    """Applies time-ramp, probability cap, median filter, and EMA to raw Gemini scores.
+
+    Used by test_on_dataset to post-process per-check probabilities into a
+    smoothed EMA struggle score that drives the interrupt decision.
+
+    Pipeline per check:
+        p_raw  →  ×time_factor  →  clip(p_cap)  →  median(3)  →  EMA  →  struggle_score
+    """
+
+    def __init__(self, ema_alpha: float) -> None:
+        self.ema_alpha    = ema_alpha
+        self.struggle_score: float = 0.0
+        self.peak_score:    float = 0.0
+        self._median_buf:   list[float] = []
+
+    def reset(self) -> None:
+        self.struggle_score = 0.0
+        self.peak_score     = 0.0
+        self._median_buf.clear()
+
+    def update(
+        self,
+        p_raw: float,
+        ep_elapsed: float,
+    ) -> tuple[float, float, float]:
+        """Ingest one raw probability and return (p_filtered, time_factor, p_cap).
+
+        Side effects: updates self.struggle_score and self.peak_score.
+        """
+        # Time ramp
+        time_factor = min(1.0, ep_elapsed / TIME_RAMP_END_S)
+
+        # Rising probability cap
+        cap_ramp = min(1.0, max(0.0, ep_elapsed - TIME_RAMP_END_S)
+                       / max(1.0, CAP_RAMP_END_S - TIME_RAMP_END_S))
+        p_cap = P_CAP_MIN + (P_CAP_MAX - P_CAP_MIN) * cap_ramp
+
+        p_scaled = min(p_raw * time_factor, p_cap)
+
+        # Median filter (window = 3)
+        self._median_buf.append(p_scaled)
+        if len(self._median_buf) > 3:
+            self._median_buf.pop(0)
+        p_filtered = float(np.median(self._median_buf))
+
+        # EMA
+        self.struggle_score = (
+            self.ema_alpha * p_filtered
+            + (1 - self.ema_alpha) * self.struggle_score
+        )
+        self.peak_score = max(self.peak_score, self.struggle_score)
+
+        return p_filtered, round(time_factor, 2), round(p_cap, 2)
+
+
+# ── Live monitor ──────────────────────────────────────────────────────────────
 
 class LiveStruggleMonitor:
     """Continuously watches a 20-second rolling buffer and polls Gemini.
 
-    Uses the richer INTERRUPT_PROMPT: Gemini counts pickup/drop attempts,
-    reads convergence data, and outputs interrupt_probability (0-1).
-    An EMA struggle_score smooths out transient spikes.
-    is_struggling() returns True when the EMA score exceeds the threshold.
+    Uses INTERRUPT_PROMPT: Gemini counts pickup/drop attempts from the video,
+    reads supplementary convergence and gripper data, and outputs
+    ``interrupt_probability`` (0–1). An EMA struggle_score smooths transient
+    spikes; ``is_struggling()`` fires when it exceeds the threshold.
 
     Args:
-        key_file:            Path to Gemini API key file (or None to use env var).
+        key_file:            Path to Gemini API key file (or None for env var).
         model:               Gemini model to use.
         check_interval:      How often (seconds) to call Gemini.
-        buffer_seconds:      Rolling buffer length — default 20s for full context.
-        n_sample_frames:     Frames subsampled per call.
-        fps:                 Camera frame rate (for buffer sizing).
+        buffer_seconds:      Rolling buffer length — 20 s gives full episode context.
+        n_sample_frames:     Frames subsampled per Gemini call.
+        fps:                 Camera frame rate (used for buffer sizing).
         interrupt_threshold: EMA score above which is_struggling() → True.
-        ema_alpha:           EMA decay for struggle_score (higher = more reactive).
+        ema_alpha:           EMA smoothing factor (higher = more reactive).
         gripper_col_idx:     Index into observation.state for gripper position.
-        gripper_threshold:   Degrees above which gripper is considered closed.
+        gripper_threshold:   Degrees above which the gripper is considered closed.
     """
 
     def __init__(
@@ -364,26 +466,26 @@ class LiveStruggleMonitor:
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
-        self._client             = genai.Client(api_key=load_api_key(key_file))
-        self._model              = model
-        self._check_interval     = check_interval
-        self._n_sample           = n_sample_frames
-        self._threshold          = interrupt_threshold
-        self._ema_alpha          = ema_alpha
-        self._gripper_col        = gripper_col_idx
-        self._gripper_thresh     = gripper_threshold
+        self._client         = genai.Client(api_key=load_api_key(key_file))
+        self._model          = model
+        self._check_interval = check_interval
+        self._n_sample       = n_sample_frames
+        self._threshold      = interrupt_threshold
+        self._ema_alpha      = ema_alpha
+        self._gripper_col    = gripper_col_idx
+        self._gripper_thresh = gripper_threshold
 
-        buffer_size              = int(buffer_seconds * fps)
-        self._buffer: deque      = deque(maxlen=buffer_size)
-        self._action_buf: deque  = deque(maxlen=buffer_size)
-        self._state_buf:  deque  = deque(maxlen=buffer_size)
-        self._lock               = threading.Lock()
+        buffer_size             = int(buffer_seconds * fps)
+        self._buffer: deque     = deque(maxlen=buffer_size)
+        self._action_buf: deque = deque(maxlen=buffer_size)
+        self._state_buf: deque  = deque(maxlen=buffer_size)
+        self._lock              = threading.Lock()
 
-        self._signal: dict       = _DEFAULT_SIGNAL.copy()
-        self._interrupt: dict    = _DEFAULT_INTERRUPT.copy()
+        self._signal: dict          = _DEFAULT_SIGNAL.copy()
+        self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
         self._struggle_score: float = 0.0
-        self._stop_event         = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._stop_event            = threading.Event()
+        self._thread: threading.Thread | None         = None
         self._capture_thread: threading.Thread | None = None
         self._capture_fps: float = fps
 
@@ -395,13 +497,9 @@ class LiveStruggleMonitor:
             self._buffer.append(frame.copy())
 
     def push_observation(self, action: np.ndarray, state: np.ndarray) -> None:
-        """Feed the latest action and observation state for stability metrics.
+        """Feed the latest action and observation state for stability/gripper metrics.
 
         Call alongside push_frame() every control step.
-
-        Args:
-            action: 1-D float32 array of joint actions.
-            state:  1-D float32 array of observation state.
         """
         with self._lock:
             self._action_buf.append(np.asarray(action, dtype=np.float32))
@@ -412,19 +510,19 @@ class LiveStruggleMonitor:
         return self._struggle_score >= self._threshold
 
     def get_signal(self) -> dict:
-        """Return the full latest signal: {struggling, confidence, reason}."""
+        """Return the legacy signal dict: {struggling, confidence, reason}."""
         return self._signal.copy()
 
     def get_interrupt(self) -> dict:
-        """Return latest interrupt assessment: {interrupt_probability, pickup_attempts, drop_attempts, reason}."""
+        """Return the latest interrupt assessment dict."""
         return self._interrupt.copy()
 
     def get_struggle_score(self) -> float:
-        """Return current EMA struggle score (0-1)."""
+        """Return the current EMA struggle score (0–1)."""
         return self._struggle_score
 
     def reset_signal(self) -> None:
-        """Clear signals and EMA at the start of each new episode."""
+        """Clear all signals and the EMA score. Call at the start of each episode."""
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
@@ -434,12 +532,14 @@ class LiveStruggleMonitor:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        print(f"[StruggleMonitor] started  model={self._model}"
-              f"  interval={self._check_interval}s"
-              f"  threshold={self._threshold}")
+        print(
+            f"[StruggleMonitor] started  model={self._model}"
+            f"  interval={self._check_interval}s"
+            f"  threshold={self._threshold}"
+        )
 
     def stop(self) -> None:
-        """Stop the background thread (and capture thread if running)."""
+        """Stop the monitoring thread (and capture thread if running)."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
@@ -448,14 +548,9 @@ class LiveStruggleMonitor:
         print("[StruggleMonitor] stopped")
 
     def start_capture(self, camera_index: int = 1) -> None:
-        """Open a dedicated OpenCV capture and feed frames into the buffer automatically.
+        """Open a dedicated capture thread that feeds frames into the buffer.
 
-        Use this when the robot's camera is shared and you can't push frames
-        manually, or when integrating alongside a blocking control loop.
-        The capture runs in its own daemon thread.
-
-        Args:
-            camera_index: cv2.VideoCapture index (same as robot camera, e.g. 1).
+        Use when the camera is shared or the control loop is blocking.
         """
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -466,13 +561,12 @@ class LiveStruggleMonitor:
         print(f"[StruggleMonitor] capture thread started  camera_index={camera_index}")
 
     def stop_capture(self) -> None:
-        """Signal the capture thread to stop (also called by stop())."""
+        """Signal the capture thread to stop."""
         self._stop_event.set()
 
     # ── Background loops ──────────────────────────────────────────────────────
 
     def _capture_loop(self, camera_index: int) -> None:
-        """Continuously grab frames from the camera and push to buffer."""
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             print(f"[StruggleMonitor] WARNING: could not open camera {camera_index}")
@@ -514,7 +608,6 @@ class LiveStruggleMonitor:
                         gripper_threshold=self._gripper_thresh,
                     )
                     self._interrupt = result
-                    # EMA update
                     p = float(result["interrupt_probability"])
                     self._struggle_score = (
                         self._ema_alpha * p
@@ -543,7 +636,7 @@ class LiveStruggleMonitor:
         return [frames[i] for i in indices]
 
 
-# ── Interrupt probability video renderer ──────────────────────────────────────
+# ── Video rendering ───────────────────────────────────────────────────────────
 
 def _draw_interrupt_hud(
     frame: np.ndarray,
@@ -556,26 +649,24 @@ def _draw_interrupt_hud(
     time_factor: float = 1.0,
     p_cap: float = 0.90,
 ) -> np.ndarray:
-    """Draw a probability gauge at the top-left of a BGR frame (in-place copy)."""
+    """Draw a probability gauge overlay at the top-left of a BGR frame."""
     frame = frame.copy()
     font  = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Panel dimensions — taller to fit 3 reason lines
     pw, ph = 260, 130
     x0, y0 = 8, 8
 
-    # Semi-transparent dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (x0, y0), (x0 + pw, y0 + ph), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    # Colour: green → yellow → red based on probability
+    # Colour: green → yellow → red
     r = int(min(255, interrupt_prob * 2 * 255))
     g = int(min(255, (1 - interrupt_prob) * 2 * 255))
     prob_color = (0, g, r)
     ema_color  = (0, 200, 80) if ema_score < threshold else (0, 60, 220)
 
-    # Probability bar at bottom of panel
+    # Probability bar
     bar_x0  = x0 + 4
     bar_y0  = y0 + ph - 14
     bar_len = int((pw - 8) * interrupt_prob)
@@ -585,20 +676,20 @@ def _draw_interrupt_hud(
     thr_x = bar_x0 + int((pw - 8) * threshold)
     cv2.line(frame, (thr_x, bar_y0 - 2), (thr_x, bar_y0 + 10), (255, 255, 255), 1)
 
-    # Row 1: scaled prob + EMA on same line
+    # Row 1: probability + EMA
     cv2.putText(frame, f"p={interrupt_prob:.2f}",
                 (x0 + 6, y0 + 20), font, 0.52, prob_color, 1, cv2.LINE_AA)
     cv2.putText(frame, f"ema={ema_score:.2f}",
                 (x0 + 90, y0 + 20), font, 0.45, ema_color, 1, cv2.LINE_AA)
-    # Time ramp / cap indicator — shown until fully ramped and cap at max
     if time_factor < 1.0 or p_cap < P_CAP_MAX:
-        label = f"×{time_factor:.0%} ≤{p_cap:.2f}"
-        cv2.putText(frame, label, (x0 + 155, y0 + 20), font, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
-    # Row 2: cumulative attempt counts
+        cv2.putText(frame, f"×{time_factor:.0%} ≤{p_cap:.2f}",
+                    (x0 + 155, y0 + 20), font, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
+
+    # Row 2: attempt counts
     cv2.putText(frame, f"picks {pickup_attempts}   drops {drop_attempts}",
                 (x0 + 6, y0 + 38), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
-    # Rows 3-5: Gemini reason text — wrap at ~38 chars, up to 3 lines
+    # Rows 3-5: reason text with word-wrap
     reason_short = (reason[:110] + "..") if len(reason) > 112 else reason
     words, line, lines = reason_short.split(), "", []
     for w in words:
@@ -630,9 +721,9 @@ def _render_episode_interrupt_video(
     gripper_threshold: float = 20.0,
     strip_height: int = 130,
 ) -> None:
-    """Render one 3-panel interrupt video using pre-loaded episode data.
+    """Render a 3-panel interrupt video (stability strip / camera / gripper strip).
 
-    No dataset re-loading — caller passes actions/states/gripper already in memory.
+    Caller passes pre-loaded episode arrays — no dataset re-loading required.
     """
     from stability_eval import _render_stability_strip
     from batch_detect_phases import _render_gripper_strip, detect_phases
@@ -650,7 +741,6 @@ def _render_episode_interrupt_video(
 
     pickup_frame, drop_frame = detect_phases(gripper, gripper_threshold)
 
-    # Open original video and seek directly — avoids ffmpeg clip-extraction edge cases
     print(f"  rendering ep {ep_idx:4d} ...")
     cap = cv2.VideoCapture(str(vid_path))
     cap.set(cv2.CAP_PROP_POS_MSEC, from_ts * 1000)
@@ -662,11 +752,12 @@ def _render_episode_interrupt_video(
     bot_strip = _render_gripper_strip(gripper, pickup_frame, drop_frame,
                                       gripper_threshold, W, strip_height)
 
-    total_H = strip_height + H + strip_height
-    writer  = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                              fps, (W, total_H))
+    writer = cv2.VideoWriter(
+        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+        fps, (W, strip_height + H + strip_height),
+    )
 
-    # Make picks/drops monotonically increasing across the episode
+    # Make pick/drop counts monotonically increasing
     max_picks = max_drops = 0
     mono_checks = []
     for ck in sorted(checks, key=lambda c: c["frame_idx"]):
@@ -677,12 +768,12 @@ def _render_episode_interrupt_video(
     check_by_frame      = {ck["frame_idx"]: ck for ck in mono_checks}
     sorted_check_frames = sorted(check_by_frame.keys())
 
-    # Mark the highest-probability frame permanently on the stability strip
+    # Mark peak-probability frame on the stability strip
     T_jerk    = len(jerk)
     T_gripper = len(gripper)
     if mono_checks:
-        peak_ck  = max(mono_checks, key=lambda c: c["p"])
-        peak_cx  = int(np.clip(peak_ck["frame_idx"] / max(T_jerk, 1) * W, 0, W - 1))
+        peak_ck = max(mono_checks, key=lambda c: c["p"])
+        peak_cx = int(np.clip(peak_ck["frame_idx"] / max(T_jerk, 1) * W, 0, W - 1))
         cv2.line(top_strip, (peak_cx, 0), (peak_cx, strip_height), (0, 100, 255), 2)
         cv2.putText(top_strip, f"peak p={peak_ck['p']:.2f}",
                     (min(peak_cx + 3, W - 95), strip_height - 6),
@@ -690,20 +781,19 @@ def _render_episode_interrupt_video(
 
     frame_idx         = 0
     cur_check         = {"p": 0.0, "ema": 0.0, "picks": 0, "drops": 0, "reason": ""}
-    cur_check_key     = -1          # frame_idx of the active check
+    cur_check_key     = -1
     check_start_frame = 0
-    type_out_frames   = int(fps * 1.5)  # fully reveal text within 1.5 s of each check
+    type_out_frames   = int(fps * 1.5)
     font              = cv2.FONT_HERSHEY_SIMPLEX
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        if pos_ms / 1000.0 > to_ts + 0.1:
+        if cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 > to_ts + 0.1:
             break
 
-        # Advance to the most recent check at or before this frame
+        # Advance to most recent check at or before this frame
         new_key = -1
         for cf in sorted_check_frames:
             if cf <= frame_idx:
@@ -713,11 +803,10 @@ def _render_episode_interrupt_video(
             cur_check_key     = new_key
             check_start_frame = frame_idx
 
-        # Typewriter effect: reveal reason text progressively after each new check
-        reason_full  = cur_check["reason"]
-        elapsed      = frame_idx - check_start_frame
-        chars        = max(1, int(elapsed / max(type_out_frames, 1) * len(reason_full) + 0.5))
-        live_reason  = reason_full[:min(chars, len(reason_full))]
+        # Typewriter effect: reveal reason progressively after each check
+        elapsed     = frame_idx - check_start_frame
+        chars       = max(1, int(elapsed / max(type_out_frames, 1) * len(cur_check["reason"]) + 0.5))
+        live_reason = cur_check["reason"][:min(chars, len(cur_check["reason"]))]
 
         frame = _draw_interrupt_hud(
             frame,
@@ -755,7 +844,7 @@ def _render_episode_interrupt_video(
     print(f"           -> {out_path}")
 
 
-# ── Batch dataset test ────────────────────────────────────────────────────────
+# ── Batch evaluation ──────────────────────────────────────────────────────────
 
 def test_on_dataset(
     dataset_id: str = "nc8304/eval_smolvla-phase-split_combined",
@@ -774,31 +863,18 @@ def test_on_dataset(
     video_dir: str | None = None,
     max_episodes: int | None = None,
 ) -> pd.DataFrame:
-    """Run the new interrupt monitor over every episode using 20-second windows.
+    """Run the interrupt monitor over every episode in a LeRobot dataset.
 
-    Gemini receives: 12 subsampled frames from a 20s rolling window,
-    stability metrics (jerk + Lyapunov), and the gripper signal (for attempt
-    counting). It returns interrupt_probability (0-1), pickup_attempts,
-    drop_attempts, and reason.
+    Simulates the live pipeline in batch: steps through each episode's frames,
+    calls assess_interrupt at ``check_interval_s`` intervals, applies
+    time-ramp / cap / median / EMA post-processing, and compares final
+    interrupt decisions to ground-truth labels.
 
-    An EMA struggle_score is maintained per episode. Results are compared to
-    known labels from results_csv.
+    Optionally renders 3-panel annotated videos per episode to ``video_dir``.
 
-    Args:
-        dataset_id:          HuggingFace dataset ID.
-        key_file:            Path to Gemini API key.
-        model:               Gemini model to use.
-        check_interval_s:    Seconds between Gemini calls (video time).
-        window_seconds:      Rolling buffer length — 20s gives Gemini full attempt context.
-        n_sample_frames:     Frames subsampled per call.
-        fps:                 Assumed camera frame rate.
-        interrupt_threshold: EMA score above which episode is flagged.
-        ema_alpha:           EMA smoothing factor.
-        gripper_col_idx:     Index into observation.state for gripper position.
-        gripper_threshold:   Degrees above which gripper is closed.
-        results_csv:         Path to labeled results.csv.
-        out_csv:             Where to save per-episode results.
-        video_dir:           If set, render 3-panel interrupt videos here.
+    Returns:
+        DataFrame with per-episode results (interrupt decision, EMA scores,
+        attempt counts, labels).
     """
     print(f"Downloading dataset {dataset_id} ...")
     repo_dir   = snapshot_download(repo_id=dataset_id, repo_type="dataset")
@@ -807,10 +883,10 @@ def test_on_dataset(
     df_data    = pd.concat([pd.read_parquet(f) for f in data_files], ignore_index=True)
     df_meta    = pd.concat([pd.read_parquet(f) for f in meta_files], ignore_index=True)
 
-    # Labels
+    # Load ground-truth labels
     if results_csv is None:
-        script_dir = Path(__file__).parent
-        candidates = [script_dir / "results.csv", Path("results.csv")]
+        script_dir  = Path(__file__).parent
+        candidates  = [script_dir / "results.csv", Path("results.csv")]
         results_csv = next((str(p) for p in candidates if p.exists()), None)
     labels: dict[int, dict] = {}
     if results_csv and Path(results_csv).exists():
@@ -826,7 +902,7 @@ def test_on_dataset(
     buffer_size      = int(window_seconds * fps)
     frames_per_check = int(check_interval_s * fps)
 
-    # Auto-detect camera key from meta columns (supports camera1, front, etc.)
+    # Auto-detect camera key from meta columns
     _cam_candidates = [
         "videos/observation.images.camera1",
         "videos/observation.images.front",
@@ -835,20 +911,21 @@ def test_on_dataset(
     ]
     cam_key = next(
         (k for k in _cam_candidates if f"{k}/from_timestamp" in df_meta.columns),
-        "videos/observation.images.camera1",  # fallback
+        "videos/observation.images.camera1",
     )
     print(f"  Using camera key: {cam_key}")
-    chunk_col  = f"{cam_key}/chunk_index"
-    file_col   = f"{cam_key}/file_index"
-    from_col   = f"{cam_key}/from_timestamp"
-    to_col     = f"{cam_key}/to_timestamp"
+    chunk_col = f"{cam_key}/chunk_index"
+    file_col  = f"{cam_key}/file_index"
+    from_col  = f"{cam_key}/from_timestamp"
+    to_col    = f"{cam_key}/to_timestamp"
 
     episodes = sorted(df_data["episode_index"].unique())
     if max_episodes is not None:
         episodes = episodes[:max_episodes]
-    rows: list[dict] = []
-    episode_checks: dict[int, list[dict]] = {}   # {ep_idx: [{frame_idx, ts, p, ema, ...}]}
-    video_paths: list[Path] = []
+
+    rows: list[dict]                    = []
+    episode_checks: dict[int, list]     = {}
+    video_paths: list[Path]             = []
 
     for ep_idx in episodes:
         ep_df   = df_data[df_data["episode_index"] == ep_idx].reset_index(drop=True)
@@ -857,14 +934,16 @@ def test_on_dataset(
         if ep_meta.empty or from_col not in ep_meta.columns:
             print(f"  [ep {ep_idx}] no meta — skipping")
             continue
-        row_m    = ep_meta.iloc[0]
-        from_ts  = float(row_m[from_col])
-        to_ts    = float(row_m[to_col]) if to_col in ep_meta.columns else None
-        # cam_key is "videos/observation.images.xxx" — strip the "videos/" prefix for path
+        row_m   = ep_meta.iloc[0]
+        from_ts = float(row_m[from_col])
+        to_ts   = float(row_m[to_col]) if to_col in ep_meta.columns else None
+
         cam_subdir = cam_key.removeprefix("videos/")
-        vid_path = (Path(repo_dir) / "videos" / cam_subdir
-                    / f"chunk-{int(row_m[chunk_col]):03d}"
-                    / f"file-{int(row_m[file_col]):03d}.mp4")
+        vid_path = (
+            Path(repo_dir) / "videos" / cam_subdir
+            / f"chunk-{int(row_m[chunk_col]):03d}"
+            / f"file-{int(row_m[file_col]):03d}.mp4"
+        )
         if not vid_path.exists():
             print(f"  [ep {ep_idx}] video not found — skipping")
             continue
@@ -877,26 +956,22 @@ def test_on_dataset(
         action_buf: deque = deque(maxlen=buffer_size)
         state_buf:  deque = deque(maxlen=buffer_size)
 
+        scorer              = _EpisodeScorer(ema_alpha)
         n_checks            = 0
-        struggle_score      = 0.0
-        peak_score          = 0.0
         first_interrupt_ts: float | None = None
         last_result         = _DEFAULT_INTERRUPT.copy()
         frame_counter       = 0
-        next_check_at       = int(10.0 * actual_fps)  # first check after 10s
+        next_check_at       = int(10.0 * actual_fps)   # first check after 10 s
         all_probs: list[float] = []
         episode_checks[ep_idx] = []
-        p_median_buf: list[float] = []   # rolling 3-check median filter
 
-        n_ep_frames = len(ep_df)
-        print(f"\n[ep {ep_idx:02d}] {n_ep_frames} frames  from={from_ts:.1f}s")
+        print(f"\n[ep {ep_idx:02d}] {len(ep_df)} frames  from={from_ts:.1f}s")
 
-        for data_idx in range(n_ep_frames):
+        for data_idx in range(len(ep_df)):
             ok, frame = cap.read()
             if not ok:
                 break
-            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if to_ts is not None and pos_ms / 1000.0 > to_ts + 0.1:
+            if to_ts is not None and cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 > to_ts + 0.1:
                 break
 
             frame_buf.append(frame)
@@ -915,53 +990,44 @@ def test_on_dataset(
                     states_snap[:, gripper_col_idx]
                     if states_snap is not None else None
                 )
+                cur_ts     = from_ts + frame_counter / actual_fps
+                ep_elapsed = frame_counter / actual_fps
 
-                cur_ts = from_ts + frame_counter / actual_fps
                 try:
                     result = assess_interrupt(
                         frames_snap, client, model,
                         actions=actions_snap, states=states_snap,
                         gripper=gripper_snap, gripper_threshold=gripper_threshold,
                     )
-                    last_result   = result
-                    n_checks     += 1
-                    p_raw         = float(result["interrupt_probability"])
-                    # Time ramp: scale down early-episode probabilities
-                    ep_elapsed    = frame_counter / actual_fps  # seconds into this episode
-                    time_factor   = min(1.0, ep_elapsed / TIME_RAMP_END_S)
-                    # Rising cap: 0.75 early, grows to 0.90 after CAP_RAMP_END_S
-                    cap_ramp      = min(1.0, max(0.0, ep_elapsed - TIME_RAMP_END_S)
-                                        / max(1.0, CAP_RAMP_END_S - TIME_RAMP_END_S))
-                    p_cap         = P_CAP_MIN + (P_CAP_MAX - P_CAP_MIN) * cap_ramp
-                    p             = min(p_raw * time_factor, p_cap)
-                    # Median filter: buffer last 3 scaled p values to kill single-check spikes
-                    p_median_buf.append(p)
-                    if len(p_median_buf) > 3:
-                        p_median_buf.pop(0)
-                    p_filtered    = float(np.median(p_median_buf))
-                    struggle_score = ema_alpha * p_filtered + (1 - ema_alpha) * struggle_score
-                    all_probs.append(p)
-                    peak_score    = max(peak_score, struggle_score)
-                    flagged       = struggle_score >= interrupt_threshold
+                    last_result = result
+                    n_checks   += 1
+
+                    p_raw                          = float(result["interrupt_probability"])
+                    p_filtered, time_factor, p_cap = scorer.update(p_raw, ep_elapsed)
+                    all_probs.append(p_filtered)
+
+                    flagged = scorer.struggle_score >= interrupt_threshold
                     if flagged and first_interrupt_ts is None:
                         first_interrupt_ts = cur_ts
+
                     episode_checks[ep_idx].append({
                         "frame_idx":   frame_counter,
                         "ts":          cur_ts,
                         "p":           p_filtered,
                         "p_raw":       p_raw,
-                        "time_factor": round(time_factor, 2),
-                        "p_cap":       round(p_cap, 2),
-                        "ema":         struggle_score,
+                        "time_factor": time_factor,
+                        "p_cap":       p_cap,
+                        "ema":         scorer.struggle_score,
                         "picks":       result["pickup_attempts"],
                         "drops":       result["drop_attempts"],
                         "reason":      result["reason"],
                     })
+
                     status = "INTERRUPT" if flagged else "ok     "
                     print(
                         f"  t={cur_ts:.1f}s  {status}"
                         f"  p={p_filtered:.2f}(raw={p_raw:.2f}×{time_factor:.2f} cap={p_cap:.2f})"
-                        f"  ema={struggle_score:.2f}"
+                        f"  ema={scorer.struggle_score:.2f}"
                         f"  picks={result['pickup_attempts']}"
                         f"  drops={result['drop_attempts']}"
                         f"  | {result['reason']}"
@@ -972,37 +1038,36 @@ def test_on_dataset(
         cap.release()
 
         lab             = labels.get(ep_idx, {})
-        final_interrupt = struggle_score >= interrupt_threshold
+        final_interrupt = scorer.struggle_score >= interrupt_threshold
         mean_prob       = float(np.mean(all_probs)) if all_probs else 0.0
 
         rows.append({
-            "episode_index":        ep_idx,
-            "n_checks":             n_checks,
-            "mean_interrupt_prob":  round(mean_prob, 3),
-            "peak_ema_score":       round(peak_score, 3),
-            "final_ema_score":      round(struggle_score, 3),
-            "final_interrupt":      final_interrupt,
-            "first_interrupt_ts":   first_interrupt_ts,
+            "episode_index":         ep_idx,
+            "n_checks":              n_checks,
+            "mean_interrupt_prob":   round(mean_prob, 3),
+            "peak_ema_score":        round(scorer.peak_score, 3),
+            "final_ema_score":       round(scorer.struggle_score, 3),
+            "final_interrupt":       final_interrupt,
+            "first_interrupt_ts":    first_interrupt_ts,
             "final_pickup_attempts": last_result["pickup_attempts"],
             "final_drop_attempts":   last_result["drop_attempts"],
-            "final_reason":         last_result["reason"],
-            "label_success":        lab.get("success", None),
-            "label_pick":           lab.get("pick",    None),
-            "label_drop":           lab.get("drop",    None),
+            "final_reason":          last_result["reason"],
+            "label_success":         lab.get("success", None),
+            "label_pick":            lab.get("pick",    None),
+            "label_drop":            lab.get("drop",    None),
         })
         print(
             f"  -> {'INTERRUPT' if final_interrupt else 'ok'}"
-            f"  ema={struggle_score:.2f}  peak={peak_score:.2f}"
+            f"  ema={scorer.struggle_score:.2f}  peak={scorer.peak_score:.2f}"
             f"  mean_p={mean_prob:.2f}"
             + (f"  label_success={lab.get('success')}" if lab else "")
         )
 
-        # Render video for this episode immediately using already-loaded data
         if video_dir is not None and episode_checks.get(ep_idx):
             actions_full = np.stack(ep_df["action"].values).astype(np.float32)
             states_full  = np.stack(ep_df["observation.state"].values).astype(np.float32)
             gripper_full = states_full[:, gripper_col_idx]
-            out_vid = Path(video_dir) / f"episode_{ep_idx:04d}_interrupt.mp4"
+            out_vid      = Path(video_dir) / f"episode_{ep_idx:04d}_interrupt.mp4"
             _render_episode_interrupt_video(
                 ep_idx=ep_idx,
                 checks=episode_checks[ep_idx],
@@ -1027,12 +1092,10 @@ def test_on_dataset(
         failed  = labeled[labeled["label_success"] == False]
         success = labeled[labeled["label_success"] == True]
 
-        sensitivity = (failed["final_interrupt"] == True).mean()  if len(failed)  else float("nan")
-        specificity = (success["final_interrupt"] == False).mean() if len(success) else float("nan")
-
-        # AUC-like: mean prob on failed vs success
-        mean_p_fail = failed["mean_interrupt_prob"].mean()   if len(failed)  else float("nan")
-        mean_p_succ = success["mean_interrupt_prob"].mean()  if len(success) else float("nan")
+        sensitivity  = (failed["final_interrupt"]  == True).mean()  if len(failed)  else float("nan")
+        specificity  = (success["final_interrupt"] == False).mean() if len(success) else float("nan")
+        mean_p_fail  = failed["mean_interrupt_prob"].mean()          if len(failed)  else float("nan")
+        mean_p_succ  = success["mean_interrupt_prob"].mean()         if len(success) else float("nan")
 
         print(f"\n=== Summary ===")
         print(f"  Episodes evaluated  : {len(results_df)}")
@@ -1053,33 +1116,31 @@ def test_on_dataset(
     return results_df
 
 
-# ── CLI demo ──────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Struggle monitor tools.")
-    sub = parser.add_subparsers(dest="cmd")
+    sub    = parser.add_subparsers(dest="cmd")
 
-    # ── live demo on a single video ──
     p_live = sub.add_parser("live", help="Simulate live monitoring on a single .mp4.")
-    p_live.add_argument("video",      help="Path to an episode .mp4.")
-    p_live.add_argument("--key-file", default=r"C:/Users/calle/Desktop/gem.txt")
-    p_live.add_argument("--model",    default="gemini-2.5-flash")
-    p_live.add_argument("--interval", type=float, default=2.0)
-    p_live.add_argument("--threshold", type=float, default=0.6)
+    p_live.add_argument("video",       help="Path to an episode .mp4.")
+    p_live.add_argument("--key-file",  default=r"C:/Users/calle/Desktop/gem.txt")
+    p_live.add_argument("--model",     default="gemini-2.5-flash")
+    p_live.add_argument("--interval",  type=float, default=2.0)
+    p_live.add_argument("--threshold", type=float, default=0.5)
 
-    # ── batch dataset test ──
     p_batch = sub.add_parser("batch", help="Run batch test on a full LeRobot dataset.")
-    p_batch.add_argument("--dataset",    default="nc8304/eval_smolvla-phase-split_combined")
-    p_batch.add_argument("--key-file",   default=r"C:/Users/calle/Desktop/gem.txt")
-    p_batch.add_argument("--model",      default="gemini-2.5-flash")
-    p_batch.add_argument("--interval",   type=float, default=2.0)
-    p_batch.add_argument("--window",     type=float, default=20.0, help="Rolling buffer seconds")
-    p_batch.add_argument("--threshold",  type=float, default=0.5,  help="EMA interrupt threshold")
-    p_batch.add_argument("--ema-alpha",  type=float, default=0.25, help="EMA smoothing factor")
-    p_batch.add_argument("--results-csv", default=None)
-    p_batch.add_argument("--out-csv",    default="struggle_test_results.csv")
+    p_batch.add_argument("--dataset",      default="nc8304/eval_smolvla-phase-split_combined")
+    p_batch.add_argument("--key-file",     default=r"C:/Users/calle/Desktop/gem.txt")
+    p_batch.add_argument("--model",        default="gemini-2.5-flash")
+    p_batch.add_argument("--interval",     type=float, default=2.0)
+    p_batch.add_argument("--window",       type=float, default=20.0,  help="Rolling buffer seconds")
+    p_batch.add_argument("--threshold",    type=float, default=0.5,   help="EMA interrupt threshold")
+    p_batch.add_argument("--ema-alpha",    type=float, default=0.25,  help="EMA smoothing factor")
+    p_batch.add_argument("--results-csv",  default=None)
+    p_batch.add_argument("--out-csv",      default="struggle_test_results.csv")
     p_batch.add_argument("--video-dir",    default=None,
                          help="If set, render 3-panel interrupt videos here.")
     p_batch.add_argument("--max-episodes", type=int, default=None,
@@ -1088,7 +1149,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.cmd == "live" or args.cmd is None:
-        # Backwards compat: treat bare positional as live mode
         video_path = getattr(args, "video", None)
         if video_path is None:
             parser.print_help()
@@ -1098,7 +1158,7 @@ if __name__ == "__main__":
             key_file=args.key_file,
             model=args.model,
             check_interval=args.interval,
-            struggle_threshold=args.threshold,
+            interrupt_threshold=args.threshold,
         )
         monitor.start()
 
