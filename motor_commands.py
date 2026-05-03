@@ -12,7 +12,8 @@ import sys
 import time
 from pathlib import Path
 
-PORT = "COM5"
+PORT         = "COM5"
+CAMERA_INDEX = 1
 
 _HOME_FILE = Path(__file__).parent / "home_pos.json"
 

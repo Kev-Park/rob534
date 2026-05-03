@@ -6,9 +6,27 @@ import time
 import webbrowser
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 import robot_control as rc
 from motor_commands import load_home, PORT, CAMERA_INDEX
 from struggle_monitor import LiveStruggleMonitor
+
+
+def _edge_removed_rgb(frame_rgb: np.ndarray, ksize: int = 3, threshold: int = 50) -> np.ndarray:
+    """Match the training-time Sobel edge-removal applied by sobel_batch.py.
+
+    Input: RGB uint8 HWC (lerobot OpenCVCamera default). Output: RGB uint8 HWC
+    with pixels whose Sobel-magnitude >= threshold set to 0.
+    """
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=ksize)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=ksize)
+    mag = np.clip(np.sqrt(gx * gx + gy * gy), 0, 255).astype(np.uint8)
+    out = frame_rgb.copy()
+    out[mag >= threshold] = 0
+    return out
 
 
 def go_home(home_pos: dict = None, port: str = "COM5",
@@ -189,6 +207,9 @@ def do_smol_vla_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
+    use_edge_removed=False,
+    edge_ksize=3,
+    edge_threshold=50,
 ):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -237,12 +258,15 @@ def do_smol_vla_eval(
     # connection, camera, and policy weights stay in memory for the full run.
 
     # Robot + camera: opened once, camera warms up once (warmup_s=2).
+    # When use_edge_removed is on, the policy was trained on observation.images.front,
+    # so we name the camera "front" to match — same hardware (index_or_path=1).
+    camera_key = "front" if use_edge_removed else "camera1"
     robot_cfg = SOFollowerRobotConfig(
         port=PORT,
         id="student_arm",
         use_degrees=True,
         cameras={
-            "camera1": OpenCVCameraConfig(
+            camera_key: OpenCVCameraConfig(
                 index_or_path=CAMERA_INDEX, fps=30, width=640, height=480, warmup_s=2,
             )
         },
@@ -307,6 +331,20 @@ def do_smol_vla_eval(
 
     # Connect robot and camera once — stays open for all episodes.
     robot.connect()
+
+    if use_edge_removed:
+        _orig_get_obs = robot.get_observation
+        def _get_obs_edge_removed():
+            obs = _orig_get_obs()
+            full_key = f"observation.images.{camera_key}"
+            frame = obs.get(full_key)
+            if frame is not None:
+                obs[full_key] = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
+            return obs
+        robot.get_observation = _get_obs_edge_removed
+        print(f"  [edge-removed] applying Sobel(ksize={edge_ksize}, thr={edge_threshold}) "
+              f"to '{camera_key}' frames live.")
+
     listener, events = init_keyboard_listener()
 
     # ── Struggle monitor (optional) ───────────────────────────────────────────
@@ -335,8 +373,8 @@ def do_smol_vla_eval(
 
     try:
         with VideoEncodingManager(dataset):
-            saved = 0       # episodes actually committed to disk
-            attempts = 0    # total record_loop runs (including redos)
+            saved = 0
+            attempts = 0
             is_redo = False
             while saved < num_episodes:
                 attempts += 1
@@ -360,7 +398,7 @@ def do_smol_vla_eval(
                 # episode starts from the same known configuration.
                 # home_pos is loaded from home_pos.json (set via motor_commands.py reset_home).
                 _go_home_with_robot(robot)
-                redo_tag = f"  [redo]" if is_redo else ""
+                redo_tag = "  [redo]" if is_redo else ""
                 print(f"\n  Episode {saved + 1}/{num_episodes}{redo_tag}")
                 record_loop(
                     robot=robot,
@@ -389,7 +427,6 @@ def do_smol_vla_eval(
                     and dataset.episode_buffer.get("size", 0) > 0
                 )
                 if events.get("rerecord_episode"):
-                    # Discard regardless of buffer state — user pressed left/rerecord.
                     print(f"  Re-recording episode {saved + 1} (attempt {attempts})")
                     if dataset.episode_buffer is not None:
                         dataset.clear_episode_buffer()
@@ -402,7 +439,7 @@ def do_smol_vla_eval(
                     print(f"  WARNING: Episode {saved + 1} collected no frames — skipping save.")
                     if dataset.episode_buffer is not None:
                         dataset.clear_episode_buffer()
-                    saved += 1   # count it as done to avoid infinite loop on persistent failure
+                    saved += 1
                     is_redo = False
 
                 if events["stop_recording"]:
@@ -497,9 +534,10 @@ if __name__ == "__main__":
     #do_replay(repo_id="nc8304/so101_031626",episode=0)
     #do_eval(policy_path="SkywalkerLi/act-so101")
     do_smol_vla_eval(
-        policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        repo_id="SkywalkerLi/eval_smolvla-phase-split-new-prompts_05",
-        num_episodes=4,
+        policy_path=resolve_policy_path("jere-mybao/smolvla_phase_edge_removed_020k"),
+        repo_id="jere-mybao/eval_smolvla_phase_edge_removed_020k",
+        num_episodes=10,
         episode_time_s=45,
         use_struggle_monitor=False,
+        use_edge_removed=True,
     )
