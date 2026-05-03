@@ -499,10 +499,10 @@ if __name__ == "__main__":
     from better_code import resolve_policy_path
 
     do_ab_eval(
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
         policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        repo_id_b="SkywalkerLi/eval_smolvla-phase-split_policyb",
-        repo_id_a="SkywalkerLi/eval_smolvla-aug_policya",
+        repo_id_b="SkywalkerLi/eval_smolvla-phase-split-new-prompts_policyB",
+        repo_id_a="SkywalkerLi/eval_smolvla-aug_policyA",
         num_episodes=10,
         episode_time_s=45,
     )
