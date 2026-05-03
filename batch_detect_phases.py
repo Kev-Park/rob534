@@ -161,11 +161,12 @@ def compute_phase_metrics(
 
 # ── video concatenation ───────────────────────────────────────────────────────
 
-def concatenate_videos(video_paths: list[Path], out_path: Path) -> None:
+def concatenate_videos(video_paths: list, out_path) -> None:
     """Concatenate a list of mp4 files into one using ffmpeg."""
+    out_path = Path(out_path)
     filelist = out_path.parent / "_concat_list.txt"
     filelist.write_text(
-        "\n".join(f"file '{p.resolve()}'" for p in video_paths),
+        "\n".join(f"file '{Path(p).resolve()}'" for p in video_paths),
         encoding="utf-8",
     )
     subprocess.run([
