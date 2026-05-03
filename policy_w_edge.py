@@ -223,7 +223,8 @@ def do_smol_vla_eval(
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
     from lerobot.robots.so_follower.so_follower import SOFollower
     from lerobot.scripts.lerobot_record import record_loop
-    from lerobot.utils.control_utils import (init_keyboard_listener, sanity_check_dataset_name,
+    from lerobot.utils.control_utils import (init_keyboard_listener, predict_action,
+                                               sanity_check_dataset_name,
                                                sanity_check_dataset_robot_compatibility)
     from lerobot.utils.utils import init_logging, log_say
     from lerobot.utils.visualization_utils import init_rerun
@@ -231,8 +232,14 @@ def do_smol_vla_eval(
     if repo_id is None:
         repo_id = repo_id_from_policy(policy_path)
     dataset_path = Path.home() / ".cache/huggingface/lerobot" / repo_id
-    # Only resume if the dataset is complete (has actual data, not just a partial/failed folder)
-    resuming = (dataset_path / "meta" / "tasks.parquet").exists()
+    # Only resume if there are actual saved episodes (tasks.parquet + at least one episode parquet).
+    # A crashed run may leave tasks.parquet with no episode files — treat that as incomplete.
+    _ep_dir = dataset_path / "meta" / "episodes"
+    resuming = (
+        (dataset_path / "meta" / "tasks.parquet").exists()
+        and _ep_dir.exists()
+        and any(_ep_dir.glob("*.parquet"))
+    )
     if resuming:
         print(f"  Found existing dataset at {dataset_path} — resuming (appending episodes).")
     elif dataset_path.exists():
@@ -344,8 +351,19 @@ def do_smol_vla_eval(
 
     if use_edge_removed:
         _orig_get_obs = robot.get_observation
+        _last_edge_obs: list = [None]  # cache last good processed observation
+
         def _get_obs_edge_removed():
-            obs = _orig_get_obs()
+            try:
+                obs = _orig_get_obs()
+            except TimeoutError:
+                # Camera frame stale (hardware drop). Use last known good observation
+                # rather than crashing the control loop.
+                if _last_edge_obs[0] is not None:
+                    print("  [edge-removed] camera stale — reusing last good frame")
+                    return _last_edge_obs[0]
+                raise  # no cached frame yet, propagate
+
             # get_observation returns short keys ("camera1"), not full dotted paths
             frame = obs.get("camera1")
             if frame is not None:
@@ -353,9 +371,36 @@ def do_smol_vla_eval(
                 obs["camera1"] = processed
                 obs["camera2"] = processed
                 obs["camera3"] = processed
+            _last_edge_obs[0] = obs
             return obs
+
         robot.get_observation = _get_obs_edge_removed
         print(f"  [edge-removed] Sobel(ksize={edge_ksize}, thr={edge_threshold}) — camera1 frame replicated to camera2/camera3")
+
+    # GPU warmup: run one dummy inference so the first real episode call is fast.
+    # Without this, the first inference takes 3+ seconds (JIT/CUDA warmup) which
+    # can cause the camera frame to go stale (> 500ms) and crash the control loop.
+    print("  GPU warmup inference...")
+    try:
+        import torch
+        from lerobot.datasets.utils import build_dataset_frame
+        from lerobot.utils.constants import OBS_STR
+        _warmup_obs = robot.get_observation()
+        _warmup_proc = robot_observation_processor(_warmup_obs)
+        _warmup_frame = build_dataset_frame(dataset.features, _warmup_proc, prefix=OBS_STR)
+        predict_action(
+            observation=_warmup_frame,
+            policy=policy,
+            device=torch.device(policy.config.device),
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            use_amp=getattr(policy.config, "use_amp", False),
+            task=single_task,
+            robot_type=robot.robot_type,
+        )
+        print("  GPU warmup done.")
+    except Exception as _e:
+        print(f"  GPU warmup failed (non-fatal): {_e}")
 
     listener, events = init_keyboard_listener()
 
