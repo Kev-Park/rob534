@@ -227,6 +227,7 @@ def do_ab_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
+    auto_switch=False,
     stats_csv=None,
 ):
     """
@@ -253,11 +254,16 @@ def do_ab_eval(
         use_struggle_monitor:    If True, runs a LiveStruggleMonitor in the background.
                                  The monitor polls Gemini every struggle_check_interval
                                  seconds. When the EMA score exceeds struggle_threshold,
-                                 the episode ends early so the operator can switch or
-                                 reset. Episode stats are written to stats_csv if set.
+                                 the episode ends early. Episode stats go to stats_csv.
         struggle_key_file:       Path to a file containing the Gemini API key.
         struggle_check_interval: Seconds between Gemini assessments.
         struggle_threshold:      EMA score above which is_struggling() triggers.
+        auto_switch:             If True (requires use_struggle_monitor=True), the policy
+                                 flips automatically when the monitor fires — no 'q' press
+                                 needed. The struggling episode is saved only to the active
+                                 policy's dataset and the arm goes home before the other
+                                 policy starts (unlike 'q', which holds position and saves
+                                 to both datasets).
         stats_csv:               Optional path to a CSV for per-episode stats.
                                  Appended to (not overwritten) so partial runs survive.
     """
@@ -418,6 +424,7 @@ def do_ab_eval(
     listener, events = init_keyboard_listener()       # lerobot's default keys (d, Escape, etc.)
     switch_listener = _start_switch_key_listener(events)  # our 'q' key on top
     events["switch_policy"] = False
+    events["auto_switched"] = False
 
     counts = {"A": 0, "B": 0}  # episodes completed per policy
     current_label = "A"         # start on A; 'q' flips this each time
@@ -437,10 +444,18 @@ def do_ab_eval(
         print("  [StruggleMonitor] watching camera — will flag struggling episodes")
 
     def _struggle_watcher(stop_evt):
-        """Background thread: sets exit_early when monitor signals struggling."""
+        """Background thread: sets exit_early when monitor signals struggling.
+
+        With auto_switch=True, also sets auto_switched so the policy flips after
+        the episode — the arm goes home rather than holding position (unlike 'q').
+        """
         while not stop_evt.is_set():
             if monitor and monitor.is_struggling():
-                print(f"\n  [StruggleMonitor] STRUGGLING — exiting episode early")
+                if auto_switch:
+                    print(f"\n  [StruggleMonitor] STRUGGLING — auto-switching policy after episode")
+                    events["auto_switched"] = True
+                else:
+                    print(f"\n  [StruggleMonitor] STRUGGLING — exiting episode early")
                 events["exit_early"] = True
                 break
             stop_evt.wait(timeout=0.25)
@@ -469,6 +484,7 @@ def do_ab_eval(
                     events["exit_early"] = False
                     events["rerecord_episode"] = False
                     events["switch_policy"] = False
+                    events["auto_switched"] = False
 
                     if monitor:
                         monitor.reset_signal()
@@ -559,7 +575,11 @@ def do_ab_eval(
                     if events["switch_policy"]:
                         current_label = "B" if current_label == "A" else "A"
                         print(f"  Now on Policy {current_label}.")
-                    # Pass the held-position flag forward to next iteration
+                    # Auto-switch: monitor triggered, flip policy (arm goes home next ep)
+                    elif events.get("auto_switched"):
+                        current_label = "B" if current_label == "A" else "A"
+                        print(f"  [AutoSwitch] Monitor triggered — now on Policy {current_label}.")
+                    # Hold position only on manual q-press, not auto-switch
                     events["_held_position"] = events["switch_policy"]
 
                     if events["stop_recording"]:
@@ -579,16 +599,156 @@ def do_ab_eval(
         dataset_b.finalize()
 
 
-if __name__ == "__main__":
-    from better_code import resolve_policy_path
+def simulate_ab_on_dataset(
+    dataset_id: str | None = None,
+    existing_stats_csv: str | None = None,
+    key_file: str = r"C:\Users\calle\Desktop\gem.txt",
+    model: str = "gemini-2.5-flash",
+    check_interval_s: float = 2.0,
+    window_seconds: float = 20.0,
+    interrupt_threshold: float = 0.5,
+    ema_alpha: float = 0.25,
+    results_csv: str | None = None,
+    out_csv: str = "ab_simulated_stats.csv",
+    video_dir: str | None = None,
+    max_episodes: int | None = None,
+):
+    """Simulate automatic A/B policy switching on a LeRobot dataset.
 
-    do_ab_eval(
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        repo_id_b="SkywalkerLi/eval_smolvla-phase-split-new-prompts_policyB",
-        repo_id_a="SkywalkerLi/eval_smolvla-aug_policyA",
-        num_episodes=10,
-        episode_time_s=45,
-        use_struggle_monitor=True,
-        stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_eval_stats.csv",
-    )
+    Two modes:
+      1. existing_stats_csv — load a CSV already produced by test_on_dataset
+         (e.g. train_stats.csv). No Gemini calls; just replays the interrupt
+         decisions and adds a policy label. Use this for quick offline testing.
+      2. dataset_id — runs test_on_dataset from scratch (makes Gemini API calls),
+         then simulates the switching on top.
+
+    Switch rule: starts on policy "A". Each time final_interrupt is True (monitor
+    would have triggered), the NEXT episode flips to the other policy. This mirrors
+    auto_switch=True in do_ab_eval on the live robot.
+
+    Writes out_csv with all original columns plus "policy" and "auto_switched_after".
+    Prints per-policy stats (success rate, clean pickup/drop, mean interrupt prob).
+
+    Args:
+        dataset_id:          HuggingFace dataset ID. Used when no existing_stats_csv.
+        existing_stats_csv:  Path to a prior test_on_dataset CSV. Skips Gemini calls.
+        key_file:            Gemini API key file (only used when running fresh).
+        model:               Gemini model (only used when running fresh).
+        check_interval_s:    Seconds between checks (only used when running fresh).
+        window_seconds:      Rolling buffer length in seconds (fresh runs only).
+        interrupt_threshold: EMA threshold for final_interrupt decision.
+        ema_alpha:           EMA smoothing factor (fresh runs only).
+        results_csv:         Ground-truth labels CSV (fresh runs only).
+        out_csv:             Where to write the enriched A/B CSV.
+        video_dir:           If set, render 3-panel videos per episode (fresh only).
+        max_episodes:        Cap on episodes to process (fresh runs only).
+    """
+    import pandas as pd
+
+    if existing_stats_csv is not None:
+        print(f"Loading existing stats from {existing_stats_csv} ...")
+        df = pd.read_csv(existing_stats_csv)
+    elif dataset_id is not None:
+        from struggle_monitor import test_on_dataset
+        raw_csv = out_csv + ".raw.csv"
+        df = test_on_dataset(
+            dataset_id=dataset_id,
+            key_file=key_file,
+            model=model,
+            check_interval_s=check_interval_s,
+            window_seconds=window_seconds,
+            interrupt_threshold=interrupt_threshold,
+            ema_alpha=ema_alpha,
+            results_csv=results_csv,
+            out_csv=raw_csv,
+            video_dir=video_dir,
+            max_episodes=max_episodes,
+        )
+    else:
+        raise ValueError("Provide either dataset_id or existing_stats_csv.")
+
+    if df.empty:
+        print("No episodes to process.")
+        return df
+
+    # ── Simulate A/B switching ────────────────────────────────────────────────
+    # Replay per-episode interrupt decisions and assign a policy label.
+    # When an interrupt would have fired, the NEXT episode flips to the other policy.
+    #
+    # Interrupt decision: peak_ema_score >= interrupt_threshold (if the column exists)
+    # or final_interrupt from the CSV (pre-computed with whatever threshold was used
+    # during the original run). Using peak_ema_score lets you experiment with
+    # different thresholds without re-running Gemini.
+    use_peak = "peak_ema_score" in df.columns
+    policy_labels: list[str] = []
+    switched_after: list[bool] = []
+    cur = "A"
+    for _, row in df.iterrows():
+        policy_labels.append(cur)
+        if use_peak:
+            triggered = float(row.get("peak_ema_score", 0.0)) >= interrupt_threshold
+        else:
+            triggered = bool(row.get("final_interrupt", False))
+        switched_after.append(triggered)
+        if triggered:
+            cur = "B" if cur == "A" else "A"
+
+    df = df.copy()
+    df.insert(1, "policy", policy_labels)
+    df.insert(2, "auto_switched_after", switched_after)
+
+    df.to_csv(out_csv, index=False)
+    print(f"\nSaved A/B simulated results to {out_csv}  ({len(df)} episodes)")
+
+    # ── Per-policy summary ────────────────────────────────────────────────────
+    total_switches = sum(switched_after)
+    print(f"\n=== Simulated A/B Summary (threshold={interrupt_threshold}) ===")
+    print(f"  Total auto-switches : {total_switches}")
+    for pol in ["A", "B"]:
+        sub = df[df["policy"] == pol]
+        n = len(sub)
+        if n == 0:
+            continue
+        n_success    = int(sub["target_reached"].sum())      if "target_reached"      in sub else "?"
+        n_clean_pick = int((sub["clean_pickup"] == True).sum()) if "clean_pickup"     in sub else "?"
+        n_clean_drop = int((sub["clean_drop"]   == True).sum()) if "clean_drop"       in sub else "?"
+        n_switched   = int(sub["auto_switched_after"].sum())
+        mean_p       = sub["mean_interrupt_prob"].mean()     if "mean_interrupt_prob" in sub else float("nan")
+        print(
+            f"  Policy {pol} : {n:2d} episodes"
+            f"  success={n_success}/{n}"
+            f"  clean_pick={n_clean_pick}/{n}"
+            f"  clean_drop={n_clean_drop}/{n}"
+            f"  switched_away={n_switched}"
+            f"  mean_p={mean_p:.3f}"
+        )
+
+    return df
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--simulate" in sys.argv:
+        # Test the A/B switching simulation on the existing training stats.
+        # No robot or Gemini calls needed — just replays interrupt decisions.
+        simulate_ab_on_dataset(
+            existing_stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\train_stats.csv",
+            out_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_simulated_stats.csv",
+            interrupt_threshold=0.5,
+        )
+    else:
+        # Live A/B eval on real robot.
+        from better_code import resolve_policy_path
+
+        do_ab_eval(
+            policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
+            policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+            repo_id_b="SkywalkerLi/eval_smolvla-phase-split-new-prompts_policyB",
+            repo_id_a="SkywalkerLi/eval_smolvla-aug_policyA",
+            num_episodes=10,
+            episode_time_s=45,
+            use_struggle_monitor=True,
+            auto_switch=True,
+            stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_eval_stats.csv",
+        )
