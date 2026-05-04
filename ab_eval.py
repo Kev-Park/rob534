@@ -726,17 +726,210 @@ def simulate_ab_on_dataset(
     return df
 
 
+# Cyan  (BGR) — student policy
+_COLOR_STUDENT = (255, 255,   0)
+# Magenta (BGR) — teacher policy
+_COLOR_TEACHER = (255,   0, 255)
+_BORDER_PX     = 6
+_STRIP_HEIGHT  = 130   # matches _render_episode_interrupt_video default
+
+
+def simulate_ab_video(
+    stats_csv: str,
+    video_dir: str,
+    out_video: str = "ab_simulated.mp4",
+    interrupt_threshold: float = 0.5,
+) -> None:
+    """Render a composite A/B simulation video from pre-computed interrupt stats.
+
+    Reads stats_csv (output of test_on_dataset), replays the simulated A/B
+    switching, and re-renders each episode's 3-panel interrupt video with:
+      - A colored border around the camera section:
+          cyan    = student policy  (Policy A)
+          magenta = teacher policy  (Policy B)
+      - A role badge in the top-right corner ("STUDENT" / "TEACHER").
+      - A red "AUTO-SWITCH" banner over the camera for the last 2 s of any
+        episode that triggers a policy flip.
+
+    All episodes are concatenated into a single output video.
+
+    Args:
+        stats_csv:           Path to a CSV that has episode_index and peak_ema_score
+                             columns (produced by test_on_dataset).
+        video_dir:           Directory that contains episode_XXXX_interrupt.mp4 files.
+        out_video:           Output .mp4 path.
+        interrupt_threshold: peak_ema_score threshold for triggering a switch.
+    """
+    import cv2
+    import numpy as np
+    import pandas as pd
+
+    df = pd.read_csv(stats_csv)
+    video_dir = Path(video_dir)
+    out_path  = Path(out_video)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Simulate A/B labels ───────────────────────────────────────────────────
+    policy_labels:  list[str]  = []
+    switched_after: list[bool] = []
+    cur = "A"
+    for _, row in df.iterrows():
+        policy_labels.append(cur)
+        triggered = float(row.get("peak_ema_score", 0.0)) >= interrupt_threshold
+        switched_after.append(triggered)
+        if triggered:
+            cur = "B" if cur == "A" else "A"
+
+    df = df.copy()
+    df["policy"]             = policy_labels
+    df["auto_switched_after"] = switched_after
+
+    writer = None
+    font   = cv2.FONT_HERSHEY_SIMPLEX
+    counts = {"A": 0, "B": 0}
+
+    for _, row in df.iterrows():
+        ep_idx   = int(row["episode_index"])
+        policy   = str(row["policy"])
+        switched = bool(row["auto_switched_after"])
+        counts[policy] += 1
+
+        vid_path = video_dir / f"episode_{ep_idx:04d}_interrupt.mp4"
+        if not vid_path.exists():
+            print(f"  [sim] ep {ep_idx:04d}: video not found, skipping")
+            continue
+
+        cap          = cv2.VideoCapture(str(vid_path))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        W            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))   # full 3-panel height
+        cam_H        = H - 2 * _STRIP_HEIGHT                     # camera-only height
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        switch_start = max(0, total_frames - int(fps * 2.0))      # last 2 s
+
+        if writer is None:
+            writer = cv2.VideoWriter(
+                str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
+            )
+
+        pol_color = _COLOR_STUDENT if policy == "A" else _COLOR_TEACHER
+        pol_role  = "STUDENT"     if policy == "A" else "TEACHER"
+        next_role = "TEACHER"     if policy == "A" else "STUDENT"
+        next_col  = _COLOR_TEACHER if policy == "A" else _COLOR_STUDENT
+
+        cam_top = _STRIP_HEIGHT
+        cam_bot = _STRIP_HEIGHT + cam_H
+        bt      = _BORDER_PX
+
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            # ── Colored border around camera section ──────────────────────────
+            cv2.rectangle(frame,
+                          (bt // 2,      cam_top + bt // 2),
+                          (W - bt // 2,  cam_bot - bt // 2),
+                          pol_color, bt)
+
+            # ── Role badge (top-right of camera section) ──────────────────────
+            badge = f"Policy {policy}  {pol_role}"
+            (tw, th), _ = cv2.getTextSize(badge, font, 0.55, 2)
+            pad = 6
+            bx0 = W - tw - 2 * pad - bt - 4
+            by0 = cam_top + bt + 4
+            bx1 = W - bt - 4
+            by1 = by0 + th + 2 * pad
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (bx0, by0), (bx1, by1), (15, 15, 15), -1)
+            cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+            cv2.putText(frame, badge, (bx0 + pad, by1 - pad),
+                        font, 0.55, pol_color, 2, cv2.LINE_AA)
+
+            # Episode-within-policy counter
+            cv2.putText(frame, f"ep {counts[policy]}",
+                        (bx0 + pad, by1 - pad + 20),
+                        font, 0.4, pol_color, 1, cv2.LINE_AA)
+
+            # ── AUTO-SWITCH banner (last 2 s of switching episodes) ───────────
+            if switched and frame_idx >= switch_start:
+                banner = "AUTO-SWITCH"
+                (bw, bh), _ = cv2.getTextSize(banner, font, 1.3, 3)
+                cam_mid = cam_top + cam_H // 2
+                tx = (W - bw) // 2
+                ty = cam_mid + bh // 2
+                ov3 = frame.copy()
+                cv2.rectangle(ov3,
+                              (tx - 16, ty - bh - 14),
+                              (tx + bw + 16, ty + 14),
+                              (0, 0, 180), -1)
+                cv2.addWeighted(ov3, 0.85, frame, 0.15, 0, frame)
+                cv2.putText(frame, banner, (tx, ty),
+                            font, 1.3, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(frame, f"-> {next_role}",
+                            (tx + (bw - int(cv2.getTextSize(f'-> {next_role}', font, 0.6, 2)[0][0])) // 2,
+                             ty + 30),
+                            font, 0.6, next_col, 2, cv2.LINE_AA)
+
+            writer.write(frame)
+            frame_idx += 1
+
+        cap.release()
+        print(f"  ep {ep_idx:04d}  {pol_role:<7}  switch={'YES' if switched else 'no '}"
+              f"  peak_ema={row.get('peak_ema_score', '?'):.3f}")
+
+    if writer:
+        writer.release()
+        print(f"\nSaved: {out_path}")
+        print(f"  {counts['A']} student episodes  +  {counts['B']} teacher episodes"
+              f"  =  {sum(counts.values())} total")
+        print(f"  Auto-switches: {sum(switched_after)}"
+              f"  (threshold={interrupt_threshold})")
+    else:
+        print("No episodes rendered — check that video_dir contains episode_XXXX_interrupt.mp4 files.")
+
+
 if __name__ == "__main__":
     import sys
 
+    _BASE = r"C:\Users\calle\PycharmProjects\RobotArm\rob534"
+
     if "--simulate" in sys.argv:
-        # Test the A/B switching simulation on the existing training stats.
-        # No robot or Gemini calls needed — just replays interrupt decisions.
+        # Offline A/B switch simulation — no robot, no Gemini calls.
+        # Uses eval stats if available, falls back to training stats.
+        _eval_csv  = rf"{_BASE}\eval_new_prompts_stats.csv"
+        _train_csv = rf"{_BASE}\train_stats.csv"
+        _src = _eval_csv if Path(_eval_csv).exists() else _train_csv
         simulate_ab_on_dataset(
-            existing_stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\train_stats.csv",
-            out_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_simulated_stats.csv",
+            existing_stats_csv=_src,
+            out_csv=rf"{_BASE}\ab_simulated_stats.csv",
             interrupt_threshold=0.5,
         )
+
+    elif "--video" in sys.argv:
+        # Render the composite A/B simulation video.
+        # Uses eval data if the batch run has finished, else training data.
+        _eval_csv  = rf"{_BASE}\eval_new_prompts_stats.csv"
+        _train_csv = rf"{_BASE}\train_stats.csv"
+        _eval_vids = rf"{_BASE}\interrupt_vids_eval"
+        _train_vids = rf"{_BASE}\interrupt_vids"
+        if Path(_eval_csv).exists() and Path(_eval_vids).exists():
+            simulate_ab_video(
+                stats_csv=_eval_csv,
+                video_dir=_eval_vids,
+                out_video=rf"{_BASE}\ab_sim_eval.mp4",
+                interrupt_threshold=0.5,
+            )
+        else:
+            print("Eval data not ready — using training data instead.")
+            simulate_ab_video(
+                stats_csv=_train_csv,
+                video_dir=_train_vids,
+                out_video=rf"{_BASE}\ab_sim_train.mp4",
+                interrupt_threshold=0.2,   # lower threshold; training data has lower EMA scores
+            )
+
     else:
         # Live A/B eval on real robot.
         from better_code import resolve_policy_path
@@ -750,5 +943,5 @@ if __name__ == "__main__":
             episode_time_s=45,
             use_struggle_monitor=True,
             auto_switch=True,
-            stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_eval_stats.csv",
+            stats_csv=rf"{_BASE}\ab_eval_stats.csv",
         )
