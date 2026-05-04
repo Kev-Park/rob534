@@ -231,16 +231,27 @@ def _stats_gui_process(queue) -> None:
     control loop so it cannot cause GIL contention or slow down switching.
     """
     import tkinter as tk
+    import collections
 
-    BG      = "#111111"
-    FG      = "#dddddd"
-    GREY    = "#666666"
-    BAR_W   = 280   # total canvas width for the EMA bar
+    BG   = "#111111"
+    FG   = "#dddddd"
+    GREY = "#666666"
+
+    # ── chart constants ───────────────────────────────────────────────────────
+    CW        = 292          # chart canvas width  (pixels)
+    CH        = 120          # chart canvas height (pixels)
+    MAX_PTS   = 120          # rolling history length (~2 min at 1 pt/s)
+    PAD_LEFT  = 28           # space for y-axis labels
+    PAD_RIGHT = 4
+    PAD_TOP   = 6
+    PAD_BOT   = 4
+    PLOT_W    = CW - PAD_LEFT - PAD_RIGHT
+    PLOT_H    = CH - PAD_TOP  - PAD_BOT
 
     root = tk.Tk()
     root.title("A/B Eval — Live Stats")
     root.configure(bg=BG)
-    root.geometry("320x310")
+    root.geometry("320x420")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
@@ -257,7 +268,7 @@ def _stats_gui_process(queue) -> None:
         return var, lbl
 
     tk.Label(root, text="A/B EVAL", bg=BG, fg="#aaaaaa",
-             font=("Consolas", 10)).pack(pady=(10, 4))
+             font=("Consolas", 10)).pack(pady=(10, 2))
 
     v_policy,  l_policy  = _row(root, "policy",        big=True)
     v_prob,    _         = _row(root, "interrupt prob")
@@ -265,52 +276,99 @@ def _stats_gui_process(queue) -> None:
     v_drops,   _         = _row(root, "drops",          big=True)
     v_status,  l_status  = _row(root, "status")
 
-    # ── EMA progress bar ──────────────────────────────────────────────────────
-    # Shows EMA creeping toward threshold.  Left of the threshold marker = safe
-    # (green→yellow gradient); right of marker = danger zone (red).
-    bar_frame = tk.Frame(root, bg=BG)
-    bar_frame.pack(fill=tk.X, padx=14, pady=(6, 2))
-    tk.Label(bar_frame, text="EMA / cutoff", bg=BG, fg=GREY,
-             font=("Consolas", 9)).pack(anchor="w")
+    # ── live EMA chart ────────────────────────────────────────────────────────
+    chart_frame = tk.Frame(root, bg=BG)
+    chart_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
+    tk.Label(chart_frame, text="EMA score  (─ threshold)", bg=BG, fg=GREY,
+             font=("Consolas", 8)).pack(anchor="w")
 
-    bar_canvas = tk.Canvas(bar_frame, width=BAR_W, height=18,
-                           bg="#222222", highlightthickness=0)
-    bar_canvas.pack(anchor="w")
+    cv = tk.Canvas(chart_frame, width=CW, height=CH,
+                   bg="#0d1117", highlightthickness=1, highlightbackground="#333333")
+    cv.pack()
 
-    # filled bar (EMA fill)
-    bar_fill   = bar_canvas.create_rectangle(0, 0, 0, 18, fill="#44ff44", width=0)
-    # threshold tick mark
-    bar_tick   = bar_canvas.create_line(0, 0, 0, 18, fill="#ffffff", width=2)
-    # numeric label inside bar
-    bar_label  = bar_canvas.create_text(BAR_W // 2, 9, text="0.000 / 0.60",
-                                        fill=FG, font=("Consolas", 8, "bold"))
+    def _ema_to_y(v):
+        """Map EMA value [0,1] → canvas y (top=1, bottom=0)."""
+        return PAD_TOP + int((1.0 - min(max(v, 0.0), 1.0)) * PLOT_H)
 
-    _state = {"ema": 0.0, "thr": 0.6}  # last known values for smooth repaint
+    def _idx_to_x(i, n):
+        """Map history index i (out of n points) → canvas x."""
+        if n <= 1:
+            return PAD_LEFT + PLOT_W
+        return PAD_LEFT + int(i * PLOT_W / (n - 1))
 
-    def _repaint_bar(ema, thr):
-        _state["ema"] = ema
-        _state["thr"] = thr
+    # Static y-axis labels (0.0, 0.5, 1.0)
+    for val, label_txt in [(0.0, "0.0"), (0.5, "0.5"), (1.0, "1.0")]:
+        y = _ema_to_y(val)
+        cv.create_line(PAD_LEFT, y, PAD_LEFT + PLOT_W, y,
+                       fill="#1e2530", width=1)          # faint grid line
+        cv.create_text(PAD_LEFT - 4, y, text=label_txt,
+                       anchor="e", fill=GREY, font=("Consolas", 7))
+
+    # Threshold line — repositioned on each update
+    thr_line  = cv.create_line(PAD_LEFT, 60, PAD_LEFT + PLOT_W, 60,
+                               fill="#ff8800", width=1, dash=(6, 4))
+    thr_label = cv.create_text(PAD_LEFT + PLOT_W - 2, 60,
+                               text="", anchor="se",
+                               fill="#ff8800", font=("Consolas", 7, "bold"))
+
+    # EMA history
+    ema_history = collections.deque(maxlen=MAX_PTS)
+    _chart_state = {"thr": 0.6}
+
+    def _redraw_chart(ema, thr):
+        _chart_state["thr"] = thr
+        ema_history.append(ema)
+        n = len(ema_history)
+
+        # Reposition threshold line
+        ty = _ema_to_y(thr)
+        cv.coords(thr_line, PAD_LEFT, ty, PAD_LEFT + PLOT_W, ty)
+        cv.itemconfig(thr_label, text=f"{thr:.2f}", anchor="ne")
+        cv.coords(thr_label, PAD_LEFT + PLOT_W - 2, ty - 2)
+
+        # Remove previous EMA drawing
+        cv.delete("ema_plot")
+
+        if n < 2:
+            return
+
+        # Build point list
+        pts = []
+        for i, v in enumerate(ema_history):
+            pts.append(_idx_to_x(i, n))
+            pts.append(_ema_to_y(v))
+
+        # Shade danger zone (between threshold line and EMA line when above thr)
+        # Build a filled polygon: EMA line → right → bottom-right → bottom-left
+        above = [v for v in ema_history if v >= thr]
+        if above:
+            poly_pts = []
+            for i, v in enumerate(ema_history):
+                poly_pts.append(_idx_to_x(i, n))
+                poly_pts.append(min(_ema_to_y(v), ty))   # clamp to threshold
+            # close polygon at threshold level
+            poly_pts += [_idx_to_x(n - 1, n), ty, _idx_to_x(0, n), ty]
+            cv.create_polygon(poly_pts, fill="#3a0000", outline="",
+                              tags="ema_plot")
+
+        # Draw EMA line — green below threshold, red above
         struggling = ema >= thr
-        # Fill width proportional to ema, capped at bar width
-        fill_w = min(int(ema * BAR_W), BAR_W)
-        # Color: green → yellow as EMA approaches threshold, red once past
-        if struggling:
-            color = "#ff2222"
-        else:
-            ratio = ema / thr if thr > 0 else 0.0
-            r = int(min(255, ratio * 2 * 255))
-            g = int(min(255, (1 - max(0, ratio * 2 - 1)) * 255))
-            color = f"#{r:02x}{g:02x}00"
-        bar_canvas.itemconfig(bar_fill, fill=color)
-        bar_canvas.coords(bar_fill, 0, 0, fill_w, 18)
-        # Threshold tick
-        tick_x = min(int(thr * BAR_W), BAR_W - 1)
-        bar_canvas.coords(bar_tick, tick_x, 0, tick_x, 18)
-        bar_canvas.itemconfig(bar_label,
-                              text=f"EMA {ema:.3f}  /  cutoff {thr:.2f}",
-                              fill="#111111" if fill_w > BAR_W // 2 else FG)
+        line_color = "#ff3333" if struggling else "#00e676"
+        cv.create_line(*pts, fill=line_color, width=2,
+                       smooth=True, tags="ema_plot")
 
-    _repaint_bar(0.0, 0.6)
+        # Dot at current value (rightmost point)
+        cx = _idx_to_x(n - 1, n)
+        cy = _ema_to_y(ema)
+        cv.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
+                       fill=line_color, outline="", tags="ema_plot")
+
+        # Current value text
+        cv.create_text(cx + 5, cy, text=f"{ema:.3f}", anchor="w",
+                       fill=line_color, font=("Consolas", 7, "bold"),
+                       tags="ema_plot")
+
+    _redraw_chart(0.0, 0.6)
 
     def poll():
         try:
@@ -324,7 +382,7 @@ def _stats_gui_process(queue) -> None:
                 ema = data.get("ema", 0.0)
                 thr = data.get("threshold", 0.6)
                 struggling = ema >= thr
-                _repaint_bar(ema, thr)
+                _redraw_chart(ema, thr)
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
                 v_picks.set(str(data.get("picks", 0)))
                 v_drops.set(str(data.get("drops", 0)))
