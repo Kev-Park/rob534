@@ -260,10 +260,10 @@ def do_ab_eval(
         struggle_threshold:      EMA score above which is_struggling() triggers.
         auto_switch:             If True (requires use_struggle_monitor=True), the policy
                                  flips automatically when the monitor fires — no 'q' press
-                                 needed. The struggling episode is saved only to the active
-                                 policy's dataset and the arm goes home before the other
-                                 policy starts (unlike 'q', which holds position and saves
-                                 to both datasets).
+                                 needed. The arm holds position (never goes home) so the
+                                 scene is identical for the other policy. Unlike 'q', only
+                                 the active policy's dataset receives the episode (no
+                                 buffer duplication to the other dataset).
         stats_csv:               Optional path to a CSV for per-episode stats.
                                  Appended to (not overwritten) so partial runs survive.
     """
@@ -571,16 +571,16 @@ def do_ab_eval(
                         if dataset.episode_buffer is not None:
                             dataset.clear_episode_buffer()
 
-                    # ── FLIP POLICY IF q WAS PRESSED ──────────────────────────
+                    # ── FLIP POLICY IF q WAS PRESSED OR MONITOR TRIGGERED ─────
                     if events["switch_policy"]:
                         current_label = "B" if current_label == "A" else "A"
                         print(f"  Now on Policy {current_label}.")
-                    # Auto-switch: monitor triggered, flip policy (arm goes home next ep)
                     elif events.get("auto_switched"):
                         current_label = "B" if current_label == "A" else "A"
                         print(f"  [AutoSwitch] Monitor triggered — now on Policy {current_label}.")
-                    # Hold position only on manual q-press, not auto-switch
-                    events["_held_position"] = events["switch_policy"]
+                    # Hold position on any policy switch (q or auto) — arm never goes
+                    # home between policies so the scene stays identical for fair comparison.
+                    events["_held_position"] = events["switch_policy"] or bool(events.get("auto_switched"))
 
                     if events["stop_recording"]:
                         break
