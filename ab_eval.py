@@ -510,10 +510,15 @@ def do_ab_eval(
         resuming = (dataset_path / "meta" / "tasks.parquet").exists()
         if resuming:
             print(f"  [{repo_id}] Resuming existing dataset.")
-            ds = LeRobotDataset(repo_id, root=dataset_path)
-            ds.start_image_writer(num_processes=0, num_threads=4)
-            sanity_check_dataset_robot_compatibility(ds, robot, 30, dataset_features)
-        else:
+            try:
+                ds = LeRobotDataset(repo_id, root=dataset_path)
+                ds.start_image_writer(num_processes=0, num_threads=4)
+                sanity_check_dataset_robot_compatibility(ds, robot, 30, dataset_features)
+            except Exception as e:
+                print(f"  [{repo_id}] Corrupted dataset ({e.__class__.__name__}), wiping and recreating.")
+                shutil.rmtree(dataset_path)
+                resuming = False   # fall through to create branch
+        if not resuming:
             if dataset_path.exists():
                 print(f"  [{repo_id}] Incomplete folder found, starting fresh.")
                 shutil.rmtree(dataset_path)
