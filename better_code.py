@@ -424,11 +424,19 @@ def do_replay(repo_id="nc8304/so101", episode=0):
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
     _BASE = Path(__file__).parent
 
-    if "--simulate" in sys.argv:
+    parser = argparse.ArgumentParser(description="Robot arm A/B eval / simulation")
+    parser.add_argument("--simulate",   action="store_true",  help="Offline A/B simulation video (no robot)")
+    parser.add_argument("--threshold",  type=float, default=0.6, help="Struggle monitor interrupt threshold (default 0.6)")
+    parser.add_argument("--episodes",   type=int,   default=10,  help="Number of episodes (default 10)")
+    parser.add_argument("--time",       type=float, default=45,  help="Max seconds per episode (default 45)")
+    args = parser.parse_args()
+
+    if args.simulate:
         # Offline A/B simulation video — no robot needed.
         from ab_eval import simulate_ab_video
         _eval_csv  = _BASE / "eval_new_prompts_stats.csv"
@@ -440,7 +448,7 @@ if __name__ == "__main__":
                 stats_csv=str(_eval_csv),
                 video_dir=str(_eval_vids),
                 out_video=str(_BASE / "ab_sim_eval.mp4"),
-                interrupt_threshold=0.5,
+                interrupt_threshold=args.threshold,
                 show=True,
                 dataset_id="nc8304/eval_smolvla-phase-split-new-prompts",
             )
@@ -449,7 +457,7 @@ if __name__ == "__main__":
                 stats_csv=str(_train_csv),
                 video_dir=str(_train_vids),
                 out_video=str(_BASE / "ab_sim_train.mp4"),
-                interrupt_threshold=0.2,
+                interrupt_threshold=args.threshold,
                 show=True,
                 dataset_id="nc8304/so101_combined_cubeONLY",
             )
@@ -533,9 +541,10 @@ if __name__ == "__main__":
         policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
         repo_id_a="SkywalkerLi/run eval_smolvla-aug_policyA",
         repo_id_b="SkywalkerLi/eval_smolvla-phase-split_policyB",
-        num_episodes=10,
-        episode_time_s=45,
+        num_episodes=args.episodes,
+        episode_time_s=args.time,
         use_struggle_monitor=True,
         auto_switch=True,
+        struggle_threshold=args.threshold,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )
