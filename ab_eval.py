@@ -593,7 +593,7 @@ def do_ab_eval(
         robot.disconnect()
         listener.stop()
         switch_listener.stop()
-        # finalize() writes index files and closes video writers.
+        # finalize() writes indexlet me see videos od files and closes video writers.
         # Must be called on both so neither dataset is left incomplete.
         dataset_a.finalize()
         dataset_b.finalize()
@@ -739,6 +739,7 @@ def simulate_ab_video(
     video_dir: str,
     out_video: str = "ab_simulated.mp4",
     interrupt_threshold: float = 0.5,
+    show: bool = False,
 ) -> None:
     """Render a composite A/B simulation video from pre-computed interrupt stats.
 
@@ -759,6 +760,10 @@ def simulate_ab_video(
         video_dir:           Directory that contains episode_XXXX_interrupt.mp4 files.
         out_video:           Output .mp4 path.
         interrupt_threshold: peak_ema_score threshold for triggering a switch.
+        show:                If True, display each frame in a real-time cv2 window
+                             as well as writing to out_video. Press 'q' to quit early.
+                             This previews exactly what the live rollout display
+                             would look like, at actual playback speed.
     """
     import cv2
     import numpy as np
@@ -872,6 +877,13 @@ def simulate_ab_video(
                              ty + 30),
                             font, 0.6, next_col, 2, cv2.LINE_AA)
 
+            if show:
+                cv2.imshow("A/B Eval Preview", frame)
+                # waitKey delay in ms to match source fps; 'q' quits preview
+                if cv2.waitKey(max(1, int(1000 / fps))) & 0xFF == ord("q"):
+                    show = False   # stop showing but keep writing to file
+                    cv2.destroyAllWindows()
+
             writer.write(frame)
             frame_idx += 1
 
@@ -881,6 +893,9 @@ def simulate_ab_video(
 
     if writer:
         writer.release()
+    cv2.destroyAllWindows()
+
+    if writer:
         print(f"\nSaved: {out_path}")
         print(f"  {counts['A']} student episodes  +  {counts['B']} teacher episodes"
               f"  =  {sum(counts.values())} total")
@@ -920,6 +935,7 @@ if __name__ == "__main__":
                 video_dir=_eval_vids,
                 out_video=rf"{_BASE}\ab_sim_eval.mp4",
                 interrupt_threshold=0.5,
+                show=True,
             )
         else:
             print("Eval data not ready — using training data instead.")
@@ -927,7 +943,8 @@ if __name__ == "__main__":
                 stats_csv=_train_csv,
                 video_dir=_train_vids,
                 out_video=rf"{_BASE}\ab_sim_train.mp4",
-                interrupt_threshold=0.2,   # lower threshold; training data has lower EMA scores
+                interrupt_threshold=0.2,
+                show=True,
             )
 
     else:
