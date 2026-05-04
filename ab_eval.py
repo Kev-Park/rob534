@@ -331,12 +331,17 @@ def _live_display_loop(
 class _MonitorFeedingRobot:
     """Thin robot wrapper that feeds camera frames to the struggle monitor.
 
-    Intercepts get_observation() so the monitor gets frames from lerobot's
-    own camera read rather than opening a competing VideoCapture handle.
+    Intercepts send_action() (called at ~30 Hz) to push the camera's
+    latest_frame — updated in lerobot's background capture thread — to the
+    monitor at action rate.  get_observation() also pushes frames but lerobot
+    only calls it at policy-inference rate (~0.3 Hz for SmolVLA), which is
+    too slow for the monitor's 12-frame minimum.
+
     All other attributes delegate transparently to the real robot.
     """
 
-    _CAM_KEY = "observation.images.camera1"
+    _CAM_NAME = "camera1"
+    _CAM_KEY  = "observation.images.camera1"
 
     def __init__(self, robot, monitor):
         object.__setattr__(self, "_robot",   robot)
@@ -347,6 +352,27 @@ class _MonitorFeedingRobot:
 
     def __setattr__(self, name, value):
         setattr(object.__getattribute__(self, "_robot"), name, value)
+
+    def _push_latest_camera_frame(self):
+        """Push the camera's latest background-thread frame to the monitor."""
+        import numpy as np
+        robot   = object.__getattribute__(self, "_robot")
+        monitor = object.__getattribute__(self, "_monitor")
+        try:
+            cam = robot.cameras.get(self._CAM_NAME)
+            if cam is not None and cam.latest_frame is not None:
+                frame = cam.latest_frame
+                if not isinstance(frame, np.ndarray):
+                    frame = np.array(frame)
+                monitor.push_frame(np.ascontiguousarray(frame))
+        except Exception:
+            pass
+
+    def send_action(self, action):
+        """Delegate to real robot and push camera frame to monitor at ~30 Hz."""
+        robot = object.__getattribute__(self, "_robot")
+        self._push_latest_camera_frame()
+        return robot.send_action(action)
 
     def get_observation(self):
         import numpy as np
