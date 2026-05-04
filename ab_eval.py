@@ -215,6 +215,150 @@ def _start_switch_key_listener(events):
     return listener
 
 
+def _stats_gui_process(queue) -> None:
+    """Standalone tkinter stats window — runs in its own process, fully isolated.
+
+    Receives dicts from the main process via a multiprocessing.Queue and
+    refreshes labels every 500 ms.  Completely separate from the robot
+    control loop so it cannot cause GIL contention or slow down switching.
+    """
+    import tkinter as tk
+
+    BG   = "#111111"
+    FG   = "#dddddd"
+    GREY = "#666666"
+
+    root = tk.Tk()
+    root.title("A/B Eval — Live Stats")
+    root.configure(bg=BG)
+    root.geometry("320x280")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    def _row(parent, label, default="--", big=False):
+        f = tk.Frame(parent, bg=BG)
+        f.pack(fill=tk.X, padx=14, pady=3)
+        tk.Label(f, text=label, bg=BG, fg=GREY, width=16, anchor="w",
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        var = tk.StringVar(value=default)
+        size = 14 if big else 10
+        lbl = tk.Label(f, textvariable=var, bg=BG, fg=FG, anchor="w",
+                       font=("Consolas", size, "bold"))
+        lbl.pack(side=tk.LEFT)
+        return var, lbl
+
+    tk.Label(root, text="A/B EVAL", bg=BG, fg="#aaaaaa",
+             font=("Consolas", 10)).pack(pady=(10, 4))
+
+    v_policy,    l_policy    = _row(root, "policy",          big=True)
+    v_ema,       l_ema       = _row(root, "EMA score")
+    v_threshold, _           = _row(root, "cutoff")
+    v_prob,      _           = _row(root, "interrupt prob")
+    v_picks,     _           = _row(root, "pickups",         big=True)
+    v_drops,     _           = _row(root, "drops",           big=True)
+    v_status,    l_status    = _row(root, "status")
+
+    def poll():
+        try:
+            while True:                         # drain all queued updates
+                data = queue.get_nowait()
+                label = data.get("label", "A")
+                color = "#00ffff" if label == "A" else "#ff44ff"
+                v_policy.set("STUDENT (A)" if label == "A" else "TEACHER (B)")
+                l_policy.config(fg=color)
+
+                ema = data.get("ema", 0.0)
+                thr = data.get("threshold", 0.6)
+                struggling = ema >= thr
+                v_ema.set(f"{ema:.4f}")
+                l_ema.config(fg="#ff4444" if struggling else FG)
+                v_threshold.set(f"{thr:.2f}")
+                v_prob.set(f"{data.get('prob', 0.0):.3f}")
+                v_picks.set(str(data.get("picks", 0)))
+                v_drops.set(str(data.get("drops", 0)))
+                if struggling:
+                    v_status.set("STRUGGLING")
+                    l_status.config(fg="#ff2222")
+                else:
+                    v_status.set("ok")
+                    l_status.config(fg="#44ff44")
+        except Exception:
+            pass
+        root.after(500, poll)
+
+    root.after(500, poll)
+    root.mainloop()
+
+
+def _live_display_loop(
+    monitor,
+    label_ref: list,
+    stop_evt: threading.Event,
+    interrupt_threshold: float = 0.5,
+    stats_queue=None,           # multiprocessing.Queue to the GUI process
+    window_name: str = "A/B Live Eval",
+) -> None:
+    """Push stats to the isolated GUI process every 0.5 s.
+
+    No cv2, no rerun — just a dict into the queue.  The GUI process does all
+    rendering independently so this thread is near-zero overhead.
+    """
+    while not stop_evt.is_set():
+        if stats_queue is not None:
+            intr = monitor.get_interrupt()
+            try:
+                stats_queue.put_nowait({
+                    "label":     label_ref[0],
+                    "ema":       monitor.get_struggle_score(),
+                    "threshold": interrupt_threshold,
+                    "prob":      intr.get("interrupt_probability", 0.0),
+                    "picks":     intr.get("pickup_attempts", 0),
+                    "drops":     intr.get("drop_attempts", 0),
+                })
+            except Exception:
+                pass   # queue full — GUI subprocess hasn't drained yet, skip
+        stop_evt.wait(0.5)
+
+
+class _MonitorFeedingRobot:
+    """Thin robot wrapper that feeds camera frames to the struggle monitor.
+
+    Intercepts get_observation() so the monitor gets frames from lerobot's
+    own camera read rather than opening a competing VideoCapture handle.
+    All other attributes delegate transparently to the real robot.
+    """
+
+    _CAM_KEY = "observation.images.camera1"
+
+    def __init__(self, robot, monitor):
+        object.__setattr__(self, "_robot",   robot)
+        object.__setattr__(self, "_monitor", monitor)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_robot"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_robot"), name, value)
+
+    def get_observation(self):
+        import numpy as np
+        robot   = object.__getattribute__(self, "_robot")
+        monitor = object.__getattribute__(self, "_monitor")
+        obs = robot.get_observation()
+        frame = obs.get(self._CAM_KEY)
+        if frame is not None:
+            # lerobot returns PIL Images; convert to BGR numpy for the monitor
+            if hasattr(frame, "numpy"):          # tensor
+                frame = frame.numpy()
+            if hasattr(frame, "convert"):        # PIL Image
+                import numpy as np
+                frame = np.array(frame.convert("RGB"))[:, :, ::-1]
+            elif isinstance(frame, np.ndarray) and frame.ndim == 3:
+                pass                             # already HWC numpy
+            monitor.push_frame(np.ascontiguousarray(frame))
+        return obs
+
+
 def do_ab_eval(
     policy_path_a,
     policy_path_b,
@@ -279,7 +423,7 @@ def do_ab_eval(
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
     from lerobot.robots.so_follower.so_follower import SOFollower
     from lerobot.scripts.lerobot_record import record_loop
-    from lerobot.utils.control_utils import (init_keyboard_listener, sanity_check_dataset_name,
+    from lerobot.utils.control_utils import (init_keyboard_listener,
                                               sanity_check_dataset_robot_compatibility)
     from lerobot.utils.utils import init_logging
     from lerobot.utils.visualization_utils import init_rerun
@@ -301,7 +445,7 @@ def do_ab_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
-    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
     init_rerun(session_name="recording")
@@ -373,7 +517,6 @@ def do_ab_eval(
             if dataset_path.exists():
                 print(f"  [{repo_id}] Incomplete folder found, starting fresh.")
                 shutil.rmtree(dataset_path)
-            sanity_check_dataset_name(repo_id, policy_cfg)
             ds = LeRobotDataset.create(
                 repo_id,
                 fps=30,
@@ -403,6 +546,13 @@ def do_ab_eval(
             "rename_observations_processor": {"rename_map": {}},
         },
     )
+
+    # Clear CUDA cache between the two model loads so the SVT encoder threads
+    # from dataset_a creation don't race with policy_b CUDA initialisation.
+    import torch, time as _time
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    _time.sleep(0.5)
 
     print("\n--- Policy B ---")
     cfg_b = _load_cfg(policy_path_b)
@@ -440,8 +590,28 @@ def do_ab_eval(
             interrupt_threshold=struggle_threshold,
         )
         monitor.start()
-        monitor.start_capture(camera_index=1)
-        print("  [StruggleMonitor] watching camera — will flag struggling episodes")
+        # Wrap the robot so get_observation() feeds frames to the monitor
+        # instead of opening a competing VideoCapture on the same camera.
+        robot = _MonitorFeedingRobot(robot, monitor)
+        print("  [StruggleMonitor] watching robot camera feed — will flag struggling episodes")
+
+    # Shared mutable label — display thread reads this, main loop writes it.
+    label_ref    = ["A"]
+    display_stop = threading.Event()
+    stats_queue  = None
+    if monitor:
+        import multiprocessing
+        stats_queue  = multiprocessing.Queue(maxsize=4)
+        gui_proc     = multiprocessing.Process(
+            target=_stats_gui_process, args=(stats_queue,), daemon=True,
+        )
+        gui_proc.start()
+        display_thread = threading.Thread(
+            target=_live_display_loop,
+            args=(monitor, label_ref, display_stop, struggle_threshold, stats_queue),
+            daemon=True,
+        )
+        display_thread.start()
 
     def _struggle_watcher(stop_evt):
         """Background thread: sets exit_early when monitor signals struggling.
@@ -574,9 +744,11 @@ def do_ab_eval(
                     # ── FLIP POLICY IF q WAS PRESSED OR MONITOR TRIGGERED ─────
                     if events["switch_policy"]:
                         current_label = "B" if current_label == "A" else "A"
+                        label_ref[0]  = current_label
                         print(f"  Now on Policy {current_label}.")
                     elif events.get("auto_switched"):
                         current_label = "B" if current_label == "A" else "A"
+                        label_ref[0]  = current_label
                         print(f"  [AutoSwitch] Monitor triggered — now on Policy {current_label}.")
                     # Hold position on any policy switch (q or auto) — arm never goes
                     # home between policies so the scene stays identical for fair comparison.
@@ -586,6 +758,7 @@ def do_ab_eval(
                         break
 
     finally:
+        display_stop.set()  # stop live cv2 display thread
         if monitor:
             monitor.stop()
         # Park arm at home and clean up regardless of how the run ended.
@@ -593,7 +766,7 @@ def do_ab_eval(
         robot.disconnect()
         listener.stop()
         switch_listener.stop()
-        # finalize() writes indexlet me see videos od files and closes video writers.
+        # finalize() writes index files and closes video writers.
         # Must be called on both so neither dataset is left incomplete.
         dataset_a.finalize()
         dataset_b.finalize()
@@ -727,7 +900,8 @@ def simulate_ab_on_dataset(
 
 
 # Cyan  (BGR) — student policy
-_COLOR_STUDENT = (255, 255,   0)
+_COLOR_STUDENT  = (255, 255,   0)
+_COLOR_SUCCESS  = (  0, 255,   0)   # green — task accomplished
 # Magenta (BGR) — teacher policy
 _COLOR_TEACHER = (255,   0, 255)
 _BORDER_PX     = 6
@@ -740,6 +914,7 @@ def simulate_ab_video(
     out_video: str = "ab_simulated.mp4",
     interrupt_threshold: float = 0.5,
     show: bool = False,
+    dataset_id: str | None = None,
 ) -> None:
     """Render a composite A/B simulation video from pre-computed interrupt stats.
 
@@ -749,23 +924,27 @@ def simulate_ab_video(
           cyan    = student policy  (Policy A)
           magenta = teacher policy  (Policy B)
       - A role badge in the top-right corner ("STUDENT" / "TEACHER").
-      - A red "AUTO-SWITCH" banner over the camera for the last 2 s of any
-        episode that triggers a policy flip.
+      - A red "AUTO-SWITCH" banner from the exact frame the EMA threshold
+        was crossed to the end of the episode (not just the last 2 s).
 
     All episodes are concatenated into a single output video.
 
     Args:
-        stats_csv:           Path to a CSV that has episode_index and peak_ema_score
-                             columns (produced by test_on_dataset).
+        stats_csv:           Path to a CSV that has episode_index, peak_ema_score,
+                             and first_interrupt_ts columns (from test_on_dataset).
         video_dir:           Directory that contains episode_XXXX_interrupt.mp4 files.
         out_video:           Output .mp4 path.
         interrupt_threshold: peak_ema_score threshold for triggering a switch.
         show:                If True, display each frame in a real-time cv2 window
                              as well as writing to out_video. Press 'q' to quit early.
-                             This previews exactly what the live rollout display
-                             would look like, at actual playback speed.
+        dataset_id:          HuggingFace dataset ID used to load per-episode from_ts
+                             (episode start time in the source video). Required to
+                             compute the exact switch frame from first_interrupt_ts.
+                             Uses local cache — no download. Falls back to end-of-
+                             episode banner if not provided.
     """
     import cv2
+    import glob as _glob
     import numpy as np
     import pandas as pd
 
@@ -774,57 +953,97 @@ def simulate_ab_video(
     out_path  = Path(out_video)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Simulate A/B labels ───────────────────────────────────────────────────
-    policy_labels:  list[str]  = []
-    switched_after: list[bool] = []
-    cur = "A"
-    for _, row in df.iterrows():
-        policy_labels.append(cur)
-        triggered = float(row.get("peak_ema_score", 0.0)) >= interrupt_threshold
-        switched_after.append(triggered)
-        if triggered:
-            cur = "B" if cur == "A" else "A"
-
-    df = df.copy()
-    df["policy"]             = policy_labels
-    df["auto_switched_after"] = switched_after
+    # ── Build episode from_ts lookup (needed for exact switch frame) ──────────
+    # first_interrupt_ts in the CSV is an absolute video timestamp.
+    # The interrupt video for episode N starts at from_ts seconds into that video.
+    # switch_frame = (first_interrupt_ts - from_ts) * fps
+    ep_from_ts: dict[int, float] = {}
+    if dataset_id is not None:
+        try:
+            from huggingface_hub import snapshot_download
+            repo_dir = snapshot_download(repo_id=dataset_id, repo_type="dataset",
+                                         local_files_only=True)
+            meta_files = sorted(_glob.glob(f"{repo_dir}/meta/episodes/**/*.parquet",
+                                           recursive=True))
+            if meta_files:
+                df_meta = pd.concat([pd.read_parquet(f) for f in meta_files],
+                                    ignore_index=True)
+                _cam_candidates = [
+                    "videos/observation.images.camera1",
+                    "videos/observation.images.front",
+                    "videos/observation.images.top",
+                    "videos/observation.images.camera_0",
+                ]
+                _cam = next(
+                    (k for k in _cam_candidates
+                     if f"{k}/from_timestamp" in df_meta.columns),
+                    None,
+                )
+                if _cam:
+                    for _, mrow in df_meta.iterrows():
+                        ep_from_ts[int(mrow["episode_index"])] = float(
+                            mrow[f"{_cam}/from_timestamp"]
+                        )
+                    print(f"  Loaded from_ts for {len(ep_from_ts)} episodes from meta.")
+        except Exception as _e:
+            print(f"  Warning: could not load episode from_ts ({_e}). "
+                  f"Provide dataset_id for exact switch frames.")
 
     writer = None
     font   = cv2.FONT_HERSHEY_SIMPLEX
-    counts = {"A": 0, "B": 0}
+
+    n_total = 0
+    vid_count         = 0   # sequential counter for rendered videos
+
+    # Pre-count how many videos exist so we can show N/total in badge
+    # Only render episodes where the threshold was actually crossed
+    n_vids_expected = sum(
+        1 for _, r in df.iterrows()
+        if float(r.get("peak_ema_score", 0.0)) >= interrupt_threshold
+        and (video_dir / f"episode_{int(r['episode_index']):04d}_interrupt.mp4").exists()
+    )
 
     for _, row in df.iterrows():
-        ep_idx   = int(row["episode_index"])
-        policy   = str(row["policy"])
-        switched = bool(row["auto_switched_after"])
-        counts[policy] += 1
+        ep_idx    = int(row["episode_index"])
+        peak_ema  = float(row.get("peak_ema_score", 0.0))
+        switched  = peak_ema >= interrupt_threshold
+
+        if not switched:
+            continue  # skip episodes where teacher was never needed
 
         vid_path = video_dir / f"episode_{ep_idx:04d}_interrupt.mp4"
         if not vid_path.exists():
             print(f"  [sim] ep {ep_idx:04d}: video not found, skipping")
             continue
 
+        vid_count += 1
+
         cap          = cv2.VideoCapture(str(vid_path))
         fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
         W            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))   # full 3-panel height
-        cam_H        = H - 2 * _STRIP_HEIGHT                     # camera-only height
+        H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_H        = H - 2 * _STRIP_HEIGHT
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        switch_start = max(0, total_frames - int(fps * 2.0))      # last 2 s
+
+        # ── Switch frame: exact moment EMA crossed threshold ──────────────────
+        first_ts = row.get("first_interrupt_ts")
+        from_ts  = ep_from_ts.get(ep_idx)
+        if switched and first_ts is not None and not pd.isna(first_ts) and from_ts is not None:
+            switch_frame = max(0, int((float(first_ts) - from_ts) * fps))
+        else:
+            switch_frame = total_frames  # never switch if not triggered
 
         if writer is None:
             writer = cv2.VideoWriter(
                 str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
             )
 
-        pol_color = _COLOR_STUDENT if policy == "A" else _COLOR_TEACHER
-        pol_role  = "STUDENT"     if policy == "A" else "TEACHER"
-        next_role = "TEACHER"     if policy == "A" else "STUDENT"
-        next_col  = _COLOR_TEACHER if policy == "A" else _COLOR_STUDENT
-
         cam_top = _STRIP_HEIGHT
         cam_bot = _STRIP_HEIGHT + cam_H
         bt      = _BORDER_PX
+        BANNER_FRAMES = int(fps * 2.5)   # show "TEACHER INTERVENES" for ~2.5 s
+
+        n_total += 1
 
         frame_idx = 0
         while True:
@@ -832,14 +1051,22 @@ def simulate_ab_video(
             if not ok:
                 break
 
+            # ── Two-phase model: STUDENT until threshold crossed, then TEACHER ─
+            if switched and frame_idx >= switch_frame:
+                border_color = _COLOR_TEACHER
+                role_text    = "TEACHER"
+            else:
+                border_color = _COLOR_STUDENT
+                role_text    = "STUDENT"
+
             # ── Colored border around camera section ──────────────────────────
             cv2.rectangle(frame,
                           (bt // 2,      cam_top + bt // 2),
                           (W - bt // 2,  cam_bot - bt // 2),
-                          pol_color, bt)
+                          border_color, bt)
 
             # ── Role badge (top-right of camera section) ──────────────────────
-            badge = f"Policy {policy}  {pol_role}"
+            badge = f"[{vid_count}/{n_vids_expected}] ep {ep_idx}  {role_text}"
             (tw, th), _ = cv2.getTextSize(badge, font, 0.55, 2)
             pad = 6
             bx0 = W - tw - 2 * pad - bt - 4
@@ -850,17 +1077,13 @@ def simulate_ab_video(
             cv2.rectangle(overlay, (bx0, by0), (bx1, by1), (15, 15, 15), -1)
             cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
             cv2.putText(frame, badge, (bx0 + pad, by1 - pad),
-                        font, 0.55, pol_color, 2, cv2.LINE_AA)
+                        font, 0.55, border_color, 2, cv2.LINE_AA)
 
-            # Episode-within-policy counter
-            cv2.putText(frame, f"ep {counts[policy]}",
-                        (bx0 + pad, by1 - pad + 20),
-                        font, 0.4, pol_color, 1, cv2.LINE_AA)
-
-            # ── AUTO-SWITCH banner (last 2 s of switching episodes) ───────────
-            if switched and frame_idx >= switch_start:
-                banner = "AUTO-SWITCH"
-                (bw, bh), _ = cv2.getTextSize(banner, font, 1.3, 3)
+            # ── "TEACHER INTERVENES" banner for first ~2.5 s after switch ─────
+            if (switched
+                    and switch_frame <= frame_idx < switch_frame + BANNER_FRAMES):
+                banner = "TEACHER INTERVENES"
+                (bw, bh), _ = cv2.getTextSize(banner, font, 1.1, 3)
                 cam_mid = cam_top + cam_H // 2
                 tx = (W - bw) // 2
                 ty = cam_mid + bh // 2
@@ -868,97 +1091,35 @@ def simulate_ab_video(
                 cv2.rectangle(ov3,
                               (tx - 16, ty - bh - 14),
                               (tx + bw + 16, ty + 14),
-                              (0, 0, 180), -1)
-                cv2.addWeighted(ov3, 0.85, frame, 0.15, 0, frame)
+                              (80, 0, 80), -1)
+                cv2.addWeighted(ov3, 0.82, frame, 0.18, 0, frame)
                 cv2.putText(frame, banner, (tx, ty),
-                            font, 1.3, (255, 255, 255), 3, cv2.LINE_AA)
-                cv2.putText(frame, f"-> {next_role}",
-                            (tx + (bw - int(cv2.getTextSize(f'-> {next_role}', font, 0.6, 2)[0][0])) // 2,
-                             ty + 30),
-                            font, 0.6, next_col, 2, cv2.LINE_AA)
+                            font, 1.1, _COLOR_TEACHER, 3, cv2.LINE_AA)
 
             if show:
                 cv2.imshow("A/B Eval Preview", frame)
-                # waitKey delay in ms to match source fps; 'q' quits preview
                 if cv2.waitKey(max(1, int(1000 / fps))) & 0xFF == ord("q"):
-                    show = False   # stop showing but keep writing to file
+                    show = False
                     cv2.destroyAllWindows()
 
             writer.write(frame)
             frame_idx += 1
 
         cap.release()
-        print(f"  ep {ep_idx:04d}  {pol_role:<7}  switch={'YES' if switched else 'no '}"
-              f"  peak_ema={row.get('peak_ema_score', '?'):.3f}")
+        print(f"  [{vid_count}/{n_vids_expected}] ep {ep_idx:04d}  peak_ema={peak_ema:.3f}"
+              f"  switch={'@' + str(switch_frame) + 'f' if switched else 'no'}")
 
     if writer:
         writer.release()
     cv2.destroyAllWindows()
 
     if writer:
-        print(f"\nSaved: {out_path}")
-        print(f"  {counts['A']} student episodes  +  {counts['B']} teacher episodes"
-              f"  =  {sum(counts.values())} total")
-        print(f"  Auto-switches: {sum(switched_after)}"
-              f"  (threshold={interrupt_threshold})")
+        print(f"\nSaved: {out_path}  ({n_total} episodes with teacher intervention)")
+        print(f"  (interrupt_threshold={interrupt_threshold})")
     else:
         print("No episodes rendered — check that video_dir contains episode_XXXX_interrupt.mp4 files.")
 
 
-if __name__ == "__main__":
-    import sys
-
-    _BASE = r"C:\Users\calle\PycharmProjects\RobotArm\rob534"
-
-    if "--simulate" in sys.argv:
-        # Offline A/B switch simulation — no robot, no Gemini calls.
-        # Uses eval stats if available, falls back to training stats.
-        _eval_csv  = rf"{_BASE}\eval_new_prompts_stats.csv"
-        _train_csv = rf"{_BASE}\train_stats.csv"
-        _src = _eval_csv if Path(_eval_csv).exists() else _train_csv
-        simulate_ab_on_dataset(
-            existing_stats_csv=_src,
-            out_csv=rf"{_BASE}\ab_simulated_stats.csv",
-            interrupt_threshold=0.5,
-        )
-
-    elif "--video" in sys.argv:
-        # Render the composite A/B simulation video.
-        # Uses eval data if the batch run has finished, else training data.
-        _eval_csv  = rf"{_BASE}\eval_new_prompts_stats.csv"
-        _train_csv = rf"{_BASE}\train_stats.csv"
-        _eval_vids = rf"{_BASE}\interrupt_vids_eval"
-        _train_vids = rf"{_BASE}\interrupt_vids"
-        if Path(_eval_csv).exists() and Path(_eval_vids).exists():
-            simulate_ab_video(
-                stats_csv=_eval_csv,
-                video_dir=_eval_vids,
-                out_video=rf"{_BASE}\ab_sim_eval.mp4",
-                interrupt_threshold=0.5,
-                show=True,
-            )
-        else:
-            print("Eval data not ready — using training data instead.")
-            simulate_ab_video(
-                stats_csv=_train_csv,
-                video_dir=_train_vids,
-                out_video=rf"{_BASE}\ab_sim_train.mp4",
-                interrupt_threshold=0.2,
-                show=True,
-            )
-
-    else:
-        # Live A/B eval on real robot.
-        from better_code import resolve_policy_path
-
-        do_ab_eval(
-            policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-            policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-            repo_id_b="SkywalkerLi/eval_smolvla-phase-split-new-prompts_policyB",
-            repo_id_a="SkywalkerLi/eval_smolvla-aug_policyA",
-            num_episodes=10,
-            episode_time_s=45,
-            use_struggle_monitor=True,
-            auto_switch=True,
-            stats_csv=rf"{_BASE}\ab_eval_stats.csv",
-        )
+# Entry point is better_code.py — run via:
+#   python better_code.py            # live A/B eval on robot
+#   python better_code.py --simulate # offline simulation video

@@ -656,6 +656,12 @@ class LiveStruggleMonitor:
         """Return the current EMA struggle score (0–1)."""
         return self._struggle_score
 
+    @property
+    def latest_frame(self):
+        """Return a copy of the most recent camera frame, or None if buffer is empty."""
+        with self._lock:
+            return self._buffer[-1].copy() if self._buffer else None
+
     def get_episode_state(self) -> EpisodeState:
         """Return the accumulated episode state summary (safe to call at any time)."""
         return self._state_tracker.get_state()

@@ -421,6 +421,37 @@ def do_replay(repo_id="nc8304/so101", episode=0):
 
 
 if __name__ == "__main__":
+    import sys
+
+    _BASE = Path(__file__).parent
+
+    if "--simulate" in sys.argv:
+        # Offline A/B simulation video — no robot needed.
+        from ab_eval import simulate_ab_video
+        _eval_csv  = _BASE / "eval_new_prompts_stats.csv"
+        _train_csv = _BASE / "train_stats.csv"
+        _eval_vids = _BASE / "interrupt_vids_eval"
+        _train_vids = _BASE / "interrupt_vids"
+        if _eval_csv.exists() and _eval_vids.exists():
+            simulate_ab_video(
+                stats_csv=str(_eval_csv),
+                video_dir=str(_eval_vids),
+                out_video=str(_BASE / "ab_sim_eval.mp4"),
+                interrupt_threshold=0.5,
+                show=True,
+                dataset_id="nc8304/eval_smolvla-phase-split-new-prompts",
+            )
+        else:
+            simulate_ab_video(
+                stats_csv=str(_train_csv),
+                video_dir=str(_train_vids),
+                out_video=str(_BASE / "ab_sim_train.mp4"),
+                interrupt_threshold=0.2,
+                show=True,
+                dataset_id="nc8304/so101_combined_cubeONLY",
+            )
+        sys.exit(0)
+
     import torch
     import psutil
 
@@ -491,15 +522,17 @@ if __name__ == "__main__":
 
     print("=" * 50)
 
-    #get_current_pos()
-    #do_teleoperate()
-    #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
-    #do_replay(repo_id="nc8304/so101_031626",episode=0)
-    #do_eval(policy_path="SkywalkerLi/act-so101")
-    do_smol_vla_eval(
-        policy_path=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        repo_id="SkywalkerLi/eval_smolvla-phase-split-new-prompts_05",
-        num_episodes=4,
+    # ── Live A/B eval on real robot ───────────────────────────────────────────
+    from ab_eval import do_ab_eval
+
+    do_ab_eval(
+        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        repo_id_a="SkywalkerLi/run eval_smolvla-aug_policyA",
+        repo_id_b="SkywalkerLi/eval_smolvla-phase-split_policyB",
+        num_episodes=10,
         episode_time_s=45,
-        use_struggle_monitor=False,
+        use_struggle_monitor=True,
+        auto_switch=True,
+        stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )
