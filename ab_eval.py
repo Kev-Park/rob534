@@ -112,6 +112,24 @@ from better_code import (
 )
 
 
+def _append_episode_stats_ab(csv_path: str, ep_idx: int, policy_label: str, ep_state) -> None:
+    """Append one episode's stats row to a CSV (creates file + header on first write).
+
+    Columns: episode_index, policy, then all EpisodeState dataclass fields.
+    """
+    import csv
+    from dataclasses import asdict
+    path = Path(csv_path)
+    row = {"episode_index": ep_idx, "policy": policy_label, **asdict(ep_state)}
+    write_header = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"  [stats] ep {ep_idx} (Policy {policy_label}) -> {csv_path}")
+
+
 def _duplicate_buffer(source_dataset, target_dataset) -> int:
     """
     Copy every buffered frame from source_dataset into target_dataset.
@@ -205,6 +223,11 @@ def do_ab_eval(
     single_task="Grab the cube and drop it",
     num_episodes=20,
     episode_time_s=60,
+    use_struggle_monitor=False,
+    struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
+    struggle_check_interval=2.0,
+    struggle_threshold=0.6,
+    stats_csv=None,
 ):
     """
     A/B policy eval driven by manual q-key switches.
@@ -224,9 +247,19 @@ def do_ab_eval(
         repo_id_a:      Dataset repo_id for policy A results. Auto-derived from
                         policy_path_a if not given.
         repo_id_b:      Same for policy B.
-        single_task:    Task string written into both datasets.
-        num_episodes:   Total episode cap across both policies combined.
-        episode_time_s: Max seconds per episode before it auto-ends.
+        single_task:             Task string written into both datasets.
+        num_episodes:            Total episode cap across both policies combined.
+        episode_time_s:          Max seconds per episode before it auto-ends.
+        use_struggle_monitor:    If True, runs a LiveStruggleMonitor in the background.
+                                 The monitor polls Gemini every struggle_check_interval
+                                 seconds. When the EMA score exceeds struggle_threshold,
+                                 the episode ends early so the operator can switch or
+                                 reset. Episode stats are written to stats_csv if set.
+        struggle_key_file:       Path to a file containing the Gemini API key.
+        struggle_check_interval: Seconds between Gemini assessments.
+        struggle_threshold:      EMA score above which is_struggling() triggers.
+        stats_csv:               Optional path to a CSV for per-episode stats.
+                                 Appended to (not overwritten) so partial runs survive.
     """
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -389,6 +422,29 @@ def do_ab_eval(
     counts = {"A": 0, "B": 0}  # episodes completed per policy
     current_label = "A"         # start on A; 'q' flips this each time
 
+    # ── Struggle monitor (optional) ───────────────────────────────────────────
+    monitor = None
+    if use_struggle_monitor:
+        from struggle_monitor import LiveStruggleMonitor
+        monitor = LiveStruggleMonitor(
+            key_file=struggle_key_file,
+            model="gemini-2.5-flash",
+            check_interval=struggle_check_interval,
+            interrupt_threshold=struggle_threshold,
+        )
+        monitor.start()
+        monitor.start_capture(camera_index=1)
+        print("  [StruggleMonitor] watching camera — will flag struggling episodes")
+
+    def _struggle_watcher(stop_evt):
+        """Background thread: sets exit_early when monitor signals struggling."""
+        while not stop_evt.is_set():
+            if monitor and monitor.is_struggling():
+                print(f"\n  [StruggleMonitor] STRUGGLING — exiting episode early")
+                events["exit_early"] = True
+                break
+            stop_evt.wait(timeout=0.25)
+
     try:
         # Both VideoEncodingManagers stay open for the full run so their
         # background video-writing threads are always ready, regardless of
@@ -413,6 +469,17 @@ def do_ab_eval(
                     events["exit_early"] = False
                     events["rerecord_episode"] = False
                     events["switch_policy"] = False
+
+                    if monitor:
+                        monitor.reset_signal()
+
+                    # Per-episode watcher thread: ends episode early if struggling.
+                    watcher_stop = threading.Event()
+                    if monitor:
+                        watcher = threading.Thread(
+                            target=_struggle_watcher, args=(watcher_stop,), daemon=True
+                        )
+                        watcher.start()
 
                     # ── GO HOME (skipped after q) ──────────────────────────────
                     # Normally the arm returns home so every episode starts from
@@ -447,6 +514,12 @@ def do_ab_eval(
                         display_data=True,
                     )
 
+                    # Stop watcher thread and collect episode stats.
+                    if monitor:
+                        watcher_stop.set()
+                        ep_state = monitor.get_episode_state()
+                        print(f"  [EpisodeState] {ep_state}")
+
                     # ── SAVE EPISODE ──────────────────────────────────────────
                     # Guard against empty buffer — can happen if 'q' was pressed
                     # during go_home before the record_loop captured any frames.
@@ -465,9 +538,18 @@ def do_ab_eval(
                             print(f"  [switch] Saving {n_copied} frames to both datasets.")
                             dataset.save_episode()        # clears source buffer
                             other_dataset.save_episode()  # saves the copied frames
+                            # Write stats for both datasets (same episode, both policies)
+                            if stats_csv and monitor:
+                                _append_episode_stats_ab(
+                                    stats_csv, dataset.num_episodes - 1, label, ep_state)
+                                _append_episode_stats_ab(
+                                    stats_csv, other_dataset.num_episodes - 1, other_label, ep_state)
                         else:
                             # Normal end — save only to the active policy's dataset.
                             dataset.save_episode()
+                            if stats_csv and monitor:
+                                _append_episode_stats_ab(
+                                    stats_csv, dataset.num_episodes - 1, label, ep_state)
                     else:
                         print(f"  WARNING: Episode {i + 1} (Policy {label}) collected no frames — skipping save.")
                         if dataset.episode_buffer is not None:
@@ -484,6 +566,8 @@ def do_ab_eval(
                         break
 
     finally:
+        if monitor:
+            monitor.stop()
         # Park arm at home and clean up regardless of how the run ended.
         _go_home_with_robot(robot)
         robot.disconnect()
@@ -505,4 +589,6 @@ if __name__ == "__main__":
         repo_id_a="SkywalkerLi/eval_smolvla-aug_policyA",
         num_episodes=10,
         episode_time_s=45,
+        use_struggle_monitor=True,
+        stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\ab_eval_stats.csv",
     )
