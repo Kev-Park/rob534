@@ -232,20 +232,21 @@ def _stats_gui_process(queue) -> None:
     """
     import tkinter as tk
 
-    BG   = "#111111"
-    FG   = "#dddddd"
-    GREY = "#666666"
+    BG      = "#111111"
+    FG      = "#dddddd"
+    GREY    = "#666666"
+    BAR_W   = 280   # total canvas width for the EMA bar
 
     root = tk.Tk()
     root.title("A/B Eval — Live Stats")
     root.configure(bg=BG)
-    root.geometry("320x280")
+    root.geometry("320x310")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
     def _row(parent, label, default="--", big=False):
         f = tk.Frame(parent, bg=BG)
-        f.pack(fill=tk.X, padx=14, pady=3)
+        f.pack(fill=tk.X, padx=14, pady=2)
         tk.Label(f, text=label, bg=BG, fg=GREY, width=16, anchor="w",
                  font=("Consolas", 9)).pack(side=tk.LEFT)
         var = tk.StringVar(value=default)
@@ -258,13 +259,58 @@ def _stats_gui_process(queue) -> None:
     tk.Label(root, text="A/B EVAL", bg=BG, fg="#aaaaaa",
              font=("Consolas", 10)).pack(pady=(10, 4))
 
-    v_policy,    l_policy    = _row(root, "policy",          big=True)
-    v_ema,       l_ema       = _row(root, "EMA score")
-    v_threshold, _           = _row(root, "cutoff")
-    v_prob,      _           = _row(root, "interrupt prob")
-    v_picks,     _           = _row(root, "pickups",         big=True)
-    v_drops,     _           = _row(root, "drops",           big=True)
-    v_status,    l_status    = _row(root, "status")
+    v_policy,  l_policy  = _row(root, "policy",        big=True)
+    v_prob,    _         = _row(root, "interrupt prob")
+    v_picks,   _         = _row(root, "pickups",        big=True)
+    v_drops,   _         = _row(root, "drops",          big=True)
+    v_status,  l_status  = _row(root, "status")
+
+    # ── EMA progress bar ──────────────────────────────────────────────────────
+    # Shows EMA creeping toward threshold.  Left of the threshold marker = safe
+    # (green→yellow gradient); right of marker = danger zone (red).
+    bar_frame = tk.Frame(root, bg=BG)
+    bar_frame.pack(fill=tk.X, padx=14, pady=(6, 2))
+    tk.Label(bar_frame, text="EMA / cutoff", bg=BG, fg=GREY,
+             font=("Consolas", 9)).pack(anchor="w")
+
+    bar_canvas = tk.Canvas(bar_frame, width=BAR_W, height=18,
+                           bg="#222222", highlightthickness=0)
+    bar_canvas.pack(anchor="w")
+
+    # filled bar (EMA fill)
+    bar_fill   = bar_canvas.create_rectangle(0, 0, 0, 18, fill="#44ff44", width=0)
+    # threshold tick mark
+    bar_tick   = bar_canvas.create_line(0, 0, 0, 18, fill="#ffffff", width=2)
+    # numeric label inside bar
+    bar_label  = bar_canvas.create_text(BAR_W // 2, 9, text="0.000 / 0.60",
+                                        fill=FG, font=("Consolas", 8, "bold"))
+
+    _state = {"ema": 0.0, "thr": 0.6}  # last known values for smooth repaint
+
+    def _repaint_bar(ema, thr):
+        _state["ema"] = ema
+        _state["thr"] = thr
+        struggling = ema >= thr
+        # Fill width proportional to ema, capped at bar width
+        fill_w = min(int(ema * BAR_W), BAR_W)
+        # Color: green → yellow as EMA approaches threshold, red once past
+        if struggling:
+            color = "#ff2222"
+        else:
+            ratio = ema / thr if thr > 0 else 0.0
+            r = int(min(255, ratio * 2 * 255))
+            g = int(min(255, (1 - max(0, ratio * 2 - 1)) * 255))
+            color = f"#{r:02x}{g:02x}00"
+        bar_canvas.itemconfig(bar_fill, fill=color)
+        bar_canvas.coords(bar_fill, 0, 0, fill_w, 18)
+        # Threshold tick
+        tick_x = min(int(thr * BAR_W), BAR_W - 1)
+        bar_canvas.coords(bar_tick, tick_x, 0, tick_x, 18)
+        bar_canvas.itemconfig(bar_label,
+                              text=f"EMA {ema:.3f}  /  cutoff {thr:.2f}",
+                              fill="#111111" if fill_w > BAR_W // 2 else FG)
+
+    _repaint_bar(0.0, 0.6)
 
     def poll():
         try:
@@ -278,9 +324,7 @@ def _stats_gui_process(queue) -> None:
                 ema = data.get("ema", 0.0)
                 thr = data.get("threshold", 0.6)
                 struggling = ema >= thr
-                v_ema.set(f"{ema:.4f}")
-                l_ema.config(fg="#ff4444" if struggling else FG)
-                v_threshold.set(f"{thr:.2f}")
+                _repaint_bar(ema, thr)
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
                 v_picks.set(str(data.get("picks", 0)))
                 v_drops.set(str(data.get("drops", 0)))
