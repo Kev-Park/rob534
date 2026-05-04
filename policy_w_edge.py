@@ -197,6 +197,21 @@ def _go_home_with_robot(robot, steps: int = 30, step_delay: float = 0.1):
     print("  Home position reached.")
 
 
+def _append_episode_stats(csv_path: str, ep_idx: int, ep_state) -> None:
+    """Append one episode's stats row to a CSV (creates file + header on first write)."""
+    import csv
+    from dataclasses import asdict
+    path = Path(csv_path)
+    row = {"episode_index": ep_idx, **asdict(ep_state)}
+    write_header = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"  [stats] ep {ep_idx} → {csv_path}")
+
+
 def do_smol_vla_eval(
     policy_path,
     repo_id=None,
@@ -210,6 +225,7 @@ def do_smol_vla_eval(
     use_edge_removed=False,
     edge_ksize=3,
     edge_threshold=50,
+    stats_csv=None,
 ):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -280,15 +296,10 @@ def do_smol_vla_eval(
     )
     robot = SOFollower(robot_cfg)
 
-    # Inject synthetic camera2/camera3 observation features so dataset_features
-    # and make_policy see all three cameras the edge-removed policy was trained on.
-    # observation_features uses short keys ("camera1"), not the full dotted path.
-    if use_edge_removed:
-        obs_feats = robot.observation_features  # triggers @cached_property — returns mutable dict
-        cam1_feat = obs_feats.get("camera1")
-        if cam1_feat is not None:
-            obs_feats["camera2"] = cam1_feat
-            obs_feats["camera3"] = cam1_feat
+    # Note: camera2/camera3 are NOT added to robot.observation_features.
+    # Only camera1 appears in dataset_features → only camera1 is saved to disk and
+    # shown in rerun.  The policy receives camera2/camera3 via the preprocessor
+    # wrapper below (injected after build_dataset_frame, before policy.select_action).
 
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.pretrained_path = policy_path
@@ -346,6 +357,26 @@ def do_smol_vla_eval(
         },
     )
 
+    # Wrap preprocessor to inject camera2/camera3 from camera1 for policy inference.
+    # This runs inside predict_action (on a copy of observation_frame), so camera2/camera3
+    # never appear in the dict that record_loop saves to the dataset or sends to rerun.
+    # Uses a proxy class so all other methods (reset, etc.) are forwarded to the original.
+    if use_edge_removed:
+        class _CameraDupPreprocessor:
+            def __init__(self, orig):
+                self._orig = orig
+            def __call__(self, batch, **kwargs):
+                batch = dict(batch)
+                for k in list(batch.keys()):
+                    if "camera1" in str(k):
+                        batch[str(k).replace("camera1", "camera2")] = batch[k]
+                        batch[str(k).replace("camera1", "camera3")] = batch[k]
+                return self._orig(batch, **kwargs)
+            def __getattr__(self, name):
+                return getattr(self._orig, name)
+        preprocessor = _CameraDupPreprocessor(preprocessor)
+        print("  [edge-removed] preprocessor will duplicate camera1 -> camera2/camera3 at policy stage only")
+
     # Connect robot and camera once — stays open for all episodes.
     robot.connect()
 
@@ -367,15 +398,13 @@ def do_smol_vla_eval(
             # get_observation returns short keys ("camera1"), not full dotted paths
             frame = obs.get("camera1")
             if frame is not None:
-                processed = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
-                obs["camera1"] = processed
-                obs["camera2"] = processed
-                obs["camera3"] = processed
+                obs["camera1"] = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
+            # camera2/camera3 are NOT added here — injected by preprocessor wrapper instead
             _last_edge_obs[0] = obs
             return obs
 
         robot.get_observation = _get_obs_edge_removed
-        print(f"  [edge-removed] Sobel(ksize={edge_ksize}, thr={edge_threshold}) — camera1 frame replicated to camera2/camera3")
+        print(f"  [edge-removed] Sobel(ksize={edge_ksize}, thr={edge_threshold}) applied to camera1 only")
 
     # GPU warmup: run one dummy inference so the first real episode call is fast.
     # Without this, the first inference takes 3+ seconds (JIT/CUDA warmup) which
@@ -492,6 +521,8 @@ def do_smol_vla_eval(
                     dataset.save_episode()
                     saved += 1
                     is_redo = False
+                    if stats_csv and monitor:
+                        _append_episode_stats(stats_csv, dataset.num_episodes - 1, ep_state)
                 else:
                     print(f"  WARNING: Episode {saved + 1} collected no frames — skipping save.")
                     if dataset.episode_buffer is not None:
@@ -578,7 +609,7 @@ if __name__ == "__main__":
         )
         if smi.stdout.strip():
             print(f"GPU processes:  {smi.stdout.strip()}")
-        else:
+        else:wherew
             print("GPU processes:  none")
     except FileNotFoundError:
         print("GPU processes:  nvidia-smi not found")
@@ -593,8 +624,9 @@ if __name__ == "__main__":
     do_smol_vla_eval(
         policy_path=resolve_policy_path("jere-mybao/smolvla_phase_edge_removed_020k"),
         repo_id="jere-mybao/eval_smolvla_phase_edge_removed_020k",
-        num_episodes=10,
+        num_episodes=80,
         episode_time_s=45,
-        use_struggle_monitor=False,
+        use_struggle_monitor=True,
         use_edge_removed=True,
+        stats_csv=r"C:\Users\calle\PycharmProjects\RobotArm\rob534\eval_stats.csv",
     )

@@ -461,19 +461,24 @@ class EpisodeState:
                        "first_15s" (0–15 s), "next_15s" (15–30 s), "last" (>30 s),
                        or None (task not completed).
     """
-    target_reached:    bool        = False
-    clean_pickup:      bool | None = None
-    pickup_attempts:   int         = 0
-    clean_drop:        bool | None = None
-    drop_recorrected:  bool | None = None
-    max_probability:   float       = 0.0
-    avg_probability:   float       = 0.0
-    success_window:    str | None  = None
+    target_reached:         bool        = False
+    clean_pickup:           bool | None = None
+    pickup_attempts:        int         = 0
+    clean_drop:             bool | None = None
+    drop_recorrected:       bool | None = None
+    max_probability:        float       = 0.0
+    avg_probability:        float       = 0.0
+    success_window:         str | None  = None
+    time_to_first_pickup_s: float | None = None  # seconds from episode start to first grasp
+    time_to_complete_s:     float | None = None  # seconds from episode start to task accomplished
 
     def __str__(self) -> str:
+        pickup_t = f"{self.time_to_first_pickup_s:.1f}s" if self.time_to_first_pickup_s is not None else "None"
+        complete_t = f"{self.time_to_complete_s:.1f}s" if self.time_to_complete_s is not None else "None"
         return (
             f"target_reached={self.target_reached}"
             f"  pickup_attempts={self.pickup_attempts}  clean_pickup={self.clean_pickup}"
+            f"  time_to_pickup={pickup_t}  time_to_complete={complete_t}"
             f"  clean_drop={self.clean_drop}  drop_recorrected={self.drop_recorrected}"
             f"  max_p={self.max_probability:.3f}  avg_p={self.avg_probability:.3f}"
             f"  success_window={self.success_window}"
@@ -499,6 +504,7 @@ class EpisodeStateTracker:
         self._max_drops:        int          = 0
         self._first_success_t:  float | None = None
         self._drops_at_success: int          = 0   # drop count when task first accomplished
+        self._first_pickup_t:   float | None = None
 
     def update(self, result: dict, ep_elapsed: float) -> None:
         """Ingest one Gemini check result. ep_elapsed = seconds since episode start."""
@@ -509,6 +515,9 @@ class EpisodeStateTracker:
         drops = int(result.get("drop_attempts",   0))
         self._max_picks = max(self._max_picks, picks)
         self._max_drops = max(self._max_drops, drops)
+
+        if picks > 0 and self._first_pickup_t is None:
+            self._first_pickup_t = ep_elapsed
 
         if result.get("task_accomplished", False) and self._first_success_t is None:
             self._first_success_t  = ep_elapsed
@@ -540,14 +549,16 @@ class EpisodeStateTracker:
             success_window = "last"
 
         return EpisodeState(
-            target_reached   = self._first_success_t is not None,
-            clean_pickup     = clean_pickup,
-            pickup_attempts  = self._max_picks,
-            clean_drop       = clean_drop,
-            drop_recorrected = drop_recorrected,
-            max_probability  = round(max_p, 3),
-            avg_probability  = round(avg_p, 3),
-            success_window   = success_window,
+            target_reached          = self._first_success_t is not None,
+            clean_pickup            = clean_pickup,
+            pickup_attempts         = self._max_picks,
+            clean_drop              = clean_drop,
+            drop_recorrected        = drop_recorrected,
+            max_probability         = round(max_p, 3),
+            avg_probability         = round(avg_p, 3),
+            success_window          = success_window,
+            time_to_first_pickup_s  = round(self._first_pickup_t, 1) if self._first_pickup_t is not None else None,
+            time_to_complete_s      = round(self._first_success_t, 1) if self._first_success_t is not None else None,
         )
 
 
@@ -1010,7 +1021,12 @@ def test_on_dataset(
         attempt counts, labels).
     """
     print(f"Downloading dataset {dataset_id} ...")
-    repo_dir   = snapshot_download(repo_id=dataset_id, repo_type="dataset")
+    # Use local cache if available to avoid slow HF hub freshness checks.
+    try:
+        repo_dir = snapshot_download(repo_id=dataset_id, repo_type="dataset", local_files_only=True)
+        print(f"  Using local cache: {repo_dir}")
+    except Exception:
+        repo_dir = snapshot_download(repo_id=dataset_id, repo_type="dataset")
     data_files = sorted(glob.glob(f"{repo_dir}/data/**/*.parquet", recursive=True))
     meta_files = sorted(glob.glob(f"{repo_dir}/meta/episodes/**/*.parquet", recursive=True))
     df_data    = pd.concat([pd.read_parquet(f) for f in data_files], ignore_index=True)
@@ -1056,11 +1072,26 @@ def test_on_dataset(
     if max_episodes is not None:
         episodes = episodes[:max_episodes]
 
+    # Resume: skip episodes already written to the CSV.
+    already_done: set[int] = set()
+    if Path(out_csv).exists():
+        import csv as _csv
+        with open(out_csv, newline="") as _f:
+            for _row in _csv.DictReader(_f):
+                try:
+                    already_done.add(int(_row["episode_index"]))
+                except (KeyError, ValueError):
+                    pass
+        if already_done:
+            print(f"  Resuming: {len(already_done)} episodes already done, skipping them.")
+
     rows: list[dict]                    = []
     episode_checks: dict[int, list]     = {}
     video_paths: list[Path]             = []
 
     for ep_idx in episodes:
+        if ep_idx in already_done:
+            continue
         ep_df   = df_data[df_data["episode_index"] == ep_idx].reset_index(drop=True)
         ep_meta = df_meta[df_meta["episode_index"] == ep_idx]
 
@@ -1177,7 +1208,7 @@ def test_on_dataset(
         mean_prob       = float(np.mean(all_probs)) if all_probs else 0.0
         ep_state        = ep_tracker.get_state()
 
-        rows.append({
+        row = {
             "episode_index":         ep_idx,
             "n_checks":              n_checks,
             "mean_interrupt_prob":   round(mean_prob, 3),
@@ -1197,15 +1228,27 @@ def test_on_dataset(
             "max_probability":       ep_state.max_probability,
             "avg_probability":       ep_state.avg_probability,
             "success_window":        ep_state.success_window,
+            "time_to_first_pickup_s": ep_state.time_to_first_pickup_s,
+            "time_to_complete_s":    ep_state.time_to_complete_s,
             # Ground-truth labels
             "label_success":         lab.get("success", None),
             "label_pick":            lab.get("pick",    None),
             "label_drop":            lab.get("drop",    None),
-        })
+        }
+        rows.append(row)
+        # Write this episode's row immediately so progress survives a crash
+        import csv as _csv
+        _write_header = not Path(out_csv).exists()
+        with open(out_csv, "a", newline="") as _f:
+            _w = _csv.DictWriter(_f, fieldnames=list(row.keys()))
+            if _write_header:
+                _w.writeheader()
+            _w.writerow(row)
         print(
             f"  -> {'INTERRUPT' if final_interrupt else 'ok'}"
             f"  ema={scorer.struggle_score:.2f}  peak={scorer.peak_score:.2f}"
             f"  mean_p={mean_prob:.2f}"
+            f"  pickup_t={ep_state.time_to_first_pickup_s}s  complete_t={ep_state.time_to_complete_s}s"
             + (f"  label_success={lab.get('success')}" if lab else "")
         )
 
@@ -1230,8 +1273,7 @@ def test_on_dataset(
             video_paths.append(out_vid)
 
     results_df = pd.DataFrame(rows)
-    results_df.to_csv(out_csv, index=False)
-    print(f"\nSaved results to {out_csv}")
+    print(f"\nSaved results to {out_csv}  ({len(rows)} episodes)")
 
     if labels and "label_success" in results_df.columns:
         labeled = results_df.dropna(subset=["label_success"])
