@@ -95,7 +95,15 @@ TO UPLOAD AFTER YOU ARE DONE
 import shutil
 import subprocess
 import threading
+import time as _time
 from pathlib import Path
+
+# PIL sometimes raises "image file is truncated" when the background image-writer
+# threads haven't finished flushing a PNG before the video encoder reads it.
+# LOAD_TRUNCATED_IMAGES tells PIL to load whatever data is present instead of
+# crashing — the truncation is typically just the last few bytes of a frame.
+import PIL.ImageFile
+PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Helpers imported from better_code.py (must be in the same directory):
 #   _check_starvation     — warns if CPU/RAM is under pressure before opening camera
@@ -644,9 +652,15 @@ def do_ab_eval(
                 for i in range(num_episodes):
 
                     # ── PICK ACTIVE POLICY ────────────────────────────────────
-                    # current_label only changes when 'q' is pressed — it is NOT
-                    # automatically alternated. Same policy keeps running until
-                    # you manually switch.
+                    # Always start on Policy A (student) unless we are in the
+                    # one held-position episode that immediately follows a switch
+                    # (where the arm hasn't gone home and we want the other policy
+                    # to attempt the exact same scene for a direct comparison).
+                    held = events.get("_held_position", False)
+                    if not held:
+                        current_label = "A"
+                        label_ref[0]  = "A"
+
                     label   = current_label
                     dataset = dataset_a if label == "A" else dataset_b
                     policy  = policy_a  if label == "A" else policy_b
@@ -678,8 +692,7 @@ def do_ab_eval(
                     # _held_position is True and we skip go_home — the arm and
                     # the object stay exactly where they are so the other policy
                     # gets a fair attempt from the identical starting state.
-                    held = events.get("_held_position", False)
-                    if i == 0 or not held:
+                    if not held:
                         _go_home_with_robot(robot)
 
                     print(f"\n  Episode {i + 1}/{num_episodes} — "
@@ -712,6 +725,10 @@ def do_ab_eval(
                         print(f"  [EpisodeState] {ep_state}")
 
                     # ── SAVE EPISODE ──────────────────────────────────────────
+                    # Brief pause so background image-writer threads finish
+                    # flushing PNGs before the video encoder reads them.
+                    _time.sleep(2.5)
+
                     # Guard against empty buffer — can happen if 'q' was pressed
                     # during go_home before the record_loop captured any frames.
                     frames_collected = (

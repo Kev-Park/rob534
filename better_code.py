@@ -6,6 +6,9 @@ import time
 import webbrowser
 from pathlib import Path
 
+import PIL.ImageFile
+PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 import robot_control as rc
 from motor_commands import load_home, PORT, CAMERA_INDEX
 from struggle_monitor import LiveStruggleMonitor
