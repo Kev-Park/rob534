@@ -434,7 +434,8 @@ if __name__ == "__main__":
     parser.add_argument("--threshold",  type=float, default=0.6, help="Struggle monitor interrupt threshold (default 0.6)")
     parser.add_argument("--episodes",   type=int,   default=10,  help="Number of episodes (default 10)")
     parser.add_argument("--time",       type=float, default=45,  help="Max seconds per episode (default 45)")
-    parser.add_argument("--interval",   type=float, default=1.0, help="Seconds between Gemini assessments (default 1.0)")
+    parser.add_argument("--interval",       type=float, default=1.0,  help="Seconds between Gemini assessments (default 1.0)")
+    parser.add_argument("--switch-duration", type=float, default=15.0, help="Seconds policy B runs after auto-switch (default 15.0)")
     args = parser.parse_args()
 
     if args.simulate:
@@ -548,5 +549,6 @@ if __name__ == "__main__":
         auto_switch=True,
         struggle_threshold=args.threshold,
         struggle_check_interval=args.interval,
+        switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )

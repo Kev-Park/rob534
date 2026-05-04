@@ -508,6 +508,7 @@ def do_ab_eval(
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
     auto_switch=False,
+    switch_duration=15.0,
     stats_csv=None,
 ):
     """
@@ -538,12 +539,15 @@ def do_ab_eval(
         struggle_key_file:       Path to a file containing the Gemini API key.
         struggle_check_interval: Seconds between Gemini assessments.
         struggle_threshold:      EMA score above which is_struggling() triggers.
-        auto_switch:             If True (requires use_struggle_monitor=True), the policy
-                                 flips automatically when the monitor fires — no 'q' press
-                                 needed. The arm holds position (never goes home) so the
-                                 scene is identical for the other policy. Unlike 'q', only
-                                 the active policy's dataset receives the episode (no
-                                 buffer duplication to the other dataset).
+        auto_switch:             If True (requires use_struggle_monitor=True), policy B
+                                 takes over automatically when the monitor fires.
+        switch_duration:         How many seconds policy B runs after an auto-switch
+                                 (default 15 s). Arm holds position from where A got
+                                 stuck. After B's stint the episode ends; both A's and
+                                 B's frames are saved to their respective datasets.
+                                 Next episode always starts on A from home position.
+                                 Set to 0 to keep the old behaviour (episode ends
+                                 immediately when monitor fires, no B intervention).
         stats_csv:               Optional path to a CSV for per-episode stats.
                                  Appended to (not overwritten) so partial runs survive.
     """
@@ -851,6 +855,59 @@ def do_ab_eval(
                         watcher_stop.set()
                         ep_state = monitor.get_episode_state()
                         print(f"  [EpisodeState] {ep_state}")
+
+                    # ── POLICY-B INTERVENTION ─────────────────────────────────
+                    # When the monitor auto-triggered, run policy B for
+                    # switch_duration seconds from exactly where A got stuck
+                    # (arm holds position — no go_home). Frames go into B's
+                    # dataset buffer as a separate episode. After B's stint the
+                    # episode loop falls through to save both episodes and then
+                    # the NEXT episode always resets to A from home.
+                    if events.get("auto_switched") and auto_switch and switch_duration > 0:
+                        print(f"\n  [AutoSwitch] Policy B intervening for {switch_duration:.0f}s "
+                              f"from current position...")
+                        label_ref[0] = "B"
+                        events["exit_early"]    = False
+                        events["auto_switched"] = False
+                        if monitor:
+                            monitor.reset_signal()
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=30,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            policy=policy_b,
+                            preprocessor=pre_b,
+                            postprocessor=post_b,
+                            dataset=dataset_b,
+                            control_time_s=switch_duration,
+                            single_task=single_task,
+                            display_data=True,
+                        )
+                        label_ref[0] = "A"   # display resets for next episode
+                        if monitor:
+                            b_ep_state = monitor.get_episode_state()
+                            print(f"  [EpisodeState B] {b_ep_state}")
+                        # save B's frames (writer flush + save)
+                        _time.sleep(2.5)
+                        b_frames = (
+                            dataset_b.episode_buffer is not None
+                            and dataset_b.episode_buffer.get("size", 0) > 0
+                        )
+                        if b_frames:
+                            dataset_b.save_episode()
+                            if stats_csv and monitor:
+                                _append_episode_stats_ab(
+                                    stats_csv, dataset_b.num_episodes - 1, "B", b_ep_state)
+                        else:
+                            print("  WARNING: Policy B collected no frames — skipping save.")
+                            if dataset_b.episode_buffer is not None:
+                                dataset_b.clear_episode_buffer()
+                        # clear the auto_switched flag so the flip logic below
+                        # doesn't also trigger
+                        events["auto_switched"] = False
 
                     # ── SAVE EPISODE ──────────────────────────────────────────
                     # Brief pause so background image-writer threads finish
