@@ -466,7 +466,7 @@ def _live_display_loop(
     rendering independently so this thread is near-zero overhead.
     """
     while not stop_evt.is_set():
-        if stats_queue is not None:
+        if stats_queue is not None and not monitor.transfer_active:
             intr = monitor.get_interrupt()
             try:
                 stats_queue.put_nowait({
@@ -678,6 +678,40 @@ def do_ab_eval(
             use_videos=True,
         ),
     )
+
+    def _patch_vlm_cache():
+        """Patch SmolVLMWithExpertModel so the 500M base VLM is loaded only once.
+
+        Both policies use the same frozen SmolVLM2-500M backbone (train_expert_only=True
+        means only the expert head was fine-tuned). Without this patch, the 1 GB of base
+        weights are read from disk twice. With it, the second policy reuses the object
+        already in VRAM — saving ~15-20s of load time.
+        """
+        try:
+            from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+            _vlm_cache: dict = {}
+            _orig_init = SmolVLMWithExpertModel.__init__
+
+            def _cached_init(self, model_id="HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+                              load_vlm_weights=True, **kwargs):
+                if load_vlm_weights and model_id in _vlm_cache:
+                    print(f"  [VLM cache] reusing {model_id} (skip reload)")
+                    # init without weights (fast: random tensors only), then swap in cache
+                    _orig_init(self, model_id=model_id, load_vlm_weights=False, **kwargs)
+                    self.vlm = _vlm_cache[model_id]
+                else:
+                    _orig_init(self, model_id=model_id,
+                               load_vlm_weights=load_vlm_weights, **kwargs)
+                    if load_vlm_weights:
+                        _vlm_cache[model_id] = self.vlm
+                        print(f"  [VLM cache] cached {model_id} for reuse")
+
+            SmolVLMWithExpertModel.__init__ = _cached_init
+            print("  [VLM cache] patch applied — base VLM will load once only")
+        except Exception as exc:
+            print(f"  [VLM cache] patch skipped ({exc.__class__.__name__}: {exc})")
+
+    _patch_vlm_cache()
 
     def _load_cfg(policy_path):
         """Load policy config and fix any cluster-specific paths baked into it."""
@@ -956,6 +990,7 @@ def do_ab_eval(
                                     stats_queue.put_nowait({"reset": True, "delay_ms": 1500})
                                 except Exception:
                                     pass
+                            monitor.pause_for_transfer()
                             monitor.reset_signal()
                         _t0 = _time.perf_counter()
                         record_loop(
@@ -976,6 +1011,7 @@ def do_ab_eval(
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
                         label_ref[0] = "A"   # display resets for next episode
                         if monitor:
+                            monitor.resume_from_transfer()
                             b_ep_state = monitor.get_episode_state()
                             print(f"  [EpisodeState B] {b_ep_state}")
                         # save B's frames (writer flush + save)
