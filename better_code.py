@@ -443,13 +443,12 @@ if __name__ == "__main__":
     parser.add_argument("--threshold",       type=float, default=0.6,  help="Struggle monitor interrupt threshold (default 0.6)")
     parser.add_argument("--episodes",        type=int,   default=10,   help="Number of episodes (default 10)")
     parser.add_argument("--time",            type=float, default=45,   help="Max seconds per episode (default 45)")
-    parser.add_argument("--interval",        type=float, default=1.0,  help="Seconds between Gemini assessments (default 1.0)")
+    parser.add_argument("--interval",        type=float, default=0.5,  help="Seconds between metric checks (default 0.5)")
     parser.add_argument("--switch-duration", type=float, default=15.0, help="Seconds policy B runs after auto-switch (default 15.0)")
     parser.add_argument("--task",            type=str,   default="Grab the cube and drop it", help="Task instruction string sent to the policy")
     parser.add_argument("--model",           type=str,   default="gemini-2.5-flash", help="Gemini model for struggle monitor (default gemini-2.5-flash)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
-    parser.add_argument("--alpha",           type=float, default=0.4,  help="EMA smoothing factor (default 0.4, higher = more reactive)")
     args = parser.parse_args()
 
     if args.simulate:
@@ -560,13 +559,11 @@ if __name__ == "__main__":
         num_episodes=args.episodes,
         episode_time_s=90,
         use_struggle_monitor=True,
-        auto_switch=True,
+        auto_switch=False,
         struggle_threshold=0.2,
         struggle_check_interval=args.interval,
         struggle_model=args.model,
         struggle_n_frames=args.frames,
-        struggle_median=1,
-        struggle_ema_alpha=args.alpha,
         switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )

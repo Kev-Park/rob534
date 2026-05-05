@@ -253,7 +253,7 @@ def _stats_gui_process(queue) -> None:
     root = tk.Tk()
     root.title("A/B Eval — Live Stats")
     root.configure(bg=BG)
-    root.geometry("320x420")
+    root.geometry("400x620")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
@@ -274,7 +274,7 @@ def _stats_gui_process(queue) -> None:
 
     v_policy,  l_policy  = _row(root, "policy",        big=True)
     v_timer,   _         = _row(root, "episode time",   big=True)
-    v_metric,  _         = _row(root, "metric p")
+    v_metric,  _         = _row(root, "S score")
     v_prob,    _         = _row(root, "interrupt prob")
     v_status,  l_status  = _row(root, "status")
 
@@ -286,34 +286,105 @@ def _stats_gui_process(queue) -> None:
 
     vote_box_frame = tk.Frame(votes_frame, bg=BG)
     vote_box_frame.pack(anchor="w", pady=(2, 0))
-    # Pre-create 5 vote box labels (one per judge temperature)
+    # Pre-create 5 vote box labels (one per judge temperature) showing temp + confidence
     _vote_labels: list[tk.Label] = []
     for _ in range(5):
-        lbl = tk.Label(vote_box_frame, text="--", width=6,
+        lbl = tk.Label(vote_box_frame, text="--\n--", width=6,
                        bg="#333333", fg="#999999",
-                       font=("Consolas", 9, "bold"), relief="flat", padx=4, pady=2)
+                       font=("Consolas", 8, "bold"), relief="flat", padx=4, pady=2,
+                       justify="center")
         lbl.pack(side=tk.LEFT, padx=2)
         _vote_labels.append(lbl)
 
     def _update_vote_boxes(votes):
-        """Update the vote box labels from a list of judge vote dicts."""
+        """Update the vote box labels — shows temperature and confidence per judge."""
         for i, lbl in enumerate(_vote_labels):
             if i < len(votes):
                 v = votes[i]
                 struggling = v.get("struggling", False)
                 temp = v.get("temp", 0.0)
+                conf = v.get("confidence", 0.0)
                 lbl.config(
-                    text=f"{temp:.2f}",
+                    text=f"{temp:.2f}\n{conf:.2f}",
                     bg="#cc2222" if struggling else "#22aa22",
                     fg="#ffffff",
                 )
             else:
-                lbl.config(text="--", bg="#333333", fg="#999999")
+                lbl.config(text="--\n--", bg="#333333", fg="#999999")
 
-    # ── live EMA chart ────────────────────────────────────────────────────────
+    # ── per-channel raw values + ratio bars ──────────────────────────────────
+    _CH_NAMES  = ("E_RMS", "J_RMS", "neg_SPARC", "rho_HF", "sigma_bar")
+    _CH_LABELS = ("E_rms", "Jerk",  "SPARC",     "HF_pwr", "Stall")
+    _CH_BAR_MAX = 2.0   # ratio value that fills the bar to 100%
+
+    ch_frame = tk.Frame(root, bg=BG)
+    ch_frame.pack(fill=tk.X, padx=14, pady=(6, 2))
+    tk.Label(ch_frame, text="channels  raw · ratio/θ", bg=BG, fg=GREY,
+             font=("Consolas", 8)).pack(anchor="w")
+
+    # Each row: label | raw_val_lbl | bar | ratio_lbl
+    _ch_rows: list[tuple] = []   # (raw_var, bar_cv, bar_id, ratio_var)
+    _CH_BAR_W, _CH_BAR_H = 120, 10
+    for ch_label in _CH_LABELS:
+        row = tk.Frame(ch_frame, bg=BG)
+        row.pack(fill=tk.X, pady=1)
+        tk.Label(row, text=f"{ch_label:<9}", bg=BG, fg=GREY,
+                 font=("Consolas", 8), width=9, anchor="w").pack(side=tk.LEFT)
+        raw_var = tk.StringVar(value="--")
+        tk.Label(row, textvariable=raw_var, bg=BG, fg="#dddddd",
+                 font=("Consolas", 8), width=9, anchor="e").pack(side=tk.LEFT)
+        bar_cv = tk.Canvas(row, width=_CH_BAR_W, height=_CH_BAR_H,
+                           bg="#1a1a1a", highlightthickness=0)
+        bar_cv.pack(side=tk.LEFT, padx=(4, 4))
+        bar_cv.create_rectangle(0, 0, _CH_BAR_W, _CH_BAR_H,
+                                fill="#222222", outline="")
+        bar_id = bar_cv.create_rectangle(0, 0, 0, _CH_BAR_H, fill="#00e676", outline="")
+        ratio_var = tk.StringVar(value="")
+        tk.Label(row, textvariable=ratio_var, bg=BG, fg=GREY,
+                 font=("Consolas", 8), width=6, anchor="w").pack(side=tk.LEFT)
+        _ch_rows.append((raw_var, bar_cv, bar_id, ratio_var))
+
+    # S score row (prominent, just below channels)
+    s_frame = tk.Frame(root, bg=BG)
+    s_frame.pack(fill=tk.X, padx=14, pady=(4, 2))
+    tk.Label(s_frame, text="S = max(ratio)", bg=BG, fg=GREY,
+             font=("Consolas", 8)).pack(side=tk.LEFT)
+    v_s_score = tk.StringVar(value="--")
+    lbl_s_score = tk.Label(s_frame, textvariable=v_s_score, bg=BG, fg="#dddddd",
+                           font=("Consolas", 10, "bold"))
+    lbl_s_score.pack(side=tk.LEFT, padx=(8, 0))
+
+    def _update_channel_bars(ratios: dict, values: dict):
+        thr = _chart_state["thr"]
+        dominant = max(ratios, key=ratios.get) if ratios else None
+        for i, ch_name in enumerate(_CH_NAMES):
+            raw_var, bar_cv, bar_id, ratio_var = _ch_rows[i]
+            raw = values.get(ch_name, float("nan"))
+            ratio = ratios.get(ch_name, 0.0)
+            if ratio != ratio:  # NaN guard
+                ratio = 0.0
+            # raw value label — scientific notation keeps it compact
+            raw_var.set(f"{raw:.4g}" if raw == raw else "--")  # nan check
+            # ratio bar
+            filled = max(0, int(min(ratio, _CH_BAR_MAX) / _CH_BAR_MAX * _CH_BAR_W))
+            is_over = ratio >= thr
+            color = "#ff3333" if is_over else "#00e676"
+            bar_cv.coords(bar_id, 0, 0, filled, _CH_BAR_H)
+            bar_cv.itemconfig(bar_id, fill=color)
+            ratio_var.set(f"r={ratio:.2f}")
+        # S score line
+        if ratios:
+            s_val = max(ratios.values())
+            v_s_score.set(f"{s_val:.3f}  ({dominant})")
+            lbl_s_score.config(fg="#ff3333" if s_val >= thr else "#44ff44")
+        else:
+            v_s_score.set("--")
+            lbl_s_score.config(fg=GREY)
+
+    # ── live S score chart ────────────────────────────────────────────────────
     chart_frame = tk.Frame(root, bg=BG)
     chart_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
-    tk.Label(chart_frame, text="EMA score  (─ threshold)", bg=BG, fg=GREY,
+    tk.Label(chart_frame, text="S score  (─ threshold)", bg=BG, fg=GREY,
              font=("Consolas", 8)).pack(anchor="w")
 
     cv = tk.Canvas(chart_frame, width=CW, height=CH,
@@ -321,8 +392,8 @@ def _stats_gui_process(queue) -> None:
     cv.pack()
 
     def _ema_to_y(v):
-        """Map EMA value [0,1] → canvas y (top=1, bottom=0)."""
-        return PAD_TOP + int((1.0 - min(max(v, 0.0), 1.0)) * PLOT_H)
+        """Map S value [0, 2] → canvas y (top=2, bottom=0)."""
+        return PAD_TOP + int((1.0 - min(max(v, 0.0), 2.0) / 2.0) * PLOT_H)
 
     def _idx_to_x(i, n):
         """Map history index i (out of n points) → canvas x."""
@@ -330,8 +401,8 @@ def _stats_gui_process(queue) -> None:
             return PAD_LEFT + PLOT_W
         return PAD_LEFT + int(i * PLOT_W / (n - 1))
 
-    # Static y-axis labels (0.0, 0.5, 1.0)
-    for val, label_txt in [(0.0, "0.0"), (0.5, "0.5"), (1.0, "1.0")]:
+    # Static y-axis labels (0.0, 1.0, 2.0)
+    for val, label_txt in [(0.0, "0.0"), (1.0, "1.0"), (2.0, "2.0")]:
         y = _ema_to_y(val)
         cv.create_line(PAD_LEFT, y, PAD_LEFT + PLOT_W, y,
                        fill="#1e2530", width=1)          # faint grid line
@@ -429,6 +500,7 @@ def _stats_gui_process(queue) -> None:
         v_metric.set("0.000")
         v_prob.set("0.000")
         _update_vote_boxes([])
+        _update_channel_bars({}, {})
         v_status.set("--")
         l_status.config(fg=FG)
         _redraw_chart(0.0, _chart_state["thr"])
@@ -450,9 +522,13 @@ def _stats_gui_process(queue) -> None:
             _reset_display()
 
     def poll():
-        try:
-            while True:                         # drain all queued updates
+        import queue as _q
+        while True:
+            try:
                 data = queue.get_nowait()
+            except _q.Empty:
+                break
+            try:
                 if data.get("reset"):
                     _schedule_reset(data.get("delay_ms", 0))
                     continue
@@ -473,17 +549,18 @@ def _stats_gui_process(queue) -> None:
                 ep_s = data.get("ep_elapsed", 0.0)
                 mins, secs = divmod(int(ep_s), 60)
                 v_timer.set(f"{mins}:{secs:02d}")
-                v_metric.set(f"{data.get('metric_p', 0.0):.3f}")
+                v_metric.set(f"{data.get('ema', 0.0):.3f}")
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
                 _update_vote_boxes(data.get("votes", []))
+                _update_channel_bars(data.get("ratios", {}), data.get("values", {}))
                 if struggling:
                     v_status.set("STRUGGLING")
                     l_status.config(fg="#ff2222")
                 else:
                     v_status.set("ok")
                     l_status.config(fg="#44ff44")
-        except Exception:
-            pass
+            except Exception:
+                import traceback; traceback.print_exc()
         root.after(200, poll)
 
     root.after(200, poll)
@@ -505,18 +582,22 @@ def _live_display_loop(
     _last_print     = 0.0
 
     while not stop_evt.is_set():
-        now   = _time.monotonic()
-        intr  = monitor.get_interrupt()
-        ema   = monitor.get_struggle_score()
-        prob  = intr.get("interrupt_probability", 0.0)
-        votes = intr.get("votes", [])
-        label = label_ref[0]
-        status = "STRUGGLING" if ema >= interrupt_threshold else "ok"
+        now     = _time.monotonic()
+        intr    = monitor.get_interrupt()
+        ema     = monitor.get_struggle_score()
+        import math as _math
+        if _math.isnan(ema) or _math.isinf(ema):
+            ema = 0.0
+        ratios  = monitor.get_channel_ratios()
+        values  = monitor.get_channel_values()
+        prob    = intr.get("interrupt_probability", 0.0)
+        votes   = intr.get("votes", [])
+        label   = label_ref[0]
+        status  = "STRUGGLING" if ema >= interrupt_threshold else "ok"
 
         # Print a new line to terminal every _print_interval seconds
         if now - _last_print >= _print_interval:
             t = _time.strftime("%H:%M:%S")
-            metric_p = monitor.get_metric_p()
             bar_filled = int(ema / max(interrupt_threshold, 1e-6) * 20)
             bar = "#" * min(bar_filled, 20) + "-" * max(20 - bar_filled, 0)
             buf   = monitor.buf_len
@@ -526,51 +607,60 @@ def _live_display_loop(
                 f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
                 for v in votes
             ) if votes else "--"
+            ch_str = "  ".join(
+                f"{k}={values.get(k, float('nan')):.3g}(r={v:.2f})"
+                for k, v in ratios.items()
+            ) if ratios else "no data"
             print(
-                f"[{t}] policy={label}  [{bar}] ema={ema:.3f}/{interrupt_threshold:.2f}"
-                f"  metric_p={metric_p:.3f}  gemini_p={prob:.3f}  [{vote_str}]"
+                f"[{t}] policy={label}  [{bar}] S={ema:.3f}/{interrupt_threshold:.2f}"
+                f"  gemini_p={prob:.3f}  [{vote_str}]"
                 f"  buf={buf}fr  last_check={age_s}  {status}",
                 flush=True,
             )
+            print(f"         channels: {ch_str}", flush=True)
             _last_print = now
 
         # Push to GUI at its own rate
         if stats_queue is not None and not monitor.transfer_active and (now - _last_gui_push) >= _gui_interval:
             try:
                 stats_queue.put_nowait({
-                    "label":     label,
-                    "ema":       ema,
-                    "threshold": interrupt_threshold,
-                    "prob":      prob,
-                    "votes":     votes,
+                    "label":      label,
+                    "ema":        ema,
+                    "threshold":  interrupt_threshold,
+                    "prob":       prob,
+                    "votes":      votes,
                     "ep_elapsed": monitor.episode_elapsed,
-                    "metric_p":  monitor.get_metric_p(),
+                    "ratios":     ratios,
+                    "values":     values,
                 })
                 _last_gui_push = now
             except Exception:
-                pass   # queue full — GUI subprocess hasn't drained yet, skip
+                pass   # queue full — GUI thread hasn't drained yet, skip
 
         stop_evt.wait(0.1)
 
 
 class _MonitorFeedingRobot:
-    """Thin robot wrapper that feeds camera frames to the struggle monitor.
+    """Thin robot wrapper that feeds camera frames and joint state to the struggle monitor.
 
     Intercepts send_action() (called at ~30 Hz) to push the camera's
-    latest_frame — updated in lerobot's background capture thread — to the
-    monitor at action rate.  get_observation() also pushes frames but lerobot
-    only calls it at policy-inference rate (~0.3 Hz for SmolVLA), which is
-    too slow for the monitor's 12-frame minimum.
+    latest_frame and the most recent joint state to the monitor at action rate.
 
     All other attributes delegate transparently to the real robot.
     """
 
-    _CAM_NAME = "camera1"
-    _CAM_KEY  = "observation.images.camera1"
+    _CAM_NAME   = "camera1"
+    _CAM_KEY    = "observation.images.camera1"
+    # Joint keys in a fixed order — used to build state and action arrays
+    _JOINT_KEYS = (
+        "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
+        "wrist_flex.pos",   "wrist_roll.pos",    "gripper.pos",
+    )
 
     def __init__(self, robot, monitor):
-        object.__setattr__(self, "_robot",   robot)
-        object.__setattr__(self, "_monitor", monitor)
+        object.__setattr__(self, "_robot",       robot)
+        object.__setattr__(self, "_monitor",     monitor)
+        object.__setattr__(self, "_last_state",  None)
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_robot"), name)
@@ -594,9 +684,20 @@ class _MonitorFeedingRobot:
             pass
 
     def send_action(self, action):
-        """Delegate to real robot and push camera frame to monitor at ~30 Hz."""
-        robot = object.__getattribute__(self, "_robot")
+        """Delegate to real robot and push camera frame + joint obs to monitor at ~30 Hz."""
+        import numpy as np
+        robot   = object.__getattribute__(self, "_robot")
+        monitor = object.__getattribute__(self, "_monitor")
         self._push_latest_camera_frame()
+        last_state = object.__getattribute__(self, "_last_state")
+        if last_state is not None:
+            # Extract action array from dict (joint keys) or use directly if array
+            if isinstance(action, dict):
+                action_vals = [float(action[k]) for k in self._JOINT_KEYS if k in action]
+                action_arr  = np.array(action_vals, dtype=np.float32)
+            else:
+                action_arr = np.asarray(action, dtype=np.float32).flatten()
+            monitor.push_observation(action_arr, last_state)
         return robot.send_action(action)
 
     def get_observation(self):
@@ -604,6 +705,11 @@ class _MonitorFeedingRobot:
         robot   = object.__getattribute__(self, "_robot")
         monitor = object.__getattribute__(self, "_monitor")
         obs = robot.get_observation()
+        # Build state vector from individual joint-position keys
+        state_vals = [float(obs[k]) for k in self._JOINT_KEYS if k in obs]
+        if state_vals:
+            object.__setattr__(self, "_last_state",
+                               np.array(state_vals, dtype=np.float32))
         frame = obs.get(self._CAM_KEY)
         if frame is not None:
             # lerobot returns PIL Images; convert to BGR numpy for the monitor
@@ -632,8 +738,6 @@ def do_ab_eval(
     struggle_threshold=0.6,
     struggle_model="gemini-pro",
     struggle_n_frames=12,
-    struggle_median=3,
-    struggle_ema_alpha=0.4,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -898,8 +1002,6 @@ def do_ab_eval(
             check_interval=struggle_check_interval,
             interrupt_threshold=struggle_threshold,
             n_sample_frames=struggle_n_frames,
-            median_window=struggle_median,
-            ema_alpha=struggle_ema_alpha,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
@@ -912,9 +1014,9 @@ def do_ab_eval(
     display_stop = threading.Event()
     stats_queue  = None
     if monitor:
-        import multiprocessing
-        stats_queue  = multiprocessing.Queue(maxsize=4)
-        gui_proc     = multiprocessing.Process(
+        import queue as _q
+        stats_queue  = _q.Queue(maxsize=4)
+        gui_proc     = threading.Thread(
             target=_stats_gui_process, args=(stats_queue,), daemon=True,
         )
         gui_proc.start()
@@ -926,20 +1028,21 @@ def do_ab_eval(
         display_thread.start()
 
     def _struggle_watcher(stop_evt):
-        """Background thread: sets exit_early when monitor signals struggling.
+        """Background thread: triggers policy switch when monitor signals struggling.
 
-        With auto_switch=True, also sets auto_switched so the policy flips after
-        the episode — the arm goes home rather than holding position (unlike 'q').
+        Only acts when auto_switch=True. When auto_switch=False the monitor runs
+        passively — signals are visible in the GUI/terminal but episodes are not
+        affected.
         """
         while not stop_evt.is_set():
             if monitor and monitor.is_struggling():
                 if auto_switch:
                     print(f"\n  [StruggleMonitor] STRUGGLING — auto-switching policy after episode")
                     events["auto_switched"] = True
+                    events["exit_early"] = True
+                    break
                 else:
-                    print(f"\n  [StruggleMonitor] STRUGGLING — exiting episode early")
-                events["exit_early"] = True
-                break
+                    print(f"\n  [StruggleMonitor] STRUGGLING (passive — press q to switch)", flush=True)
             stop_evt.wait(timeout=0.25)
 
     try:
@@ -954,14 +1057,10 @@ def do_ab_eval(
                     _timings: dict[str, float] = {}
 
                     # ── PICK ACTIVE POLICY ────────────────────────────────────
-                    # Always start on Policy A (student) unless we are in the
-                    # one held-position episode that immediately follows a switch
-                    # (where the arm hasn't gone home and we want the other policy
-                    # to attempt the exact same scene for a direct comparison).
+                    # Every episode always starts on Policy A.
+                    current_label = "A"
+                    label_ref[0]  = "A"
                     held = events.get("_held_position", False)
-                    if not held:
-                        current_label = "A"
-                        label_ref[0]  = "A"
 
                     label   = current_label
                     dataset = dataset_a if label == "A" else dataset_b
@@ -978,6 +1077,7 @@ def do_ab_eval(
                     events["auto_switched"] = False
 
                     if monitor:
+                        monitor.resume_from_transfer()   # ensure never stuck paused
                         monitor.reset_signal()
                         if stats_queue is not None:
                             try:

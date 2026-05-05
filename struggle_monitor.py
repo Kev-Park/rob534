@@ -19,18 +19,13 @@ two supplementary text blocks derived from the robot's sensor stream:
                        and observation states.
 From the frames each judge returns ``struggling`` (bool), ``confidence`` (0–1),
 and ``reason``. The panel aggregates votes into ``interrupt_probability`` (vote
-fraction). The raw probability is post-processed
-before driving the interrupt decision:
+fraction). The interrupt decision is driven by the metric-based S score:
 
-  1. **Time ramp** — probability is linearly scaled from 0 at episode start to
-     its full value after ``TIME_RAMP_END_S`` seconds. This prevents the first
-     check (during the approach phase) from triggering a false positive.
-  2. **Probability cap** — the scaled value is capped at ``P_CAP_MIN`` early in
-     the episode, rising to ``P_CAP_MAX`` after ``CAP_RAMP_END_S`` seconds. High
-     probabilities are only allowed after the arm has had time to fail repeatedly.
-  3. **Median filter** — a 3-check rolling median kills isolated spike assessments.
-  4. **EMA** — an exponential moving average smooths the trend over time.
-     ``is_struggling()`` fires when the EMA score crosses ``interrupt_threshold``.
+  1. **S score** — computed from 5 motion channels (tracking error, jerk, SPARC,
+     HF power, stall/clip), each normalized by its P95 calibration threshold.
+     ``is_struggling()`` fires when S crosses ``interrupt_threshold``.
+  2. **Gemini** — called only when S >= threshold to supply a human-readable
+     reason; does not affect the interrupt decision.
 
 Quick start
 -----------
@@ -129,8 +124,11 @@ def compute_struggle_score(
     for i, ch_name in enumerate(M_CHANNELS):
         arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
         # Take the last value (most recent window)
-        val = float(arr[-1]) if arr.size > 0 else 0.0
-        channels[ch_name] = val
+        raw = float(arr[-1]) if arr.size > 0 else float("nan")
+        channels[ch_name] = raw
+        # NaN means the metric couldn't be computed (e.g. stationary arm →
+        # SPARC collapses to DC). Treat as 0 so it doesn't poison S.
+        val = 0.0 if (raw != raw) else raw   # nan != nan
 
         theta_i = thresholds.theta[i]
         if ch_name == "sigma_bar":
@@ -149,23 +147,9 @@ def compute_struggle_score(
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# Time ramp: scale interrupt probability linearly from 0 → 1 over the first N
-# seconds. Prevents early-episode checks from firing before the arm has had a
-# chance to attempt the task.
-TIME_RAMP_END_S: float = 30.0
-
-# Probability cap: Gemini's raw output is capped at P_CAP_MIN early in the
-# episode and rises to P_CAP_MAX by CAP_RAMP_END_S, so very high probabilities
-# are only possible after sustained struggle.
-P_CAP_MIN:      float = 0.75
-P_CAP_MAX:      float = 0.90
-CAP_RAMP_END_S: float = 30.0
-
 # Panel of judges: each judge uses the same prompt but a different temperature,
-# creating a conservative→liberal spectrum without requiring different prompts.
-# Low-temp judges only flag obvious failures; high-temp judges catch borderline
-# cases too. vote_count / n_judges feeds the EMA; set interrupt_threshold to
-# control how much sustained agreement is required.
+# creating a conservative→liberal spectrum. Low-temp judges only flag obvious
+# failures; high-temp judges catch borderline cases too.
 JUDGE_TEMPERATURES: tuple[float, ...] = (0.10, 0.25, 0.40, 0.55, 0.70)
 
 
@@ -404,8 +388,7 @@ def assess_interrupt_panel(
     Each judge uses the same prompt but a different temperature, creating a
     conservative→liberal spectrum. Low-temp judges only flag clear failures;
     high-temp judges catch borderline cases. interrupt_probability = vote_count
-    / n_judges feeds the caller's EMA; set interrupt_threshold there to control
-    how much sustained agreement is required.
+    / n_judges.
 
     Returns:
         {"interrupt_probability": float, "vote_count": int,
@@ -463,59 +446,24 @@ def assess_interrupt_panel(
 # ── Probability post-processing ───────────────────────────────────────────────
 
 class _EpisodeScorer:
-    """Applies time-ramp, probability cap, median filter, and EMA to raw Gemini scores.
+    """Tracks the S score across a batch episode.
 
-    Used by test_on_dataset to post-process per-check probabilities into a
-    smoothed EMA struggle score that drives the interrupt decision.
-
-    Pipeline per check:
-        p_raw  →  ×time_factor  →  clip(p_cap)  →  median(3)  →  EMA  →  struggle_score
+    struggle_score is set to the latest S value each check.
+    peak_score tracks the highest S seen in the episode.
     """
 
-    def __init__(self, ema_alpha: float) -> None:
-        self.ema_alpha    = ema_alpha
+    def __init__(self) -> None:
         self.struggle_score: float = 0.0
         self.peak_score:    float = 0.0
-        self._median_buf:   list[float] = []
 
     def reset(self) -> None:
         self.struggle_score = 0.0
         self.peak_score     = 0.0
-        self._median_buf.clear()
 
-    def update(
-        self,
-        p_raw: float,
-        ep_elapsed: float,
-    ) -> tuple[float, float, float]:
-        """Ingest one raw probability and return (p_filtered, time_factor, p_cap).
-
-        Side effects: updates self.struggle_score and self.peak_score.
-        """
-        # Time ramp
-        time_factor = min(1.0, ep_elapsed / TIME_RAMP_END_S)
-
-        # Rising probability cap
-        cap_ramp = min(1.0, max(0.0, ep_elapsed - TIME_RAMP_END_S)
-                       / max(1.0, CAP_RAMP_END_S - TIME_RAMP_END_S))
-        p_cap = P_CAP_MIN + (P_CAP_MAX - P_CAP_MIN) * cap_ramp
-
-        p_scaled = min(p_raw * time_factor, p_cap)
-
-        # Median filter (window = 3)
-        self._median_buf.append(p_scaled)
-        if len(self._median_buf) > 3:
-            self._median_buf.pop(0)
-        p_filtered = float(np.median(self._median_buf))
-
-        # EMA
-        self.struggle_score = (
-            self.ema_alpha * p_filtered
-            + (1 - self.ema_alpha) * self.struggle_score
-        )
-        self.peak_score = max(self.peak_score, self.struggle_score)
-
-        return p_filtered, round(time_factor, 2), round(p_cap, 2)
+    def update(self, S: float) -> None:
+        """Update with the latest S score."""
+        self.struggle_score = S
+        self.peak_score = max(self.peak_score, S)
 
 
 # ── Episode state tracking ────────────────────────────────────────────────────
@@ -646,10 +594,10 @@ class EpisodeStateTracker:
 class LiveStruggleMonitor:
     """Continuously watches a 20-second rolling buffer and polls the judge panel.
 
-    Every ``check_interval`` seconds a panel of ``len(JUDGE_TEMPERATURES)``
-    Gemini judges votes in parallel. The vote fraction (vote_count / n_judges)
-    feeds an EMA; ``is_struggling()`` fires when the EMA crosses
-    ``interrupt_threshold``.
+    Every ``check_interval`` seconds the S score is computed from buffered
+    actions/states. ``is_struggling()`` fires when S crosses
+    ``interrupt_threshold``. Gemini is called when S >= threshold to provide
+    a human-readable reason.
 
     Args:
         key_file:            Path to Gemini API key file (or None for env var).
@@ -658,8 +606,7 @@ class LiveStruggleMonitor:
         buffer_seconds:      Rolling buffer length — 20 s gives full episode context.
         n_sample_frames:     Frames subsampled per panel call.
         fps:                 Camera frame rate (used for buffer sizing).
-        interrupt_threshold: EMA score above which is_struggling() → True.
-        ema_alpha:           EMA smoothing factor (higher = more reactive).
+        interrupt_threshold: S score above which is_struggling() → True.
         gripper_col_idx:     Index into observation.state for gripper position.
         gripper_threshold:   Degrees above which the gripper is considered closed.
     """
@@ -673,9 +620,6 @@ class LiveStruggleMonitor:
         n_sample_frames: int = 12,
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
-        ema_alpha: float = 0.4,
-        struggle_ema_alpha: float = 0.4,
-        median_window: int = 3,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
@@ -684,9 +628,6 @@ class LiveStruggleMonitor:
         self._check_interval = check_interval
         self._n_sample       = int(n_sample_frames)
         self._threshold      = interrupt_threshold
-        self._ema_alpha      = ema_alpha
-        self._struggle_alpha = struggle_ema_alpha
-        self._median_window  = max(1, int(median_window))
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
 
@@ -699,8 +640,8 @@ class LiveStruggleMonitor:
         self._signal: dict          = _DEFAULT_SIGNAL.copy()
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
         self._struggle_score: float = 0.0
-        self._metric_p: float       = 0.0   # metric-based gating signal (alpha * S)
-        self._p_history: list       = []   # last 3 raw p values for median filter
+        self._channel_ratios: dict  = {}   # latest per-channel ratios from compute_struggle_score
+        self._channel_values: dict  = {}   # latest raw (un-normalised) channel values
         self._stop_event            = threading.Event()
         self._transfer_active       = threading.Event()
         self._transfer_epoch: int   = 0
@@ -729,7 +670,7 @@ class LiveStruggleMonitor:
             self._state_buf.append(np.asarray(state, dtype=np.float32))
 
     def is_struggling(self) -> bool:
-        """True when the EMA struggle_score exceeds the interrupt threshold."""
+        """True when the S score exceeds the interrupt threshold."""
         return self._struggle_score >= self._threshold
 
     def get_signal(self) -> dict:
@@ -741,12 +682,16 @@ class LiveStruggleMonitor:
         return self._interrupt.copy()
 
     def get_struggle_score(self) -> float:
-        """Return the current EMA struggle score (0–1)."""
+        """Return the current S score."""
         return self._struggle_score
 
-    def get_metric_p(self) -> float:
-        """Return the current metric-based gating signal (alpha * S)."""
-        return self._metric_p
+    def get_channel_ratios(self) -> dict:
+        """Return the latest per-channel ratios (channel name -> ratio)."""
+        return self._channel_ratios.copy()
+
+    def get_channel_values(self) -> dict:
+        """Return the latest raw (un-normalised) channel values."""
+        return self._channel_values.copy()
 
     @property
     def latest_frame(self):
@@ -772,8 +717,7 @@ class LiveStruggleMonitor:
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
-        self._metric_p       = 0.0
-        self._p_history      = []
+        self._channel_ratios = {}
         self._state_tracker.reset()
         self._episode_start  = time.time()
 
@@ -824,7 +768,7 @@ class LiveStruggleMonitor:
             f"[StruggleMonitor] started  model={self._model}"
             f"  interval={self._check_interval}s"
             f"  panel={len(JUDGE_TEMPERATURES)} judges"
-            f"  ema_threshold={self._threshold}"
+            f"  s_threshold={self._threshold}"
         )
 
     def stop(self) -> None:
@@ -884,62 +828,49 @@ class LiveStruggleMonitor:
                 )
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
-                # Gate: compute metric-based struggle score; only call Gemini
-                # when p = alpha * S >= threshold.
-                call_gemini = True
                 if actions is not None and states is not None:
                     score_result = compute_struggle_score(actions, states)
                     S = score_result["S"]
-                    self._metric_p = self._struggle_alpha * S
-                    if self._metric_p < self._threshold:
-                        call_gemini = False
-                        ep_elapsed = time.time() - self._episode_start
+                    self._struggle_score  = S
+                    self._channel_ratios  = score_result["ratios"]
+                    self._channel_values  = score_result["channels"]
+                    ep_elapsed = time.time() - self._episode_start
+
+                    if S < self._threshold:
                         print(
                             f"[StruggleMonitor] ok      t={ep_elapsed:.0f}s"
-                            f"  metric S={S:.2f}  p={self._metric_p:.2f} < {self._threshold}"
-                            f"  (skipping Gemini)"
+                            f"  S={S:.2f} < {self._threshold}  (skipping Gemini)"
                         )
-
-                if call_gemini:
-                    frames = self._subsample(buf, self._n_sample)
-                    epoch_snapshot = self._transfer_epoch
-                    try:
-                        result = assess_interrupt_panel(
-                            frames, self._client, self._model,
-                            actions=actions, states=states,
-                        )
-                        # Discard if a transfer started while the panel was running.
-                        if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
-                            self._interrupt = result
-                            self._last_check_t = time.time()
-                            p_raw = float(result["interrupt_probability"])
-                            # Rolling median over last N calls — kills isolated spikes.
-                            self._p_history.append(p_raw)
-                            if len(self._p_history) > self._median_window:
-                                self._p_history.pop(0)
-                            p = sorted(self._p_history)[len(self._p_history) // 2]
-                            self._struggle_score = (
-                                self._ema_alpha * p
-                                + (1 - self._ema_alpha) * self._struggle_score
+                    else:
+                        frames = self._subsample(buf, self._n_sample)
+                        epoch_snapshot = self._transfer_epoch
+                        try:
+                            result = assess_interrupt_panel(
+                                frames, self._client, self._model,
+                                actions=actions, states=states,
                             )
-                            ep_elapsed = time.time() - self._episode_start
-                            self._state_tracker.update(result, ep_elapsed)
-                            status = "INTERRUPT" if self.is_struggling() else "ok     "
-                            vote_str = " ".join(
-                                f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
-                                for v in result.get("votes", [])
-                            )
-                            print(
-                                f"[StruggleMonitor] {status}"
-                                f"  t={ep_elapsed:.0f}s"
-                                f"  metric S={S:.2f}  p={self._metric_p:.2f}"
-                                f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
-                                f"  [{vote_str}]"
-                                f"  gemini_p={p_raw:.2f}→med={p:.2f}  ema={self._struggle_score:.2f}"
-                                f"  | {result['reason']}"
-                            )
-                    except Exception as e:
-                        print(f"[StruggleMonitor] Gemini error: {e}")
+                            # Discard if a transfer started while the panel was running.
+                            if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
+                                self._interrupt = result
+                                self._last_check_t = time.time()
+                                self._state_tracker.update(result, ep_elapsed)
+                                status = "INTERRUPT" if self.is_struggling() else "ok     "
+                                vote_str = " ".join(
+                                    f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                                    for v in result.get("votes", [])
+                                )
+                                p_raw = float(result["interrupt_probability"])
+                                print(
+                                    f"[StruggleMonitor] {status}"
+                                    f"  t={ep_elapsed:.0f}s"
+                                    f"  S={S:.2f}"
+                                    f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
+                                    f"  [{vote_str}]"
+                                    f"  gemini_p={p_raw:.2f}"
+                                    f"  | {result['reason']}"
+                                )
+                        except Exception as e:
+                            print(f"[StruggleMonitor] Gemini error: {e}")
 
             elapsed = time.time() - start
             self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
@@ -958,12 +889,10 @@ class LiveStruggleMonitor:
 def _draw_interrupt_hud(
     frame: np.ndarray,
     interrupt_prob: float,
-    ema_score: float,
+    s_score: float,
     votes: list[dict],
     reason: str,
     threshold: float = 0.5,
-    time_factor: float = 1.0,
-    p_cap: float = 0.90,
     ep_elapsed: float = 0.0,
 ) -> np.ndarray:
     """Draw a probability gauge overlay at the top-left of a BGR frame."""
@@ -981,26 +910,23 @@ def _draw_interrupt_hud(
     r = int(min(255, interrupt_prob * 2 * 255))
     g = int(min(255, (1 - interrupt_prob) * 2 * 255))
     prob_color = (0, g, r)
-    ema_color  = (0, 200, 80) if ema_score < threshold else (0, 60, 220)
+    s_color    = (0, 200, 80) if s_score < threshold else (0, 60, 220)
 
-    # Probability bar
+    # S score bar
     bar_x0  = x0 + 4
     bar_y0  = y0 + ph - 14
-    bar_len = int((pw - 8) * interrupt_prob)
+    bar_len = int((pw - 8) * min(s_score, 2.0) / 2.0)
     cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + pw - 8, bar_y0 + 8), (50, 50, 50), -1)
     if bar_len > 0:
-        cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + bar_len, bar_y0 + 8), prob_color, -1)
-    thr_x = bar_x0 + int((pw - 8) * threshold)
+        cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + bar_len, bar_y0 + 8), s_color, -1)
+    thr_x = bar_x0 + int((pw - 8) * threshold / 2.0)
     cv2.line(frame, (thr_x, bar_y0 - 2), (thr_x, bar_y0 + 10), (255, 255, 255), 1)
 
-    # Row 1: probability + EMA
+    # Row 1: Gemini vote probability + S score
     cv2.putText(frame, f"p={interrupt_prob:.2f}",
                 (x0 + 6, y0 + 20), font, 0.52, prob_color, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"ema={ema_score:.2f}",
-                (x0 + 90, y0 + 20), font, 0.45, ema_color, 1, cv2.LINE_AA)
-    if time_factor < 1.0 or p_cap < P_CAP_MAX:
-        cv2.putText(frame, f"×{time_factor:.0%} ≤{p_cap:.2f}",
-                    (x0 + 155, y0 + 20), font, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"S={s_score:.2f}",
+                (x0 + 90, y0 + 20), font, 0.45, s_color, 1, cv2.LINE_AA)
 
     # Row 2: per-judge vote boxes (green = ok, red = struggling) + timer
     box_x = x0 + 6
@@ -1105,7 +1031,7 @@ def _render_episode_interrupt_video(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 100, 255), 1, cv2.LINE_AA)
 
     frame_idx         = 0
-    cur_check         = {"p": 0.0, "ema": 0.0, "votes": [], "reason": ""}
+    cur_check         = {"p": 0.0, "S": 0.0, "votes": [], "reason": ""}
     cur_check_key     = -1
     check_start_frame = 0
     type_out_frames   = int(fps * 1.5)
@@ -1136,12 +1062,10 @@ def _render_episode_interrupt_video(
         frame = _draw_interrupt_hud(
             frame,
             interrupt_prob=cur_check["p"],
-            ema_score=cur_check["ema"],
+            s_score=cur_check["S"],
             votes=cur_check.get("votes", []),
             reason=live_reason,
             threshold=interrupt_threshold,
-            time_factor=cur_check.get("time_factor", 1.0),
-            p_cap=cur_check.get("p_cap", P_CAP_MAX),
             ep_elapsed=frame_idx / fps,
         )
         cv2.putText(frame, f"Episode {ep_idx}", (W - 130, 22),
@@ -1180,7 +1104,6 @@ def test_on_dataset(
     n_sample_frames: int = 12,
     fps: float = 30.0,
     interrupt_threshold: float = 0.5,
-    ema_alpha: float = 0.4,
     gripper_col_idx: int = 5,
     gripper_threshold: float = 20.0,
     results_csv: str | None = None,
@@ -1191,9 +1114,9 @@ def test_on_dataset(
     """Run the interrupt monitor over every episode in a LeRobot dataset.
 
     Simulates the live pipeline in batch: steps through each episode's frames,
-    calls assess_interrupt at ``check_interval_s`` intervals, applies
-    time-ramp / cap / median / EMA post-processing, and compares final
-    interrupt decisions to ground-truth labels.
+    calls assess_interrupt at ``check_interval_s`` intervals, computes the S
+    score from buffered actions/states, and compares interrupt decisions to
+    ground-truth labels.
 
     Optionally renders 3-panel annotated videos per episode to ``video_dir``.
 
@@ -1301,14 +1224,14 @@ def test_on_dataset(
         action_buf: deque = deque(maxlen=buffer_size)
         state_buf:  deque = deque(maxlen=buffer_size)
 
-        scorer              = _EpisodeScorer(ema_alpha)
+        scorer              = _EpisodeScorer()
         ep_tracker          = EpisodeStateTracker()
         n_checks            = 0
         first_interrupt_ts: float | None = None
         last_result         = _DEFAULT_INTERRUPT.copy()
         frame_counter       = 0
         next_check_at       = int(10.0 * actual_fps)   # first check after 10 s
-        all_probs: list[float] = []
+        all_s: list[float] = []
         episode_checks[ep_idx] = []
 
         print(f"\n[ep {ep_idx:02d}] {len(ep_df)} frames  from={from_ts:.1f}s")
@@ -1335,6 +1258,17 @@ def test_on_dataset(
                 cur_ts     = from_ts + frame_counter / actual_fps
                 ep_elapsed = frame_counter / actual_fps
 
+                # Compute S score from buffered sensor data
+                S = 0.0
+                if actions_snap is not None and states_snap is not None:
+                    S = compute_struggle_score(actions_snap, states_snap)["S"]
+                scorer.update(S)
+                all_s.append(S)
+
+                flagged = scorer.struggle_score >= interrupt_threshold
+                if flagged and first_interrupt_ts is None:
+                    first_interrupt_ts = cur_ts
+
                 try:
                     result = assess_interrupt_panel(
                         frames_snap, client, model,
@@ -1344,25 +1278,16 @@ def test_on_dataset(
                     n_checks   += 1
                     ep_tracker.update(result, ep_elapsed)
 
-                    p_raw                          = float(result["interrupt_probability"])
-                    p_filtered, time_factor, p_cap = scorer.update(p_raw, ep_elapsed)
-                    all_probs.append(p_filtered)
-
-                    flagged = scorer.struggle_score >= interrupt_threshold
-                    if flagged and first_interrupt_ts is None:
-                        first_interrupt_ts = cur_ts
+                    p_raw = float(result["interrupt_probability"])
 
                     episode_checks[ep_idx].append({
-                        "frame_idx":   frame_counter,
-                        "ts":          cur_ts,
-                        "ep_elapsed":  ep_elapsed,
-                        "p":           p_filtered,
-                        "p_raw":       p_raw,
-                        "time_factor": time_factor,
-                        "p_cap":       p_cap,
-                        "ema":         scorer.struggle_score,
-                        "votes":       result.get("votes", []),
-                        "reason":      result["reason"],
+                        "frame_idx":  frame_counter,
+                        "ts":         cur_ts,
+                        "ep_elapsed": ep_elapsed,
+                        "p":          p_raw,
+                        "S":          S,
+                        "votes":      result.get("votes", []),
+                        "reason":     result["reason"],
                     })
 
                     vote_str = " ".join(
@@ -1372,10 +1297,10 @@ def test_on_dataset(
                     status = "INTERRUPT" if flagged else "ok     "
                     print(
                         f"  t={cur_ts:.1f}s  {status}"
+                        f"  S={S:.2f}"
                         f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
                         f"  [{vote_str}]"
-                        f"  p={p_filtered:.2f}(raw={p_raw:.2f}×{time_factor:.2f} cap={p_cap:.2f})"
-                        f"  ema={scorer.struggle_score:.2f}"
+                        f"  gemini_p={p_raw:.2f}"
                         f"  | {result['reason']}"
                     )
                 except Exception as e:
@@ -1385,15 +1310,15 @@ def test_on_dataset(
 
         lab             = labels.get(ep_idx, {})
         final_interrupt = scorer.struggle_score >= interrupt_threshold
-        mean_prob       = float(np.mean(all_probs)) if all_probs else 0.0
+        mean_s          = float(np.mean(all_s)) if all_s else 0.0
         ep_state        = ep_tracker.get_state()
 
         row = {
             "episode_index":         ep_idx,
             "n_checks":              n_checks,
-            "mean_interrupt_prob":   round(mean_prob, 3),
-            "peak_ema_score":        round(scorer.peak_score, 3),
-            "final_ema_score":       round(scorer.struggle_score, 3),
+            "mean_s_score":          round(mean_s, 3),
+            "peak_s_score":          round(scorer.peak_score, 3),
+            "final_s_score":         round(scorer.struggle_score, 3),
             "final_interrupt":       final_interrupt,
             "first_interrupt_ts":    first_interrupt_ts,
             "final_vote_count":      last_result.get("vote_count", 0),
@@ -1425,8 +1350,8 @@ def test_on_dataset(
             _w.writerow(row)
         print(
             f"  -> {'INTERRUPT' if final_interrupt else 'ok'}"
-            f"  ema={scorer.struggle_score:.2f}  peak={scorer.peak_score:.2f}"
-            f"  mean_p={mean_prob:.2f}"
+            f"  S={scorer.struggle_score:.2f}  peak={scorer.peak_score:.2f}"
+            f"  mean_S={mean_s:.2f}"
             f"  pickup_t={ep_state.time_to_first_pickup_s}s  complete_t={ep_state.time_to_complete_s}s"
             + (f"  label_success={lab.get('success')}" if lab else "")
         )
@@ -1461,16 +1386,16 @@ def test_on_dataset(
 
         sensitivity  = (failed["final_interrupt"]  == True).mean()  if len(failed)  else float("nan")
         specificity  = (success["final_interrupt"] == False).mean() if len(success) else float("nan")
-        mean_p_fail  = failed["mean_interrupt_prob"].mean()          if len(failed)  else float("nan")
-        mean_p_succ  = success["mean_interrupt_prob"].mean()         if len(success) else float("nan")
+        mean_p_fail  = failed["mean_s_score"].mean()                 if len(failed)  else float("nan")
+        mean_p_succ  = success["mean_s_score"].mean()                if len(success) else float("nan")
 
         print(f"\n=== Summary ===")
         print(f"  Episodes evaluated  : {len(results_df)}")
         print(f"  Labeled episodes    : {len(labeled)}  (failed={len(failed)}, success={len(success)})")
         print(f"  Sensitivity         : {sensitivity:.2%}")
         print(f"  Specificity         : {specificity:.2%}")
-        print(f"  Mean p (failed)     : {mean_p_fail:.3f}")
-        print(f"  Mean p (success)    : {mean_p_succ:.3f}")
+        print(f"  Mean S (failed)     : {mean_p_fail:.3f}")
+        print(f"  Mean S (success)    : {mean_p_succ:.3f}")
         print(f"  Separation          : {mean_p_fail - mean_p_succ:.3f}  (higher = better)")
 
     if video_paths:
@@ -1496,9 +1421,8 @@ if __name__ == "__main__":
     p_live.add_argument("--key-file",  default=r"C:/Users/calle/Desktop/gem.txt")
     p_live.add_argument("--model",     default="gemini-2.5-flash")
     p_live.add_argument("--interval",  type=float, default=2.0)
-    p_live.add_argument("--threshold", type=float, default=0.5)
-    p_live.add_argument("--alpha",     type=float, default=0.4,
-                        help="Struggle score scaling: p = alpha * S; Gemini called when p >= threshold")
+    p_live.add_argument("--threshold", type=float, default=0.5,
+                        help="S score threshold above which is_struggling() fires")
 
     p_batch = sub.add_parser("batch", help="Run batch test on a full LeRobot dataset.")
     p_batch.add_argument("--dataset",      default="nc8304/eval_smolvla-phase-split_combined")
@@ -1506,8 +1430,7 @@ if __name__ == "__main__":
     p_batch.add_argument("--model",        default="gemini-2.5-flash")
     p_batch.add_argument("--interval",     type=float, default=2.0)
     p_batch.add_argument("--window",       type=float, default=20.0,  help="Rolling buffer seconds")
-    p_batch.add_argument("--threshold",    type=float, default=0.5,   help="EMA interrupt threshold")
-    p_batch.add_argument("--ema-alpha",    type=float, default=0.25,  help="EMA smoothing factor")
+    p_batch.add_argument("--threshold",    type=float, default=0.5,   help="S score interrupt threshold")
     p_batch.add_argument("--results-csv",  default=None)
     p_batch.add_argument("--out-csv",      default="struggle_test_results.csv")
     p_batch.add_argument("--video-dir",    default=None,
@@ -1528,7 +1451,6 @@ if __name__ == "__main__":
             model=args.model,
             check_interval=args.interval,
             interrupt_threshold=args.threshold,
-            struggle_ema_alpha=args.alpha,
         )
         monitor.start()
 
@@ -1554,7 +1476,6 @@ if __name__ == "__main__":
             check_interval_s=args.interval,
             window_seconds=args.window,
             interrupt_threshold=args.threshold,
-            ema_alpha=args.ema_alpha,
             results_csv=args.results_csv,
             out_csv=args.out_csv,
             video_dir=args.video_dir,
