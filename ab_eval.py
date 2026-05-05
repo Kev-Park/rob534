@@ -109,6 +109,7 @@ PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 #   _check_starvation     — warns if CPU/RAM is under pressure before opening camera
 #   _go_home_with_robot   — smoothly moves arm to the position saved in home_pos.json
 #   _rerun_is_running     — checks port 9090 so we don't restart rerun if already open
+#   _wait_for_port        — blocks until a TCP port is accepting connections
 #   _wait_and_open_viewer — waits for rerun server to start then opens the browser tab
 #   repo_id_from_policy   — derives "SkywalkerLi/eval_<model>" from a policy path
 from better_code import (
@@ -116,6 +117,7 @@ from better_code import (
     _go_home_with_robot,
     _rerun_is_running,
     _wait_and_open_viewer,
+    _wait_for_port,
     repo_id_from_policy,
 )
 
@@ -271,10 +273,41 @@ def _stats_gui_process(queue) -> None:
              font=("Consolas", 10)).pack(pady=(10, 2))
 
     v_policy,  l_policy  = _row(root, "policy",        big=True)
+    v_timer,   _         = _row(root, "episode time",   big=True)
     v_prob,    _         = _row(root, "interrupt prob")
-    v_picks,   _         = _row(root, "pickups",        big=True)
-    v_drops,   _         = _row(root, "drops",          big=True)
     v_status,  l_status  = _row(root, "status")
+
+    # ── per-judge vote boxes ───────────────────────────────────────────────────
+    votes_frame = tk.Frame(root, bg=BG)
+    votes_frame.pack(fill=tk.X, padx=14, pady=(6, 2))
+    tk.Label(votes_frame, text="judge votes", bg=BG, fg=GREY,
+             font=("Consolas", 8)).pack(anchor="w")
+
+    vote_box_frame = tk.Frame(votes_frame, bg=BG)
+    vote_box_frame.pack(anchor="w", pady=(2, 0))
+    # Pre-create 5 vote box labels (one per judge temperature)
+    _vote_labels: list[tk.Label] = []
+    for _ in range(5):
+        lbl = tk.Label(vote_box_frame, text="--", width=6,
+                       bg="#333333", fg="#999999",
+                       font=("Consolas", 9, "bold"), relief="flat", padx=4, pady=2)
+        lbl.pack(side=tk.LEFT, padx=2)
+        _vote_labels.append(lbl)
+
+    def _update_vote_boxes(votes):
+        """Update the vote box labels from a list of judge vote dicts."""
+        for i, lbl in enumerate(_vote_labels):
+            if i < len(votes):
+                v = votes[i]
+                struggling = v.get("struggling", False)
+                temp = v.get("temp", 0.0)
+                lbl.config(
+                    text=f"{temp:.2f}",
+                    bg="#cc2222" if struggling else "#22aa22",
+                    fg="#ffffff",
+                )
+            else:
+                lbl.config(text="--", bg="#333333", fg="#999999")
 
     # ── live EMA chart ────────────────────────────────────────────────────────
     chart_frame = tk.Frame(root, bg=BG)
@@ -391,9 +424,9 @@ def _stats_gui_process(queue) -> None:
         switch_markers.clear()
         _chart_state["counter"] = 0
         cv.delete("ema_plot")
+        v_timer.set("0:00")
         v_prob.set("0.000")
-        v_picks.set("0")
-        v_drops.set("0")
+        _update_vote_boxes([])
         v_status.set("--")
         l_status.config(fg=FG)
         _redraw_chart(0.0, _chart_state["thr"])
@@ -435,9 +468,11 @@ def _stats_gui_process(queue) -> None:
                 thr = data.get("threshold", 0.6)
                 struggling = ema >= thr
                 _redraw_chart(ema, thr)
+                ep_s = data.get("ep_elapsed", 0.0)
+                mins, secs = divmod(int(ep_s), 60)
+                v_timer.set(f"{mins}:{secs:02d}")
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
-                v_picks.set(str(data.get("picks", 0)))
-                v_drops.set(str(data.get("drops", 0)))
+                _update_vote_boxes(data.get("votes", []))
                 if struggling:
                     v_status.set("STRUGGLING")
                     l_status.config(fg="#ff2222")
@@ -471,8 +506,7 @@ def _live_display_loop(
         intr  = monitor.get_interrupt()
         ema   = monitor.get_struggle_score()
         prob  = intr.get("interrupt_probability", 0.0)
-        picks = intr.get("pickup_attempts", 0)
-        drops = intr.get("drop_attempts", 0)
+        votes = intr.get("votes", [])
         label = label_ref[0]
         status = "STRUGGLING" if ema >= interrupt_threshold else "ok"
 
@@ -484,9 +518,13 @@ def _live_display_loop(
             buf   = monitor.buf_len
             age   = monitor.secs_since_last_check
             age_s = f"{age:.0f}s ago" if age > 0 else "no check yet"
+            vote_str = " ".join(
+                f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                for v in votes
+            ) if votes else "--"
             print(
                 f"[{t}] policy={label}  [{bar}] ema={ema:.3f}/{interrupt_threshold:.2f}"
-                f"  p={prob:.3f}  picks={picks}  drops={drops}"
+                f"  p={prob:.3f}  [{vote_str}]"
                 f"  buf={buf}fr  last_check={age_s}  {status}",
                 flush=True,
             )
@@ -500,8 +538,8 @@ def _live_display_loop(
                     "ema":       ema,
                     "threshold": interrupt_threshold,
                     "prob":      prob,
-                    "picks":     picks,
-                    "drops":     drops,
+                    "votes":     votes,
+                    "ep_elapsed": monitor.episode_elapsed,
                 })
                 _last_gui_push = now
             except Exception:
@@ -590,6 +628,7 @@ def do_ab_eval(
     struggle_model="gemini-2.5-flash",
     struggle_n_frames=12,
     struggle_median=3,
+    struggle_ema_alpha=0.4,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -668,10 +707,13 @@ def do_ab_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
-        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+    # Wait for the gRPC port (9876) to be ready before connecting the SDK,
+    # otherwise rr.spawn() starts a competing native viewer that steals the port.
+    _wait_for_port(9876)
+    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
-    init_rerun(session_name="recording")
+    init_rerun(session_name="recording", ip="127.0.0.1", port=9876)
 
     # ── ONE-TIME HARDWARE + PIPELINE SETUP ───────────────────────────────────
     # Everything here is created once and reused across all episodes for both
@@ -852,6 +894,7 @@ def do_ab_eval(
             interrupt_threshold=struggle_threshold,
             n_sample_frames=struggle_n_frames,
             median_window=struggle_median,
+            ema_alpha=struggle_ema_alpha,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
@@ -1015,8 +1058,7 @@ def do_ab_eval(
                                         "ema":       monitor.get_struggle_score(),
                                         "threshold": struggle_threshold,
                                         "prob":      _peak_intr.get("interrupt_probability", 0.0),
-                                        "picks":     _peak_intr.get("pickup_attempts", 0),
-                                        "drops":     _peak_intr.get("drop_attempts", 0),
+                                        "votes":     _peak_intr.get("votes", []),
                                     })
                                     stats_queue.put_nowait({"switch_marker": True})
                                     # Delayed reset — keep the marker visible for 1.5 s

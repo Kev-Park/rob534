@@ -83,14 +83,20 @@ def _rerun_is_running(port=9090):
         return False
 
 
-def _wait_and_open_viewer(port=9090, timeout=30):
+def _wait_for_port(port, timeout=30):
+    """Block until *port* is accepting connections (or *timeout* seconds pass)."""
     start = time.time()
     while time.time() - start < timeout:
         try:
             with socket.create_connection(("localhost", port), timeout=1):
-                break
+                return True
         except OSError:
             time.sleep(0.5)
+    return False
+
+
+def _wait_and_open_viewer(port=9090, timeout=30):
+    _wait_for_port(port, timeout)
     webbrowser.open(f"http://localhost:{port}/?url=rerun%2Bhttp%3A%2F%2Flocalhost%3A9876%2Fproxy")
 
 REPO_IDS = {
@@ -227,10 +233,13 @@ def do_smol_vla_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
+    # Wait for the gRPC port (9876) to be ready before connecting the SDK,
+    # otherwise rr.spawn() starts a competing native viewer that steals the port.
+    _wait_for_port(9876)
     threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
-    init_rerun(session_name="recording")
+    init_rerun(session_name="recording", ip="127.0.0.1", port=9876)
 
     # ── One-time setup ────────────────────────────────────────────────────────
     # Everything below is created ONCE and reused across all episodes.
@@ -440,6 +449,7 @@ if __name__ == "__main__":
     parser.add_argument("--model",           type=str,   default="gemini-2.5-flash", help="Gemini model for struggle monitor (default gemini-2.5-flash)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
+    parser.add_argument("--alpha",           type=float, default=0.4,  help="EMA smoothing factor (default 0.4, higher = more reactive)")
     args = parser.parse_args()
 
     if args.simulate:
@@ -555,7 +565,8 @@ if __name__ == "__main__":
         struggle_check_interval=args.interval,
         struggle_model=args.model,
         struggle_n_frames=args.frames,
-        struggle_median=args.median,
+        struggle_median=1,
+        struggle_ema_alpha=args.alpha,
         switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )

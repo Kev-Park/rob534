@@ -17,13 +17,9 @@ two supplementary text blocks derived from the robot's sensor stream:
 
   * Stability block  — rolling jerk and Lyapunov trend computed from joint actions
                        and observation states.
-  * Gripper block    — raw gripper-angle trace with numerically counted open/close
-                       events. This is supplementary: Gemini is asked to count
-                       pickup/drop attempts from the *video*; the sensor trace
-                       lets it cross-check its visual read.
-
-From the frames Gemini estimates ``interrupt_probability`` (0–1) and counts
-``pickup_attempts`` / ``drop_attempts``. The raw probability is post-processed
+From the frames each judge returns ``struggling`` (bool), ``confidence`` (0–1),
+and ``reason``. The panel aggregates votes into ``interrupt_probability`` (vote
+fraction). The raw probability is post-processed
 before driving the interrupt decision:
 
   1. **Time ramp** — probability is linearly scaled from 0 at episode start to
@@ -46,8 +42,8 @@ Quick start
     monitor.push_observation(action, state)     # 1-D float32 arrays
 
     if monitor.is_struggling():
-        detail = monitor.get_interrupt()        # {interrupt_probability, pickup_attempts,
-        switch_policy()                         #  drop_attempts, reason}
+        detail = monitor.get_interrupt()        # {interrupt_probability, vote_count, votes, reason}
+        switch_policy()
 
     monitor.stop()
 
@@ -90,7 +86,7 @@ TIME_RAMP_END_S: float = 30.0
 # are only possible after sustained struggle.
 P_CAP_MIN:      float = 0.75
 P_CAP_MAX:      float = 0.90
-CAP_RAMP_END_S: float = 60.0
+CAP_RAMP_END_S: float = 30.0
 
 # Panel of judges: each judge uses the same prompt but a different temperature,
 # creating a conservative→liberal spectrum without requiring different prompts.
@@ -107,7 +103,6 @@ STRUGGLE_PROMPT = """You are watching a sequence of frames from a live robot arm
 doing a pick-and-place task. The frames are evenly sampled from the last few seconds.
 {stability_block}
 Is the robot currently struggling?
-
 Struggling signals:
   - Gripper missed the block or has an unstable / tilted grip
   - Block is rotating or slipping inside the gripper
@@ -126,61 +121,8 @@ Not struggling:
 Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
 """
 
-# Primary prompt — used by assess_interrupt (probabilistic, 20-second window).
-INTERRUPT_PROMPT = """You are a supervisor watching 20 seconds of a robot arm doing a
-pick-and-place task. The frames span the FULL 20-second window so you can see the
-outcome of any attempt — use this to count successes and failures.
-
-IMPORTANT CONTEXT: The robot arm ALWAYS starts each episode with an EMPTY, OPEN gripper
-in a neutral rest position above the workspace. The very first frames will show the arm
-approaching the block with an open gripper — this is normal and NOT a drop event.
-Only count gripper opens as drop_attempts AFTER the gripper has first successfully closed
-on the block.
-
-{stability_block}
-{gripper_block}
-
-Your job is to rate the PROBABILITY that a human operator should interrupt and switch
-to a different policy RIGHT NOW (at the END of this 20-second window).
-
-Count carefully from the frames:
-  pickup_attempts : how many times did the gripper close on or near the block?
-                    (1 = one clean grasp, 2+ = retries or failed attempts)
-  drop_attempts   : how many times did the gripper open to release the block AFTER
-                    a successful pickup? (1 = one clean drop, 2+ = retries)
-                    Do NOT count the initial open-gripper approach as a drop attempt.
-  task_accomplished: has the robot fully completed the task? For pick-and-place this
-                    means the block is now at rest in/at the target (e.g. through a
-                    hole, inside a container, on a mark). Set true ONLY when the block
-                    is visibly at rest in the target at the END of this window.
-
-NORMAL BEHAVIOUR — do NOT penalise these:
-  - A single re-grasp: the gripper briefly re-closes to improve grip (pickup_attempts = 2 is fine)
-  - A single drop correction or push motion to seat the block (drop_attempts = 2 is fine)
-  These are expected and represent good adaptive behaviour, not failure.
-
-Decision criteria — vote YES (struggling=true) if ANY of these apply:
-  - 4+ pickup attempts or 3+ drop attempts (repeated failures, not single re-grasp)
-  - Block dropped and not recovered by the end of this window
-  - Sustained diverging Lyapunov trend with no visible sign of recovery
-  - Arm looping, oscillating, or making no net progress for more than ~10 s
-  - Policy has clearly lost the task (block lost, arm stuck erratically)
-
-Vote NO (struggling=false) if:
-  - Execution is clean or has at most one minor self-corrected hiccup
-  - At most 2 pickup attempts and 2 drop attempts, with visible recovery
-  - Converging Lyapunov trend, or task already accomplished
-
-Return ONLY JSON with fields:
-  struggling (bool) — true if you recommend interrupting now,
-  pickup_attempts (int),
-  drop_attempts (int),
-  task_accomplished (bool),
-  reason (one sentence justifying your vote).
-"""
-
-# JSON schemas for structured Gemini output.
-RESPONSE_SCHEMA = {       # legacy — matches STRUGGLE_PROMPT
+# JSON schema for structured Gemini output — matches STRUGGLE_PROMPT.
+JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
         "struggling": {"type": "boolean"},
@@ -190,27 +132,12 @@ RESPONSE_SCHEMA = {       # legacy — matches STRUGGLE_PROMPT
     "required": ["struggling", "confidence", "reason"],
 }
 
-JUDGE_SCHEMA = {          # matches INTERRUPT_PROMPT (per-judge binary output)
-    "type": "object",
-    "properties": {
-        "struggling":        {"type": "boolean"},
-        "pickup_attempts":   {"type": "integer"},
-        "drop_attempts":     {"type": "integer"},
-        "task_accomplished": {"type": "boolean"},
-        "reason":            {"type": "string"},
-    },
-    "required": ["struggling", "pickup_attempts", "drop_attempts",
-                 "task_accomplished", "reason"],
-}
-
 # Sentinel values returned before the first Gemini call completes.
 _DEFAULT_SIGNAL = {"struggling": False, "confidence": 0.0, "reason": "no assessment yet"}
 _DEFAULT_INTERRUPT = {
     "interrupt_probability": 0.0,
     "vote_count": 0,
-    "pickup_attempts": 0,
-    "drop_attempts": 0,
-    "task_accomplished": False,
+    "votes": [],        # per-judge: [{"temp": float, "struggling": bool, "confidence": float, "reason": str}, ...]
     "reason": "no assessment yet",
 }
 
@@ -336,7 +263,7 @@ def assess_frames(
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
+            response_schema=JUDGE_SCHEMA,
             temperature=0.2,
         ),
     )
@@ -350,41 +277,32 @@ def assess_interrupt(
     jpeg_quality: int = 75,
     actions: np.ndarray | None = None,
     states:  np.ndarray | None = None,
-    gripper: np.ndarray | None = None,
-    gripper_threshold: float = 20.0,
     temperature: float = 0.40,
 ) -> dict:
-    """Single-judge binary interrupt assessment over a 20-second window.
+    """Single-judge binary struggle assessment.
 
-    Sends frames to Gemini together with supplementary stability and gripper
-    sensor blocks. Returns a binary struggling decision for one judge.
+    Sends frames to Gemini using STRUGGLE_PROMPT at the given temperature.
 
     Args:
         temperature: Controls judge conservatism. Low (0.1) = fires only on
             clear failures. High (0.7) = fires on borderline cases too.
 
     Returns:
-        {"struggling": bool, "pickup_attempts": int, "drop_attempts": int,
-         "task_accomplished": bool, "reason": str}
+        {"struggling": bool, "confidence": float, "reason": str}
     """
     if not frames:
-        return _DEFAULT_INTERRUPT.copy()
+        return _DEFAULT_SIGNAL.copy()
 
     stability_block = ""
     if actions is not None and states is not None and len(actions) >= 5:
         stability_block = _build_stability_block(actions, states)
 
-    gripper_block = ""
-    if gripper is not None and len(gripper) >= 2:
-        gripper_block = _build_gripper_block(gripper, gripper_threshold)
-
     parts = _encode_frames(frames, jpeg_quality)
     if not parts:
-        return _DEFAULT_INTERRUPT.copy()
+        return _DEFAULT_SIGNAL.copy()
 
-    parts.append(types.Part.from_text(text=INTERRUPT_PROMPT.format(
+    parts.append(types.Part.from_text(text=STRUGGLE_PROMPT.format(
         stability_block=stability_block,
-        gripper_block=gripper_block,
     )))
 
     response = client.models.generate_content(
@@ -406,8 +324,6 @@ def assess_interrupt_panel(
     jpeg_quality: int = 75,
     actions: np.ndarray | None = None,
     states:  np.ndarray | None = None,
-    gripper: np.ndarray | None = None,
-    gripper_threshold: float = 20.0,
     temperatures: tuple[float, ...] = JUDGE_TEMPERATURES,
 ) -> dict:
     """Panel of N judges voting in parallel on whether to interrupt.
@@ -420,8 +336,8 @@ def assess_interrupt_panel(
 
     Returns:
         {"interrupt_probability": float, "vote_count": int,
-         "pickup_attempts": int, "drop_attempts": int,
-         "task_accomplished": bool, "reason": str}
+         "votes": [{"temp": float, "struggling": bool, "confidence": float, "reason": str}, ...],
+         "reason": str}
     """
     if not frames:
         return _DEFAULT_INTERRUPT.copy()
@@ -430,7 +346,7 @@ def assess_interrupt_panel(
         future_to_temp = {
             pool.submit(
                 assess_interrupt, frames, client, model,
-                jpeg_quality, actions, states, gripper, gripper_threshold, temp,
+                jpeg_quality, actions, states, temp,
             ): temp
             for temp in temperatures
         }
@@ -446,23 +362,27 @@ def assess_interrupt_panel(
         return _DEFAULT_INTERRUPT.copy()
 
     ordered.sort(key=lambda x: x[0])   # stable order by temperature
-    votes = [v for _, v in ordered]
-    n = len(votes)
+    n = len(ordered)
 
-    vote_count = sum(1 for v in votes if v.get("struggling", False))
+    vote_count = sum(1 for _, v in ordered if v.get("struggling", False))
     interrupt_probability = vote_count / n
 
-    pickup_attempts  = max(v.get("pickup_attempts", 0) for v in votes)
-    drop_attempts    = max(v.get("drop_attempts",   0) for v in votes)
-    task_accomplished = sum(1 for v in votes if v.get("task_accomplished", False)) > n / 2
-    reason = votes[n // 2].get("reason", "")   # median judge's reasoning
+    # Per-judge vote details (sorted by temperature)
+    votes = [
+        {
+            "temp": temp,
+            "struggling": v.get("struggling", False),
+            "confidence": v.get("confidence", 0.0),
+            "reason": v.get("reason", ""),
+        }
+        for temp, v in ordered
+    ]
+    reason = votes[n // 2]["reason"]   # median judge's reasoning
 
     return {
         "interrupt_probability": round(interrupt_probability, 4),
         "vote_count":            vote_count,
-        "pickup_attempts":       pickup_attempts,
-        "drop_attempts":         drop_attempts,
-        "task_accomplished":     task_accomplished,
+        "votes":                 votes,
         "reason":                reason,
     }
 
@@ -809,6 +729,11 @@ class LiveStruggleMonitor:
             return 0.0
         return time.time() - self._last_check_t
 
+    @property
+    def episode_elapsed(self) -> float:
+        """Seconds elapsed since the current episode started."""
+        return time.time() - self._episode_start
+
     def start(self) -> None:
         """Start the background Gemini monitoring thread."""
         self._stop_event.clear()
@@ -876,10 +801,6 @@ class LiveStruggleMonitor:
                     np.stack(list(self._state_buf))
                     if len(self._state_buf) >= 5 else None
                 )
-                gripper = (
-                    states[:, self._gripper_col]
-                    if states is not None else None
-                )
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
                 frames = self._subsample(buf, self._n_sample)
@@ -888,8 +809,6 @@ class LiveStruggleMonitor:
                     result = assess_interrupt_panel(
                         frames, self._client, self._model,
                         actions=actions, states=states,
-                        gripper=gripper,
-                        gripper_threshold=self._gripper_thresh,
                     )
                     # Discard if a transfer started while the panel was running.
                     if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
@@ -910,14 +829,16 @@ class LiveStruggleMonitor:
                         ep_elapsed = time.time() - self._episode_start
                         self._state_tracker.update(result, ep_elapsed)
                         status = "INTERRUPT" if self.is_struggling() else "ok     "
+                        vote_str = " ".join(
+                            f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                            for v in result.get("votes", [])
+                        )
                         print(
                             f"[StruggleMonitor] {status}"
                             f"  t={ep_elapsed:.0f}s"
                             f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
+                            f"  [{vote_str}]"
                             f"  p={p_raw:.2f}→med={p:.2f}  ema={self._struggle_score:.2f}"
-                            f"  picks={result['pickup_attempts']}"
-                            f"  drops={result['drop_attempts']}"
-                            f"  done={result.get('task_accomplished', False)}"
                             f"  | {result['reason']}"
                         )
                 except Exception as e:
@@ -941,8 +862,7 @@ def _draw_interrupt_hud(
     frame: np.ndarray,
     interrupt_prob: float,
     ema_score: float,
-    pickup_attempts: int,
-    drop_attempts: int,
+    votes: list[dict],
     reason: str,
     threshold: float = 0.5,
     time_factor: float = 1.0,
@@ -985,11 +905,24 @@ def _draw_interrupt_hud(
         cv2.putText(frame, f"×{time_factor:.0%} ≤{p_cap:.2f}",
                     (x0 + 155, y0 + 20), font, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
 
-    # Row 2: attempt counts + episode timer
+    # Row 2: per-judge vote boxes (green = ok, red = struggling) + timer
+    box_x = x0 + 6
+    box_y = y0 + 30
+    box_w, box_h = 30, 16
+    gap = 4
+    for v in votes:
+        color = (0, 0, 220) if v["struggling"] else (0, 180, 0)
+        cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), color, -1)
+        cv2.putText(frame, f"{v['temp']:.2f}",
+                    (box_x + 2, box_y + box_h - 3), font, 0.30,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        box_x += box_w + gap
+
     mins, secs = divmod(int(ep_elapsed), 60)
     t_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
-    cv2.putText(frame, f"picks {pickup_attempts}   drops {drop_attempts}   t={t_str}",
-                (x0 + 6, y0 + 38), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"t={t_str}",
+                (box_x + 4, box_y + box_h - 3), font, 0.42,
+                (180, 180, 180), 1, cv2.LINE_AA)
 
     # Rows 3-5: reason text with word-wrap
     reason_short = (reason[:110] + "..") if len(reason) > 112 else reason
@@ -1059,22 +992,15 @@ def _render_episode_interrupt_video(
         fps, (W, strip_height + H + strip_height),
     )
 
-    # Make pick/drop counts monotonically increasing
-    max_picks = max_drops = 0
-    mono_checks = []
-    for ck in sorted(checks, key=lambda c: c["frame_idx"]):
-        max_picks = max(max_picks, ck["picks"])
-        max_drops = max(max_drops, ck["drops"])
-        mono_checks.append({**ck, "picks": max_picks, "drops": max_drops})
-
-    check_by_frame      = {ck["frame_idx"]: ck for ck in mono_checks}
+    sorted_checks = sorted(checks, key=lambda c: c["frame_idx"])
+    check_by_frame = {ck["frame_idx"]: ck for ck in sorted_checks}
     sorted_check_frames = sorted(check_by_frame.keys())
 
     # Mark peak-probability frame on the stability strip
     T_jerk    = len(jerk)
     T_gripper = len(gripper)
-    if mono_checks:
-        peak_ck = max(mono_checks, key=lambda c: c["p"])
+    if sorted_checks:
+        peak_ck = max(sorted_checks, key=lambda c: c["p"])
         peak_cx = int(np.clip(peak_ck["frame_idx"] / max(T_jerk, 1) * W, 0, W - 1))
         cv2.line(top_strip, (peak_cx, 0), (peak_cx, strip_height), (0, 100, 255), 2)
         cv2.putText(top_strip, f"peak p={peak_ck['p']:.2f}",
@@ -1082,7 +1008,7 @@ def _render_episode_interrupt_video(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 100, 255), 1, cv2.LINE_AA)
 
     frame_idx         = 0
-    cur_check         = {"p": 0.0, "ema": 0.0, "picks": 0, "drops": 0, "reason": ""}
+    cur_check         = {"p": 0.0, "ema": 0.0, "votes": [], "reason": ""}
     cur_check_key     = -1
     check_start_frame = 0
     type_out_frames   = int(fps * 1.5)
@@ -1114,8 +1040,7 @@ def _render_episode_interrupt_video(
             frame,
             interrupt_prob=cur_check["p"],
             ema_score=cur_check["ema"],
-            pickup_attempts=cur_check["picks"],
-            drop_attempts=cur_check["drops"],
+            votes=cur_check.get("votes", []),
             reason=live_reason,
             threshold=interrupt_threshold,
             time_factor=cur_check.get("time_factor", 1.0),
@@ -1310,10 +1235,6 @@ def test_on_dataset(
                 frames_snap  = LiveStruggleMonitor._subsample(list(frame_buf), n_sample_frames)
                 actions_snap = np.stack(list(action_buf)) if len(action_buf) >= 5 else None
                 states_snap  = np.stack(list(state_buf))  if len(state_buf)  >= 5 else None
-                gripper_snap = (
-                    states_snap[:, gripper_col_idx]
-                    if states_snap is not None else None
-                )
                 cur_ts     = from_ts + frame_counter / actual_fps
                 ep_elapsed = frame_counter / actual_fps
 
@@ -1321,7 +1242,6 @@ def test_on_dataset(
                     result = assess_interrupt_panel(
                         frames_snap, client, model,
                         actions=actions_snap, states=states_snap,
-                        gripper=gripper_snap, gripper_threshold=gripper_threshold,
                     )
                     last_result = result
                     n_checks   += 1
@@ -1344,19 +1264,21 @@ def test_on_dataset(
                         "time_factor": time_factor,
                         "p_cap":       p_cap,
                         "ema":         scorer.struggle_score,
-                        "picks":       result["pickup_attempts"],
-                        "drops":       result["drop_attempts"],
+                        "votes":       result.get("votes", []),
                         "reason":      result["reason"],
                     })
 
+                    vote_str = " ".join(
+                        f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                        for v in result.get("votes", [])
+                    )
                     status = "INTERRUPT" if flagged else "ok     "
                     print(
                         f"  t={cur_ts:.1f}s  {status}"
                         f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
+                        f"  [{vote_str}]"
                         f"  p={p_filtered:.2f}(raw={p_raw:.2f}×{time_factor:.2f} cap={p_cap:.2f})"
                         f"  ema={scorer.struggle_score:.2f}"
-                        f"  picks={result['pickup_attempts']}"
-                        f"  drops={result['drop_attempts']}"
                         f"  | {result['reason']}"
                     )
                 except Exception as e:
@@ -1377,8 +1299,7 @@ def test_on_dataset(
             "final_ema_score":       round(scorer.struggle_score, 3),
             "final_interrupt":       final_interrupt,
             "first_interrupt_ts":    first_interrupt_ts,
-            "final_pickup_attempts": last_result["pickup_attempts"],
-            "final_drop_attempts":   last_result["drop_attempts"],
+            "final_vote_count":      last_result.get("vote_count", 0),
             "final_reason":          last_result["reason"],
             # Episode state (for cross-iteration policy comparison)
             "target_reached":        ep_state.target_reached,
