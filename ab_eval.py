@@ -274,6 +274,7 @@ def _stats_gui_process(queue) -> None:
 
     v_policy,  l_policy  = _row(root, "policy",        big=True)
     v_timer,   _         = _row(root, "episode time",   big=True)
+    v_metric,  _         = _row(root, "metric p")
     v_prob,    _         = _row(root, "interrupt prob")
     v_status,  l_status  = _row(root, "status")
 
@@ -425,6 +426,7 @@ def _stats_gui_process(queue) -> None:
         _chart_state["counter"] = 0
         cv.delete("ema_plot")
         v_timer.set("0:00")
+        v_metric.set("0.000")
         v_prob.set("0.000")
         _update_vote_boxes([])
         v_status.set("--")
@@ -471,6 +473,7 @@ def _stats_gui_process(queue) -> None:
                 ep_s = data.get("ep_elapsed", 0.0)
                 mins, secs = divmod(int(ep_s), 60)
                 v_timer.set(f"{mins}:{secs:02d}")
+                v_metric.set(f"{data.get('metric_p', 0.0):.3f}")
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
                 _update_vote_boxes(data.get("votes", []))
                 if struggling:
@@ -513,6 +516,7 @@ def _live_display_loop(
         # Print a new line to terminal every _print_interval seconds
         if now - _last_print >= _print_interval:
             t = _time.strftime("%H:%M:%S")
+            metric_p = monitor.get_metric_p()
             bar_filled = int(ema / max(interrupt_threshold, 1e-6) * 20)
             bar = "#" * min(bar_filled, 20) + "-" * max(20 - bar_filled, 0)
             buf   = monitor.buf_len
@@ -524,7 +528,7 @@ def _live_display_loop(
             ) if votes else "--"
             print(
                 f"[{t}] policy={label}  [{bar}] ema={ema:.3f}/{interrupt_threshold:.2f}"
-                f"  p={prob:.3f}  [{vote_str}]"
+                f"  metric_p={metric_p:.3f}  gemini_p={prob:.3f}  [{vote_str}]"
                 f"  buf={buf}fr  last_check={age_s}  {status}",
                 flush=True,
             )
@@ -540,6 +544,7 @@ def _live_display_loop(
                     "prob":      prob,
                     "votes":     votes,
                     "ep_elapsed": monitor.episode_elapsed,
+                    "metric_p":  monitor.get_metric_p(),
                 })
                 _last_gui_push = now
             except Exception:
@@ -625,7 +630,7 @@ def do_ab_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
-    struggle_model="gemini-2.5-flash",
+    struggle_model="gemini-pro",
     struggle_n_frames=12,
     struggle_median=3,
     struggle_ema_alpha=0.4,

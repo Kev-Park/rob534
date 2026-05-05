@@ -72,6 +72,79 @@ from google.genai import types
 from huggingface_hub import snapshot_download
 
 from analyze_rollout import load_api_key
+from stability_monitor.calibration import Thresholds, _per_channel_batch, M_CHANNELS
+from stability_monitor.config import Config
+
+
+# ── Module-level cache for pooled thresholds ─────────────────────────────────
+_POOLED_THRESHOLDS: Thresholds | None = None
+
+
+def _get_pooled_thresholds() -> Thresholds:
+    """Load and cache the pooled calibration thresholds."""
+    global _POOLED_THRESHOLDS
+    if _POOLED_THRESHOLDS is None:
+        path = Path(__file__).parent / "thresholds" / "pooled.json"
+        _POOLED_THRESHOLDS = Thresholds.load(path)
+    return _POOLED_THRESHOLDS
+
+
+def compute_struggle_score(
+    actions: np.ndarray,
+    states: np.ndarray,
+    thresholds: Thresholds | None = None,
+    cfg: Config | None = None,
+) -> dict:
+    """Compute a struggle score from buffered actions/states using calibrated metrics.
+
+    Uses the same 5-channel m-vector as the calibration pipeline (tracking error,
+    jerk, SPARC, HF power, stall/clip) and normalizes each by its P95 threshold.
+    S > 1.0 means the worst channel exceeds the 95th percentile of normal operation.
+
+    Parameters
+    ----------
+    actions : (T, 6) float array of recent commanded actions.
+    states  : (T, 6) float array of recent observation states.
+    thresholds : Calibrated Thresholds; defaults to pooled.json.
+    cfg : Monitor Config; defaults to Config().
+
+    Returns
+    -------
+    dict with keys:
+        channels : dict mapping channel name -> raw metric value (last time step)
+        ratios   : dict mapping channel name -> normalized ratio (m / theta)
+        S        : float, max ratio across channels (worst-case normalized metric)
+    """
+    if thresholds is None:
+        thresholds = _get_pooled_thresholds()
+    if cfg is None:
+        cfg = Config()
+
+    # Run the 5-channel batch computation (same as calibration)
+    ch_arrays = _per_channel_batch(actions, states, cfg, thresholds)
+
+    channels: dict[str, float] = {}
+    ratios: dict[str, float] = {}
+
+    for i, ch_name in enumerate(M_CHANNELS):
+        arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
+        # Take the last value (most recent window)
+        val = float(arr[-1]) if arr.size > 0 else 0.0
+        channels[ch_name] = val
+
+        theta_i = thresholds.theta[i]
+        if ch_name == "sigma_bar":
+            # theta=0 by design: any nonzero value is a violation
+            ratios[ch_name] = 1.0 if val > 0 else 0.0
+        elif theta_i > 0:
+            ratios[ch_name] = val / theta_i
+        else:
+            # Shouldn't happen for other channels, but guard against it
+            ratios[ch_name] = 0.0
+
+    S = max(ratios.values()) if ratios else 0.0
+
+    return {"channels": channels, "ratios": ratios, "S": S}
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -601,6 +674,7 @@ class LiveStruggleMonitor:
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
         ema_alpha: float = 0.4,
+        struggle_ema_alpha: float = 0.4,
         median_window: int = 3,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
@@ -611,6 +685,7 @@ class LiveStruggleMonitor:
         self._n_sample       = int(n_sample_frames)
         self._threshold      = interrupt_threshold
         self._ema_alpha      = ema_alpha
+        self._struggle_alpha = struggle_ema_alpha
         self._median_window  = max(1, int(median_window))
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
@@ -624,6 +699,7 @@ class LiveStruggleMonitor:
         self._signal: dict          = _DEFAULT_SIGNAL.copy()
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
         self._struggle_score: float = 0.0
+        self._metric_p: float       = 0.0   # metric-based gating signal (alpha * S)
         self._p_history: list       = []   # last 3 raw p values for median filter
         self._stop_event            = threading.Event()
         self._transfer_active       = threading.Event()
@@ -668,6 +744,10 @@ class LiveStruggleMonitor:
         """Return the current EMA struggle score (0–1)."""
         return self._struggle_score
 
+    def get_metric_p(self) -> float:
+        """Return the current metric-based gating signal (alpha * S)."""
+        return self._metric_p
+
     @property
     def latest_frame(self):
         """Return a copy of the most recent camera frame, or None if buffer is empty."""
@@ -692,6 +772,7 @@ class LiveStruggleMonitor:
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
+        self._metric_p       = 0.0
         self._p_history      = []
         self._state_tracker.reset()
         self._episode_start  = time.time()
@@ -803,46 +884,62 @@ class LiveStruggleMonitor:
                 )
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
-                frames = self._subsample(buf, self._n_sample)
-                epoch_snapshot = self._transfer_epoch
-                try:
-                    result = assess_interrupt_panel(
-                        frames, self._client, self._model,
-                        actions=actions, states=states,
-                    )
-                    # Discard if a transfer started while the panel was running.
-                    if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
-                        self._interrupt = result
-                        self._last_check_t = time.time()
-                        p_raw = float(result["interrupt_probability"])
-                        # Rolling median over last N calls — kills isolated spikes.
-                        # A single bad call (p=0.70 among [0.10, 0.10]) gives median=0.10
-                        # so EMA only rises when multiple consecutive calls agree.
-                        self._p_history.append(p_raw)
-                        if len(self._p_history) > self._median_window:
-                            self._p_history.pop(0)
-                        p = sorted(self._p_history)[len(self._p_history) // 2]
-                        self._struggle_score = (
-                            self._ema_alpha * p
-                            + (1 - self._ema_alpha) * self._struggle_score
-                        )
+                # Gate: compute metric-based struggle score; only call Gemini
+                # when p = alpha * S >= threshold.
+                call_gemini = True
+                if actions is not None and states is not None:
+                    score_result = compute_struggle_score(actions, states)
+                    S = score_result["S"]
+                    self._metric_p = self._struggle_alpha * S
+                    if self._metric_p < self._threshold:
+                        call_gemini = False
                         ep_elapsed = time.time() - self._episode_start
-                        self._state_tracker.update(result, ep_elapsed)
-                        status = "INTERRUPT" if self.is_struggling() else "ok     "
-                        vote_str = " ".join(
-                            f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
-                            for v in result.get("votes", [])
-                        )
                         print(
-                            f"[StruggleMonitor] {status}"
-                            f"  t={ep_elapsed:.0f}s"
-                            f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
-                            f"  [{vote_str}]"
-                            f"  p={p_raw:.2f}→med={p:.2f}  ema={self._struggle_score:.2f}"
-                            f"  | {result['reason']}"
+                            f"[StruggleMonitor] ok      t={ep_elapsed:.0f}s"
+                            f"  metric S={S:.2f}  p={self._metric_p:.2f} < {self._threshold}"
+                            f"  (skipping Gemini)"
                         )
-                except Exception as e:
-                    print(f"[StruggleMonitor] Gemini error: {e}")
+
+                if call_gemini:
+                    frames = self._subsample(buf, self._n_sample)
+                    epoch_snapshot = self._transfer_epoch
+                    try:
+                        result = assess_interrupt_panel(
+                            frames, self._client, self._model,
+                            actions=actions, states=states,
+                        )
+                        # Discard if a transfer started while the panel was running.
+                        if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
+                            self._interrupt = result
+                            self._last_check_t = time.time()
+                            p_raw = float(result["interrupt_probability"])
+                            # Rolling median over last N calls — kills isolated spikes.
+                            self._p_history.append(p_raw)
+                            if len(self._p_history) > self._median_window:
+                                self._p_history.pop(0)
+                            p = sorted(self._p_history)[len(self._p_history) // 2]
+                            self._struggle_score = (
+                                self._ema_alpha * p
+                                + (1 - self._ema_alpha) * self._struggle_score
+                            )
+                            ep_elapsed = time.time() - self._episode_start
+                            self._state_tracker.update(result, ep_elapsed)
+                            status = "INTERRUPT" if self.is_struggling() else "ok     "
+                            vote_str = " ".join(
+                                f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                                for v in result.get("votes", [])
+                            )
+                            print(
+                                f"[StruggleMonitor] {status}"
+                                f"  t={ep_elapsed:.0f}s"
+                                f"  metric S={S:.2f}  p={self._metric_p:.2f}"
+                                f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
+                                f"  [{vote_str}]"
+                                f"  gemini_p={p_raw:.2f}→med={p:.2f}  ema={self._struggle_score:.2f}"
+                                f"  | {result['reason']}"
+                            )
+                    except Exception as e:
+                        print(f"[StruggleMonitor] Gemini error: {e}")
 
             elapsed = time.time() - start
             self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
@@ -1400,6 +1497,8 @@ if __name__ == "__main__":
     p_live.add_argument("--model",     default="gemini-2.5-flash")
     p_live.add_argument("--interval",  type=float, default=2.0)
     p_live.add_argument("--threshold", type=float, default=0.5)
+    p_live.add_argument("--alpha",     type=float, default=0.4,
+                        help="Struggle score scaling: p = alpha * S; Gemini called when p >= threshold")
 
     p_batch = sub.add_parser("batch", help="Run batch test on a full LeRobot dataset.")
     p_batch.add_argument("--dataset",      default="nc8304/eval_smolvla-phase-split_combined")
@@ -1429,6 +1528,7 @@ if __name__ == "__main__":
             model=args.model,
             check_interval=args.interval,
             interrupt_threshold=args.threshold,
+            struggle_ema_alpha=args.alpha,
         )
         monitor.start()
 
