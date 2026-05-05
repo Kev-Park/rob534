@@ -6,32 +6,9 @@ import time
 import webbrowser
 from pathlib import Path
 
-<<<<<<< HEAD
-import PIL.ImageFile
-PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
-=======
-import cv2
-import numpy as np
->>>>>>> origin/050126
-
 import robot_control as rc
-from motor_commands import load_home, PORT, CAMERA_INDEX
+from motor_commands import load_home, PORT
 from struggle_monitor import LiveStruggleMonitor
-
-
-def _edge_removed_rgb(frame_rgb: np.ndarray, ksize: int = 3, threshold: int = 50) -> np.ndarray:
-    """Match the training-time Sobel edge-removal applied by sobel_batch.py.
-
-    Input: RGB uint8 HWC (lerobot OpenCVCamera default). Output: RGB uint8 HWC
-    with pixels whose Sobel-magnitude >= threshold set to 0.
-    """
-    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=ksize)
-    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=ksize)
-    mag = np.clip(np.sqrt(gx * gx + gy * gy), 0, 255).astype(np.uint8)
-    out = frame_rgb.copy()
-    out[mag >= threshold] = 0
-    return out
 
 
 def go_home(home_pos: dict = None, port: str = "COM5",
@@ -212,9 +189,6 @@ def do_smol_vla_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
-    use_edge_removed=False,
-    edge_ksize=3,
-    edge_threshold=50,
 ):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -250,7 +224,7 @@ def do_smol_vla_eval(
     else:
         subprocess.run(["taskkill", "/f", "/im", "rerun.exe"], capture_output=True)
         subprocess.Popen(["rerun", "--serve-web"])
-    threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
+        threading.Thread(target=_wait_and_open_viewer, daemon=True).start()
 
     init_logging()
     init_rerun(session_name="recording")
@@ -263,21 +237,13 @@ def do_smol_vla_eval(
     # connection, camera, and policy weights stay in memory for the full run.
 
     # Robot + camera: opened once, camera warms up once (warmup_s=2).
-    # When use_edge_removed is on, the policy was trained on observation.images.front,
-    # so we name the camera "front" to match — same hardware (index_or_path=1).
-    camera_key = "front" if use_edge_removed else "camera1"
     robot_cfg = SOFollowerRobotConfig(
-        port=PORT,
+        port="COM5",
         id="student_arm",
         use_degrees=True,
         cameras={
-<<<<<<< HEAD
             "camera1": OpenCVCameraConfig(
-                index_or_path=CAMERA_INDEX, fps=30, width=640, height=480, warmup_s=2,
-=======
-            camera_key: OpenCVCameraConfig(
                 index_or_path=1, fps=30, width=640, height=480, warmup_s=2,
->>>>>>> origin/050126
             )
         },
     )
@@ -341,19 +307,6 @@ def do_smol_vla_eval(
 
     # Connect robot and camera once — stays open for all episodes.
     robot.connect()
-
-    if use_edge_removed:
-        _orig_get_obs = robot.get_observation
-        def _get_obs_edge_removed():
-            obs = _orig_get_obs()
-            frame = obs.get(camera_key)
-            if frame is not None:
-                obs[camera_key] = _edge_removed_rgb(frame, edge_ksize, edge_threshold)
-            return obs
-        robot.get_observation = _get_obs_edge_removed
-        print(f"  [edge-removed] applying Sobel(ksize={edge_ksize}, thr={edge_threshold}) "
-              f"to '{camera_key}' frames live.")
-
     listener, events = init_keyboard_listener()
 
     # ── Struggle monitor (optional) ───────────────────────────────────────────
@@ -363,7 +316,7 @@ def do_smol_vla_eval(
             key_file=struggle_key_file,
             model="gemini-2.5-flash",
             check_interval=struggle_check_interval,
-            interrupt_threshold=struggle_threshold,
+            struggle_threshold=struggle_threshold,
         )
         monitor.start()
         monitor.start_capture(camera_index=1)
@@ -382,11 +335,7 @@ def do_smol_vla_eval(
 
     try:
         with VideoEncodingManager(dataset):
-            saved = 0       # episodes actually committed to disk
-            attempts = 0    # total record_loop runs (including redos)
-            is_redo = False
-            while saved < num_episodes:
-                attempts += 1
+            for i in range(num_episodes):
                 # Reset events so any stray keypress during go_home doesn't
                 # immediately exit the first control loop iteration.
                 events["exit_early"] = False
@@ -407,8 +356,7 @@ def do_smol_vla_eval(
                 # episode starts from the same known configuration.
                 # home_pos is loaded from home_pos.json (set via motor_commands.py reset_home).
                 _go_home_with_robot(robot)
-                redo_tag = f"  [redo]" if is_redo else ""
-                print(f"\n  Episode {saved + 1}/{num_episodes}{redo_tag}")
+                print(f"\n  Episode {i + 1}/{num_episodes}")
                 record_loop(
                     robot=robot,
                     events=events,
@@ -425,32 +373,20 @@ def do_smol_vla_eval(
                     display_data=True,
                 )
 
-                # Stop the per-episode watcher and print episode summary
+                # Stop the per-episode watcher
                 if monitor:
                     watcher_stop.set()
-                    ep_state = monitor.get_episode_state()
-                    print(f"\n  [EpisodeState] {ep_state}")
 
                 frames_collected = (
                     dataset.episode_buffer is not None
                     and dataset.episode_buffer.get("size", 0) > 0
                 )
-                if events.get("rerecord_episode"):
-                    # Discard regardless of buffer state — user pressed left/rerecord.
-                    print(f"  Re-recording episode {saved + 1} (attempt {attempts})")
-                    if dataset.episode_buffer is not None:
-                        dataset.clear_episode_buffer()
-                    is_redo = True
-                elif frames_collected:
+                if frames_collected:
                     dataset.save_episode()
-                    saved += 1
-                    is_redo = False
                 else:
-                    print(f"  WARNING: Episode {saved + 1} collected no frames — skipping save.")
+                    print(f"  WARNING: Episode {i + 1} collected no frames — skipping save.")
                     if dataset.episode_buffer is not None:
                         dataset.clear_episode_buffer()
-                    saved += 1   # count it as done to avoid infinite loop on persistent failure
-                    is_redo = False
 
                 if events["stop_recording"]:
                     break
@@ -468,48 +404,6 @@ def do_replay(repo_id="nc8304/so101", episode=0):
 
 
 if __name__ == "__main__":
-    import argparse
-    import sys
-
-    _BASE = Path(__file__).parent
-
-    parser = argparse.ArgumentParser(description="Robot arm A/B eval / simulation")
-    parser.add_argument("--simulate",   action="store_true",  help="Offline A/B simulation video (no robot)")
-    parser.add_argument("--threshold",  type=float, default=0.6, help="Struggle monitor interrupt threshold (default 0.6)")
-    parser.add_argument("--episodes",   type=int,   default=10,  help="Number of episodes (default 10)")
-    parser.add_argument("--time",       type=float, default=45,  help="Max seconds per episode (default 45)")
-    parser.add_argument("--interval",       type=float, default=1.0,  help="Seconds between Gemini assessments (default 1.0)")
-    parser.add_argument("--switch-duration", type=float, default=15.0, help="Seconds policy B runs after auto-switch (default 15.0)")
-    parser.add_argument("--task",            type=str,   default="Grab the cube and drop it", help="Task instruction string sent to the policy")
-    args = parser.parse_args()
-
-    if args.simulate:
-        # Offline A/B simulation video — no robot needed.
-        from ab_eval import simulate_ab_video
-        _eval_csv  = _BASE / "eval_new_prompts_stats.csv"
-        _train_csv = _BASE / "train_stats.csv"
-        _eval_vids = _BASE / "interrupt_vids_eval"
-        _train_vids = _BASE / "interrupt_vids"
-        if _eval_csv.exists() and _eval_vids.exists():
-            simulate_ab_video(
-                stats_csv=str(_eval_csv),
-                video_dir=str(_eval_vids),
-                out_video=str(_BASE / "ab_sim_eval.mp4"),
-                interrupt_threshold=args.threshold,
-                show=True,
-                dataset_id="nc8304/eval_smolvla-phase-split-new-prompts",
-            )
-        else:
-            simulate_ab_video(
-                stats_csv=str(_train_csv),
-                video_dir=str(_train_vids),
-                out_video=str(_BASE / "ab_sim_train.mp4"),
-                interrupt_threshold=args.threshold,
-                show=True,
-                dataset_id="nc8304/so101_combined_cubeONLY",
-            )
-        sys.exit(0)
-
     import torch
     import psutil
 
@@ -579,25 +473,16 @@ if __name__ == "__main__":
         print("GPU processes:  nvidia-smi not found")
 
     print("=" * 50)
-    # ── Live A/B eval on real robot ───────────────────────────────────────────
-    from ab_eval import do_ab_eval
 
-    do_ab_eval(
-        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        repo_id_a="Rollout/smolvla-aug_policyA",
-        repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
-        single_task="drop cube in the target region",
-        num_episodes=args.episodes,
-        episode_time_s=90,
+    #get_current_pos()
+    #do_teleoperate()
+    #do_record(repo_id=REPO_IDS["skywalker"], num_episodes=10, single_task="Grab orange triangle", resume=True) #if file exsists make new one
+    #do_replay(repo_id="nc8304/so101_031626",episode=0)
+    #do_eval(policy_path="SkywalkerLi/act-so101")
+    do_smol_vla_eval(
+        policy_path=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        repo_id="SkywalkerLi/eval_smolvla-aug",
+        num_episodes=10,
+        episode_time_s=45,
         use_struggle_monitor=True,
-<<<<<<< HEAD
-        auto_switch=True,
-        struggle_threshold=0.2,
-        struggle_check_interval=args.interval,
-        switch_duration=args.switch_duration,
-        stats_csv=str(_BASE / "ab_eval_stats.csv"),
-=======
-        use_edge_removed=True,
->>>>>>> origin/050126
     )
