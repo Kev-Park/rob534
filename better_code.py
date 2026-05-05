@@ -540,10 +540,10 @@ if __name__ == "__main__":
     from ab_eval import do_ab_eval
 
     do_ab_eval(
-        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        repo_id_a="SkywalkerLi/run eval_smolvla-aug_policyA",
-        repo_id_b="SkywalkerLi/smolvla-phase-split-new-prompts_policyB",
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
+        repo_id_b="SkywalkerLi/run eval_smolvla-aug_policyA",
+        repo_id_a="SkywalkerLi/smolvla-phase-split-new-prompts_policyB",
         single_task=args.task,
         num_episodes=args.episodes,
         episode_time_s=args.time,
