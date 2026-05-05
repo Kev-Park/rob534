@@ -123,8 +123,10 @@ def compute_struggle_score(
 
     for i, ch_name in enumerate(M_CHANNELS):
         arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
-        # Take the last value (most recent window)
-        raw = float(arr[-1]) if arr.size > 0 else float("nan")
+        # Take the last non-NaN value (some metrics leave trailing NaNs due to
+        # forward-stencil warmup, e.g. J_RMS leaves the last 2 rows NaN)
+        valid = arr[~np.isnan(arr)]
+        raw = float(valid[-1]) if valid.size > 0 else float("nan")
         channels[ch_name] = raw
         # NaN means the metric couldn't be computed (e.g. stationary arm →
         # SPARC collapses to DC). Treat as 0 so it doesn't poison S.
