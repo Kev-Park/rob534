@@ -535,21 +535,20 @@ if __name__ == "__main__":
         print("GPU processes:  nvidia-smi not found")
 
     print("=" * 50)
-
     # ── Live A/B eval on real robot ───────────────────────────────────────────
     from ab_eval import do_ab_eval
 
     do_ab_eval(
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
-        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
-        repo_id_b="SkywalkerLi/run eval_smolvla-aug_policyA",
-        repo_id_a="SkywalkerLi/smolvla-phase-split-new-prompts_policyB",
-        single_task=args.task,
+        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
+        repo_id_a="Rollout/smolvla-aug_policyA",
+        repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
+        single_task="drop cube in the target region",
         num_episodes=args.episodes,
-        episode_time_s=args.time,
+        episode_time_s=90,
         use_struggle_monitor=True,
         auto_switch=True,
-        struggle_threshold=args.threshold,
+        struggle_threshold=0.2,
         struggle_check_interval=args.interval,
         switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),

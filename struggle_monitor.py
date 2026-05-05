@@ -617,6 +617,7 @@ class LiveStruggleMonitor:
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
         self._struggle_score: float = 0.0
         self._stop_event            = threading.Event()
+        self._transfer_active       = threading.Event()
         self._thread: threading.Thread | None         = None
         self._capture_thread: threading.Thread | None = None
         self._capture_fps: float = fps
@@ -682,6 +683,19 @@ class LiveStruggleMonitor:
         self._struggle_score = 0.0
         self._state_tracker.reset()
         self._episode_start  = time.time()
+
+    def pause_for_transfer(self) -> None:
+        """Suspend Gemini polling and display pushes during a policy transfer."""
+        self._transfer_active.set()
+
+    def resume_from_transfer(self) -> None:
+        """Resume normal monitoring after a policy transfer completes."""
+        self._transfer_active.clear()
+
+    @property
+    def transfer_active(self) -> bool:
+        """True while a policy transfer is in progress."""
+        return self._transfer_active.is_set()
 
     def start(self) -> None:
         """Start the background Gemini monitoring thread."""
@@ -754,7 +768,7 @@ class LiveStruggleMonitor:
                     if states is not None else None
                 )
 
-            if len(buf) >= self._n_sample:
+            if len(buf) >= self._n_sample and not self._transfer_active.is_set():
                 frames = self._subsample(buf, self._n_sample)
                 try:
                     result = assess_interrupt(
@@ -774,6 +788,7 @@ class LiveStruggleMonitor:
                     status = "INTERRUPT" if self.is_struggling() else "ok     "
                     print(
                         f"[StruggleMonitor] {status}"
+                        f"  t={ep_elapsed:.0f}s"
                         f"  p={p:.2f}  ema={self._struggle_score:.2f}"
                         f"  picks={result['pickup_attempts']}"
                         f"  drops={result['drop_attempts']}"
@@ -807,6 +822,7 @@ def _draw_interrupt_hud(
     threshold: float = 0.5,
     time_factor: float = 1.0,
     p_cap: float = 0.90,
+    ep_elapsed: float = 0.0,
 ) -> np.ndarray:
     """Draw a probability gauge overlay at the top-left of a BGR frame."""
     frame = frame.copy()
@@ -844,8 +860,10 @@ def _draw_interrupt_hud(
         cv2.putText(frame, f"×{time_factor:.0%} ≤{p_cap:.2f}",
                     (x0 + 155, y0 + 20), font, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
 
-    # Row 2: attempt counts
-    cv2.putText(frame, f"picks {pickup_attempts}   drops {drop_attempts}",
+    # Row 2: attempt counts + episode timer
+    mins, secs = divmod(int(ep_elapsed), 60)
+    t_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+    cv2.putText(frame, f"picks {pickup_attempts}   drops {drop_attempts}   t={t_str}",
                 (x0 + 6, y0 + 38), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
     # Rows 3-5: reason text with word-wrap
@@ -977,6 +995,7 @@ def _render_episode_interrupt_video(
             threshold=interrupt_threshold,
             time_factor=cur_check.get("time_factor", 1.0),
             p_cap=cur_check.get("p_cap", P_CAP_MAX),
+            ep_elapsed=frame_idx / fps,
         )
         cv2.putText(frame, f"Episode {ep_idx}", (W - 130, 22),
                     font, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
@@ -1194,6 +1213,7 @@ def test_on_dataset(
                     episode_checks[ep_idx].append({
                         "frame_idx":   frame_counter,
                         "ts":          cur_ts,
+                        "ep_elapsed":  ep_elapsed,
                         "p":           p_filtered,
                         "p_raw":       p_raw,
                         "time_factor": time_factor,
