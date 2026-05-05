@@ -370,10 +370,24 @@ def _stats_gui_process(queue) -> None:
 
     _redraw_chart(0.0, 0.6)
 
+    def _reset_display():
+        """Clear chart history and reset all text widgets to zero/default."""
+        ema_history.clear()
+        cv.delete("ema_plot")
+        v_prob.set("0.000")
+        v_picks.set("0")
+        v_drops.set("0")
+        v_status.set("--")
+        l_status.config(fg=FG)
+        _redraw_chart(0.0, _chart_state["thr"])
+
     def poll():
         try:
             while True:                         # drain all queued updates
                 data = queue.get_nowait()
+                if data.get("reset"):
+                    _reset_display()
+                    continue
                 label = data.get("label", "A")
                 color = "#00ffff" if label == "A" else "#ff44ff"
                 v_policy.set("STUDENT (A)" if label == "A" else "TEACHER (B)")
@@ -783,6 +797,9 @@ def do_ab_eval(
             with VideoEncodingManager(dataset_b):
                 for i in range(num_episodes):
 
+                    _t_ep_start = _time.perf_counter()
+                    _timings: dict[str, float] = {}
+
                     # ── PICK ACTIVE POLICY ────────────────────────────────────
                     # Always start on Policy A (student) unless we are in the
                     # one held-position episode that immediately follows a switch
@@ -809,6 +826,11 @@ def do_ab_eval(
 
                     if monitor:
                         monitor.reset_signal()
+                        if stats_queue is not None:
+                            try:
+                                stats_queue.put_nowait({"reset": True})
+                            except Exception:
+                                pass
 
                     # Per-episode watcher thread: ends episode early if struggling.
                     watcher_stop = threading.Event()
@@ -824,8 +846,10 @@ def do_ab_eval(
                     # _held_position is True and we skip go_home — the arm and
                     # the object stay exactly where they are so the other policy
                     # gets a fair attempt from the identical starting state.
+                    _t0 = _time.perf_counter()
                     if not held:
                         _go_home_with_robot(robot)
+                    _timings["go_home"] = _time.perf_counter() - _t0
 
                     print(f"\n  Episode {i + 1}/{num_episodes} — "
                           f"Policy {label} (ep {counts[label]} for {label})")
@@ -834,6 +858,7 @@ def do_ab_eval(
                     # record_loop runs at 30 Hz: read obs -> policy forward pass
                     # -> send action -> store frame. Exits when control_time_s
                     # is reached or events["exit_early"] is set (d or q key).
+                    _t0 = _time.perf_counter()
                     record_loop(
                         robot=robot,
                         events=events,
@@ -849,6 +874,7 @@ def do_ab_eval(
                         single_task=single_task,
                         display_data=True,
                     )
+                    _timings[f"record_loop_{label}"] = _time.perf_counter() - _t0
 
                     # Stop watcher thread and collect episode stats.
                     if monitor:
@@ -871,6 +897,12 @@ def do_ab_eval(
                         events["auto_switched"] = False
                         if monitor:
                             monitor.reset_signal()
+                            if stats_queue is not None:
+                                try:
+                                    stats_queue.put_nowait({"reset": True})
+                                except Exception:
+                                    pass
+                        _t0 = _time.perf_counter()
                         record_loop(
                             robot=robot,
                             events=events,
@@ -886,16 +918,20 @@ def do_ab_eval(
                             single_task=single_task,
                             display_data=True,
                         )
+                        _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
                         label_ref[0] = "A"   # display resets for next episode
                         if monitor:
                             b_ep_state = monitor.get_episode_state()
                             print(f"  [EpisodeState B] {b_ep_state}")
                         # save B's frames (writer flush + save)
+                        _t0 = _time.perf_counter()
                         _time.sleep(2.5)
+                        _timings["sleep_before_save_B"] = _time.perf_counter() - _t0
                         b_frames = (
                             dataset_b.episode_buffer is not None
                             and dataset_b.episode_buffer.get("size", 0) > 0
                         )
+                        _t0 = _time.perf_counter()
                         if b_frames:
                             dataset_b.save_episode()
                             if stats_csv and monitor:
@@ -905,6 +941,7 @@ def do_ab_eval(
                             print("  WARNING: Policy B collected no frames — skipping save.")
                             if dataset_b.episode_buffer is not None:
                                 dataset_b.clear_episode_buffer()
+                        _timings["save_episode_B"] = _time.perf_counter() - _t0
                         # clear the auto_switched flag so the flip logic below
                         # doesn't also trigger
                         events["auto_switched"] = False
@@ -912,7 +949,9 @@ def do_ab_eval(
                     # ── SAVE EPISODE ──────────────────────────────────────────
                     # Brief pause so background image-writer threads finish
                     # flushing PNGs before the video encoder reads them.
+                    _t0 = _time.perf_counter()
                     _time.sleep(2.5)
+                    _timings["sleep_before_save"] = _time.perf_counter() - _t0
 
                     # Guard against empty buffer — can happen if 'q' was pressed
                     # during go_home before the record_loop captured any frames.
@@ -920,6 +959,7 @@ def do_ab_eval(
                         dataset.episode_buffer is not None
                         and dataset.episode_buffer.get("size", 0) > 0
                     )
+                    _t0 = _time.perf_counter()
                     if frames_collected:
                         if events["switch_policy"]:
                             # 'q' pressed mid-episode: copy frames to the OTHER
@@ -947,6 +987,11 @@ def do_ab_eval(
                         print(f"  WARNING: Episode {i + 1} (Policy {label}) collected no frames — skipping save.")
                         if dataset.episode_buffer is not None:
                             dataset.clear_episode_buffer()
+                    _timings["save_episode"] = _time.perf_counter() - _t0
+
+                    _t_ep_total = _time.perf_counter() - _t_ep_start
+                    _timing_str = "  ".join(f"{k}={v:.1f}s" for k, v in _timings.items())
+                    print(f"  [TIMING ep {i+1}] total={_t_ep_total:.1f}s  |  {_timing_str}")
 
                     # ── FLIP POLICY IF q WAS PRESSED OR MONITOR TRIGGERED ─────
                     if events["switch_policy"]:
