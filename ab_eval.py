@@ -311,13 +311,15 @@ def _stats_gui_process(queue) -> None:
                                text="", anchor="se",
                                fill="#ff8800", font=("Consolas", 7, "bold"))
 
-    # EMA history
-    ema_history = collections.deque(maxlen=MAX_PTS)
-    _chart_state = {"thr": 0.6}
+    # EMA history and switch marker tracking
+    ema_history   = collections.deque(maxlen=MAX_PTS)
+    _chart_state  = {"thr": 0.6, "counter": 0}
+    switch_markers: list[int] = []   # data-point counter values at each switch
 
     def _redraw_chart(ema, thr):
         _chart_state["thr"] = thr
         ema_history.append(ema)
+        _chart_state["counter"] += 1
         n = len(ema_history)
 
         # Reposition threshold line
@@ -331,6 +333,19 @@ def _stats_gui_process(queue) -> None:
 
         if n < 2:
             return
+
+        # ── Switch marker vertical lines (drawn first, EMA renders on top) ──
+        for sc in switch_markers:
+            offset = _chart_state["counter"] - sc
+            idx    = n - 1 - offset
+            if 0 <= idx < n:
+                sx = _idx_to_x(idx, n)
+                cv.create_line(sx, PAD_TOP, sx, PAD_TOP + PLOT_H,
+                               fill="#ffdd00", width=1, dash=(3, 3),
+                               tags="ema_plot")
+                cv.create_text(sx + 2, PAD_TOP + 1, text="switch",
+                               anchor="nw", fill="#ffdd00",
+                               font=("Consolas", 6, "bold"), tags="ema_plot")
 
         # Build point list
         pts = []
@@ -371,8 +386,10 @@ def _stats_gui_process(queue) -> None:
     _redraw_chart(0.0, 0.6)
 
     def _reset_display():
-        """Clear chart history and reset all text widgets to zero/default."""
+        """Clear chart history, switch markers, and all text widgets."""
         ema_history.clear()
+        switch_markers.clear()
+        _chart_state["counter"] = 0
         cv.delete("ema_plot")
         v_prob.set("0.000")
         v_picks.set("0")
@@ -381,12 +398,33 @@ def _stats_gui_process(queue) -> None:
         l_status.config(fg=FG)
         _redraw_chart(0.0, _chart_state["thr"])
 
+    # Delayed-reset support: keep chart visible for a moment after a switch
+    # so the user can see the marker before the chart clears.
+    _pending_reset = [None]
+
+    def _cancel_pending_reset():
+        if _pending_reset[0] is not None:
+            root.after_cancel(_pending_reset[0])
+            _pending_reset[0] = None
+
+    def _schedule_reset(delay_ms=0):
+        _cancel_pending_reset()
+        if delay_ms > 0:
+            _pending_reset[0] = root.after(delay_ms, _reset_display)
+        else:
+            _reset_display()
+
     def poll():
         try:
             while True:                         # drain all queued updates
                 data = queue.get_nowait()
                 if data.get("reset"):
-                    _reset_display()
+                    _schedule_reset(data.get("delay_ms", 0))
+                    continue
+                if data.get("switch_marker"):
+                    # Record the current counter so we can compute the x-position
+                    # on subsequent redraws as the history scrolls.
+                    switch_markers.append(_chart_state["counter"])
                     continue
                 label = data.get("label", "A")
                 color = "#00ffff" if label == "A" else "#ff44ff"
@@ -408,9 +446,9 @@ def _stats_gui_process(queue) -> None:
                     l_status.config(fg="#44ff44")
         except Exception:
             pass
-        root.after(500, poll)
+        root.after(200, poll)
 
-    root.after(500, poll)
+    root.after(200, poll)
     root.mainloop()
 
 
@@ -899,12 +937,26 @@ def do_ab_eval(
                         events["exit_early"]    = False
                         events["auto_switched"] = False
                         if monitor:
-                            monitor.reset_signal()
+                            # Snapshot the peak EMA and mark the switch on the
+                            # chart BEFORE reset_signal() zeroes it out — ensures
+                            # the chart shows the spike that caused the switch.
                             if stats_queue is not None:
                                 try:
-                                    stats_queue.put_nowait({"reset": True})
+                                    _peak_intr = monitor.get_interrupt()
+                                    stats_queue.put_nowait({
+                                        "label":     label_ref[0],
+                                        "ema":       monitor.get_struggle_score(),
+                                        "threshold": struggle_threshold,
+                                        "prob":      _peak_intr.get("interrupt_probability", 0.0),
+                                        "picks":     _peak_intr.get("pickup_attempts", 0),
+                                        "drops":     _peak_intr.get("drop_attempts", 0),
+                                    })
+                                    stats_queue.put_nowait({"switch_marker": True})
+                                    # Delayed reset — keep the marker visible for 1.5 s
+                                    stats_queue.put_nowait({"reset": True, "delay_ms": 1500})
                                 except Exception:
                                     pass
+                            monitor.reset_signal()
                         _t0 = _time.perf_counter()
                         record_loop(
                             robot=robot,
