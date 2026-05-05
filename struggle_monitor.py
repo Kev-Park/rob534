@@ -59,6 +59,7 @@ Batch evaluation
     to ground-truth labels, and optionally renders annotated 3-panel videos.
 """
 
+import concurrent.futures
 import glob
 import json
 import threading
@@ -90,6 +91,13 @@ TIME_RAMP_END_S: float = 30.0
 P_CAP_MIN:      float = 0.75
 P_CAP_MAX:      float = 0.90
 CAP_RAMP_END_S: float = 60.0
+
+# Panel of judges: each judge uses the same prompt but a different temperature,
+# creating a conservative→liberal spectrum without requiring different prompts.
+# Low-temp judges only flag obvious failures; high-temp judges catch borderline
+# cases too. vote_count / n_judges feeds the EMA; set interrupt_threshold to
+# control how much sustained agreement is required.
+JUDGE_TEMPERATURES: tuple[float, ...] = (0.10, 0.25, 0.40, 0.55, 0.70)
 
 
 # ── Prompts & schemas ─────────────────────────────────────────────────────────
@@ -151,19 +159,24 @@ NORMAL BEHAVIOUR — do NOT penalise these:
   - A single drop correction or push motion to seat the block (drop_attempts = 2 is fine)
   These are expected and represent good adaptive behaviour, not failure.
 
-interrupt_probability scoring guide:
-  0.0 – 0.2  Clean execution. 1–2 pickups/drops, block held stably, converging trend.
-  0.2 – 0.4  Minor hiccup (one slip, one jerk spike) but recovering — low urgency.
-  0.4 – 0.6  Messy but possibly recovering. 3 attempts or mildly diverging trend.
-  0.6 – 0.8  Clearly struggling. 4+ attempts, sustained divergence, or block dropped.
-  0.8 – 1.0  Policy has failed. No progress, block lost, looping, or totally erratic.
+Decision criteria — vote YES (struggling=true) if ANY of these apply:
+  - 4+ pickup attempts or 3+ drop attempts (repeated failures, not single re-grasp)
+  - Block dropped and not recovered by the end of this window
+  - Sustained diverging Lyapunov trend with no visible sign of recovery
+  - Arm looping, oscillating, or making no net progress for more than ~10 s
+  - Policy has clearly lost the task (block lost, arm stuck erratically)
+
+Vote NO (struggling=false) if:
+  - Execution is clean or has at most one minor self-corrected hiccup
+  - At most 2 pickup attempts and 2 drop attempts, with visible recovery
+  - Converging Lyapunov trend, or task already accomplished
 
 Return ONLY JSON with fields:
-  interrupt_probability (float 0-1),
+  struggling (bool) — true if you recommend interrupting now,
   pickup_attempts (int),
   drop_attempts (int),
   task_accomplished (bool),
-  reason (one sentence explaining the score).
+  reason (one sentence justifying your vote).
 """
 
 # JSON schemas for structured Gemini output.
@@ -177,16 +190,16 @@ RESPONSE_SCHEMA = {       # legacy — matches STRUGGLE_PROMPT
     "required": ["struggling", "confidence", "reason"],
 }
 
-INTERRUPT_SCHEMA = {      # matches INTERRUPT_PROMPT
+JUDGE_SCHEMA = {          # matches INTERRUPT_PROMPT (per-judge binary output)
     "type": "object",
     "properties": {
-        "interrupt_probability": {"type": "number"},
-        "pickup_attempts":       {"type": "integer"},
-        "drop_attempts":         {"type": "integer"},
-        "task_accomplished":     {"type": "boolean"},
-        "reason":                {"type": "string"},
+        "struggling":        {"type": "boolean"},
+        "pickup_attempts":   {"type": "integer"},
+        "drop_attempts":     {"type": "integer"},
+        "task_accomplished": {"type": "boolean"},
+        "reason":            {"type": "string"},
     },
-    "required": ["interrupt_probability", "pickup_attempts", "drop_attempts",
+    "required": ["struggling", "pickup_attempts", "drop_attempts",
                  "task_accomplished", "reason"],
 }
 
@@ -194,6 +207,7 @@ INTERRUPT_SCHEMA = {      # matches INTERRUPT_PROMPT
 _DEFAULT_SIGNAL = {"struggling": False, "confidence": 0.0, "reason": "no assessment yet"}
 _DEFAULT_INTERRUPT = {
     "interrupt_probability": 0.0,
+    "vote_count": 0,
     "pickup_attempts": 0,
     "drop_attempts": 0,
     "task_accomplished": False,
@@ -338,16 +352,20 @@ def assess_interrupt(
     states:  np.ndarray | None = None,
     gripper: np.ndarray | None = None,
     gripper_threshold: float = 20.0,
+    temperature: float = 0.40,
 ) -> dict:
-    """Probabilistic interrupt assessment over a 20-second window.
+    """Single-judge binary interrupt assessment over a 20-second window.
 
-    Sends frames to Gemini (primary signal) together with supplementary stability
-    and gripper sensor blocks. Gemini counts pickup/drop attempts from the video
-    and returns an interrupt probability.
+    Sends frames to Gemini together with supplementary stability and gripper
+    sensor blocks. Returns a binary struggling decision for one judge.
+
+    Args:
+        temperature: Controls judge conservatism. Low (0.1) = fires only on
+            clear failures. High (0.7) = fires on borderline cases too.
 
     Returns:
-        {"interrupt_probability": float, "pickup_attempts": int,
-         "drop_attempts": int, "reason": str}
+        {"struggling": bool, "pickup_attempts": int, "drop_attempts": int,
+         "task_accomplished": bool, "reason": str}
     """
     if not frames:
         return _DEFAULT_INTERRUPT.copy()
@@ -374,11 +392,79 @@ def assess_interrupt(
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=INTERRUPT_SCHEMA,
-            temperature=0.2,
+            response_schema=JUDGE_SCHEMA,
+            temperature=temperature,
         ),
     )
     return json.loads(response.text)
+
+
+def assess_interrupt_panel(
+    frames: list[np.ndarray],
+    client: genai.Client,
+    model: str = "gemini-2.5-flash",
+    jpeg_quality: int = 75,
+    actions: np.ndarray | None = None,
+    states:  np.ndarray | None = None,
+    gripper: np.ndarray | None = None,
+    gripper_threshold: float = 20.0,
+    temperatures: tuple[float, ...] = JUDGE_TEMPERATURES,
+) -> dict:
+    """Panel of N judges voting in parallel on whether to interrupt.
+
+    Each judge uses the same prompt but a different temperature, creating a
+    conservative→liberal spectrum. Low-temp judges only flag clear failures;
+    high-temp judges catch borderline cases. interrupt_probability = vote_count
+    / n_judges feeds the caller's EMA; set interrupt_threshold there to control
+    how much sustained agreement is required.
+
+    Returns:
+        {"interrupt_probability": float, "vote_count": int,
+         "pickup_attempts": int, "drop_attempts": int,
+         "task_accomplished": bool, "reason": str}
+    """
+    if not frames:
+        return _DEFAULT_INTERRUPT.copy()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(temperatures)) as pool:
+        future_to_temp = {
+            pool.submit(
+                assess_interrupt, frames, client, model,
+                jpeg_quality, actions, states, gripper, gripper_threshold, temp,
+            ): temp
+            for temp in temperatures
+        }
+        ordered: list[tuple[float, dict]] = []
+        for future in concurrent.futures.as_completed(future_to_temp):
+            temp = future_to_temp[future]
+            try:
+                ordered.append((temp, future.result()))
+            except Exception as e:
+                print(f"[assess_interrupt_panel] judge temp={temp:.2f} failed: {e}")
+
+    if not ordered:
+        return _DEFAULT_INTERRUPT.copy()
+
+    ordered.sort(key=lambda x: x[0])   # stable order by temperature
+    votes = [v for _, v in ordered]
+    n = len(votes)
+
+    vote_count = sum(1 for v in votes if v.get("struggling", False))
+    interrupt_probability = vote_count / n
+
+    pickup_attempts  = max(v.get("pickup_attempts", 0) for v in votes)
+    drop_attempts    = max(v.get("drop_attempts",   0) for v in votes)
+    task_accomplished = sum(1 for v in votes if v.get("task_accomplished", False)) > n / 2
+    reason = votes[n // 2].get("reason", "")   # median judge's reasoning
+
+    return {
+        "interrupt_probability": round(interrupt_probability, 4),
+        "vote_count":            vote_count,
+        "pickup_attempts":       pickup_attempts,
+        "drop_attempts":         drop_attempts,
+        "task_accomplished":     task_accomplished,
+        "reason":                reason,
+    }
 
 
 # ── Probability post-processing ───────────────────────────────────────────────
@@ -565,19 +651,19 @@ class EpisodeStateTracker:
 # ── Live monitor ──────────────────────────────────────────────────────────────
 
 class LiveStruggleMonitor:
-    """Continuously watches a 20-second rolling buffer and polls Gemini.
+    """Continuously watches a 20-second rolling buffer and polls the judge panel.
 
-    Uses INTERRUPT_PROMPT: Gemini counts pickup/drop attempts from the video,
-    reads supplementary convergence and gripper data, and outputs
-    ``interrupt_probability`` (0–1). An EMA struggle_score smooths transient
-    spikes; ``is_struggling()`` fires when it exceeds the threshold.
+    Every ``check_interval`` seconds a panel of ``len(JUDGE_TEMPERATURES)``
+    Gemini judges votes in parallel. The vote fraction (vote_count / n_judges)
+    feeds an EMA; ``is_struggling()`` fires when the EMA crosses
+    ``interrupt_threshold``.
 
     Args:
         key_file:            Path to Gemini API key file (or None for env var).
         model:               Gemini model to use.
-        check_interval:      How often (seconds) to call Gemini.
+        check_interval:      How often (seconds) to call the panel.
         buffer_seconds:      Rolling buffer length — 20 s gives full episode context.
-        n_sample_frames:     Frames subsampled per Gemini call.
+        n_sample_frames:     Frames subsampled per panel call.
         fps:                 Camera frame rate (used for buffer sizing).
         interrupt_threshold: EMA score above which is_struggling() → True.
         ema_alpha:           EMA smoothing factor (higher = more reactive).
@@ -618,6 +704,7 @@ class LiveStruggleMonitor:
         self._struggle_score: float = 0.0
         self._stop_event            = threading.Event()
         self._transfer_active       = threading.Event()
+        self._transfer_epoch: int   = 0
         self._thread: threading.Thread | None         = None
         self._capture_thread: threading.Thread | None = None
         self._capture_fps: float = fps
@@ -685,8 +772,15 @@ class LiveStruggleMonitor:
         self._episode_start  = time.time()
 
     def pause_for_transfer(self) -> None:
-        """Suspend Gemini polling and display pushes during a policy transfer."""
+        """Suspend Gemini polling during a policy transfer and clear stale state.
+
+        Increments the transfer epoch so any in-flight Gemini call that returns
+        after this point is silently discarded rather than written to state.
+        """
+        self._transfer_epoch += 1
         self._transfer_active.set()
+        self._interrupt      = _DEFAULT_INTERRUPT.copy()
+        self._struggle_score = 0.0
 
     def resume_from_transfer(self) -> None:
         """Resume normal monitoring after a policy transfer completes."""
@@ -705,7 +799,8 @@ class LiveStruggleMonitor:
         print(
             f"[StruggleMonitor] started  model={self._model}"
             f"  interval={self._check_interval}s"
-            f"  threshold={self._threshold}"
+            f"  panel={len(JUDGE_TEMPERATURES)} judges"
+            f"  ema_threshold={self._threshold}"
         )
 
     def stop(self) -> None:
@@ -770,31 +865,35 @@ class LiveStruggleMonitor:
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
                 frames = self._subsample(buf, self._n_sample)
+                epoch_snapshot = self._transfer_epoch
                 try:
-                    result = assess_interrupt(
+                    result = assess_interrupt_panel(
                         frames, self._client, self._model,
                         actions=actions, states=states,
                         gripper=gripper,
                         gripper_threshold=self._gripper_thresh,
                     )
-                    self._interrupt = result
-                    p = float(result["interrupt_probability"])
-                    self._struggle_score = (
-                        self._ema_alpha * p
-                        + (1 - self._ema_alpha) * self._struggle_score
-                    )
-                    ep_elapsed = time.time() - self._episode_start
-                    self._state_tracker.update(result, ep_elapsed)
-                    status = "INTERRUPT" if self.is_struggling() else "ok     "
-                    print(
-                        f"[StruggleMonitor] {status}"
-                        f"  t={ep_elapsed:.0f}s"
-                        f"  p={p:.2f}  ema={self._struggle_score:.2f}"
-                        f"  picks={result['pickup_attempts']}"
-                        f"  drops={result['drop_attempts']}"
-                        f"  done={result.get('task_accomplished', False)}"
-                        f"  | {result['reason']}"
-                    )
+                    # Discard if a transfer started while the panel was running.
+                    if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
+                        self._interrupt = result
+                        p = float(result["interrupt_probability"])
+                        self._struggle_score = (
+                            self._ema_alpha * p
+                            + (1 - self._ema_alpha) * self._struggle_score
+                        )
+                        ep_elapsed = time.time() - self._episode_start
+                        self._state_tracker.update(result, ep_elapsed)
+                        status = "INTERRUPT" if self.is_struggling() else "ok     "
+                        print(
+                            f"[StruggleMonitor] {status}"
+                            f"  t={ep_elapsed:.0f}s"
+                            f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
+                            f"  p={p:.2f}  ema={self._struggle_score:.2f}"
+                            f"  picks={result['pickup_attempts']}"
+                            f"  drops={result['drop_attempts']}"
+                            f"  done={result.get('task_accomplished', False)}"
+                            f"  | {result['reason']}"
+                        )
                 except Exception as e:
                     print(f"[StruggleMonitor] Gemini error: {e}")
 
@@ -1193,7 +1292,7 @@ def test_on_dataset(
                 ep_elapsed = frame_counter / actual_fps
 
                 try:
-                    result = assess_interrupt(
+                    result = assess_interrupt_panel(
                         frames_snap, client, model,
                         actions=actions_snap, states=states_snap,
                         gripper=gripper_snap, gripper_threshold=gripper_threshold,
@@ -1227,6 +1326,7 @@ def test_on_dataset(
                     status = "INTERRUPT" if flagged else "ok     "
                     print(
                         f"  t={cur_ts:.1f}s  {status}"
+                        f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
                         f"  p={p_filtered:.2f}(raw={p_raw:.2f}×{time_factor:.2f} cap={p_cap:.2f})"
                         f"  ema={scorer.struggle_score:.2f}"
                         f"  picks={result['pickup_attempts']}"
