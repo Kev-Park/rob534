@@ -436,6 +436,7 @@ if __name__ == "__main__":
     parser.add_argument("--time",       type=float, default=45,  help="Max seconds per episode (default 45)")
     parser.add_argument("--interval",       type=float, default=1.0,  help="Seconds between Gemini assessments (default 1.0)")
     parser.add_argument("--switch-duration", type=float, default=15.0, help="Seconds policy B runs after auto-switch (default 15.0)")
+    parser.add_argument("--task",            type=str,   default="Grab the cube and drop it", help="Task instruction string sent to the policy")
     args = parser.parse_args()
 
     if args.simulate:
@@ -539,10 +540,11 @@ if __name__ == "__main__":
     from ab_eval import do_ab_eval
 
     do_ab_eval(
-        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
-        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-phase-split"),
+        policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
         repo_id_a="SkywalkerLi/run eval_smolvla-aug_policyA",
-        repo_id_b="SkywalkerLi/eval_smolvla-phase-split_policyB",
+        repo_id_b="SkywalkerLi/smolvla-phase-split-new-prompts_policyB",
+        single_task=args.task,
         num_episodes=args.episodes,
         episode_time_s=args.time,
         use_struggle_monitor=True,
