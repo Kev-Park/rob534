@@ -1,0 +1,232 @@
+% =============================================================================
+%   Stability Monitoring Methods Section
+% =============================================================================
+%   This file is a fragment, not a standalone document. Drop it into your
+%   paper with \input{stability_monitoring_methods.tex}, or paste directly.
+%
+%   Required packages in your main preamble:
+%       \usepackage{amsmath, amssymb, amsfonts}
+%       \usepackage{bbm}    % for \mathbbm{1} indicator function
+%       \usepackage{bm}     % for \bm{} bold math
+%
+%   If \mathbbm is unavailable in your TeX distribution, substitute:
+%       \usepackage{dsfont}     and use \mathds{1}
+%   or fall back to \mathbf{1} (no extra package).
+% =============================================================================
+
+\section{Methods: Online Stability Monitoring}
+
+We monitor the rollouts of a vision--language--action (VLA) student policy on
+the 6-DOF SO-101 arm and intervene when classical control-theoretic
+indicators of trajectory instability exceed thresholds calibrated on a teacher
+policy's successful rollouts. All indicators are derived solely from the data
+that the LeRobot \texttt{record} pipeline persists by default, so the monitor
+imposes no additional logging requirements and runs at a small fraction of the
+cost of a second VLA inference pass.
+
+\subsection{Notation and Data}
+
+The SO-101 has six Feetech STS3215 serial-bus servos, indexed
+$i \in \{1,\ldots,6\}$ in the order
+\textit{shoulder\_pan}, \textit{shoulder\_lift}, \textit{elbow\_flex},
+\textit{wrist\_flex}, \textit{wrist\_roll}, \textit{gripper}.
+The default \texttt{lerobot-record} schema persists, at sampling rate
+$f_s = 30$~Hz with period $T_s = 1/f_s$, two synchronized vectors per frame:
+\begin{align}
+    \mathbf{a}[k] &= \big[a_1[k], \ldots, a_6[k]\big]^\top \in \mathbb{R}^6 && \text{(commanded joint positions; \texttt{action})} \\
+    \mathbf{q}[k] &= \big[q_1[k], \ldots, q_6[k]\big]^\top \in \mathbb{R}^6 && \text{(measured joint positions; \texttt{observation.state})}
+\end{align}
+The motors expose load, current, velocity, and temperature feedback over the
+serial bus, but these channels are not logged by the default recorder; the
+metrics below therefore use $\mathbf{a}$ and $\mathbf{q}$ exclusively.
+
+For real-time monitoring we compute all metrics over a sliding window of
+length $N$ samples ending at the current step $k$,
+\begin{equation}
+    \mathcal{W}[k] \;=\; \{k - N + 1, \ldots, k\}, \qquad \Delta \;=\; N T_s.
+\end{equation}
+The 12-bit magnetic encoder on the STS3215 quantises position at $\approx
+0.088^\circ$ and the gearbox introduces up to $0.5^\circ$ of backlash, so
+naive numerical differentiation of $\mathbf{q}$ is dominated by quantisation
+noise. We therefore apply a Savitzky--Golay smoother (window 7, polynomial
+order 3) to $\mathbf{q}[k]$ before differentiation, denoting the smoothed
+signal $\tilde{\mathbf{q}}[k]$.
+
+\subsection{Position Tracking Error}
+
+\textbf{Motivation.} Because the SO-101 servos accept position setpoints
+rather than torques, the gap between commanded and measured position is the
+direct, controller-level analogue of a torque error. It captures both
+transient failures (the policy commanding more motion than the joint can
+deliver under load) and persistent stalls (a joint pinned at its load limit).
+Since both signals are recorded synchronously and at the same rate, this is
+the cleanest single stability indicator available without extending the
+recorder.
+
+Define the per-joint tracking error with a one-step offset to align the
+action with the resulting state:
+\begin{equation}
+    e_i[k] \;=\; a_i[k-1] - q_i[k].
+\end{equation}
+Per-joint windowed root-mean-square error:
+\begin{equation}
+    E_i^{\mathrm{RMS}}[k] \;=\; \sqrt{\,\frac{1}{N} \sum_{j \in \mathcal{W}[k]} e_i[j]^2\,}.
+\end{equation}
+Aggregate norm-error across joints:
+\begin{equation}
+    E^{\mathrm{RMS}}[k] \;=\; \sqrt{\,\sum_{i=1}^{6} \big(E_i^{\mathrm{RMS}}[k]\big)^2\,}.
+\end{equation}
+
+\subsection{Jerk-Based Smoothness}
+
+\textbf{Motivation.} Jerk---the third time-derivative of position---is the
+canonical scalar quantification of trajectory roughness, with a long history
+in human motor-control literature and in robotics. A policy beginning to lose
+stability typically produces jerky motion well before it produces visibly
+incorrect motion, providing the earliest-firing indicator in our suite. We
+compute jerk on the smoothed measured signal to assess executed motion;
+computing it independently on $\mathbf{a}[k]$ (for which no smoothing is
+needed) and comparing the two streams further distinguishes
+controller-tracking roughness from policy-output roughness.
+
+Discrete third-derivative approximation via a five-point central
+finite-difference stencil on the smoothed signal:
+\begin{equation}
+    \dddot{\tilde{q}}_i[k]
+    \;\approx\;
+    \frac{\tilde{q}_i[k+2] - 2\,\tilde{q}_i[k+1] + 2\,\tilde{q}_i[k-1] - \tilde{q}_i[k-2]}{2\,T_s^3}.
+\end{equation}
+Per-joint windowed RMS jerk and its aggregate:
+\begin{equation}
+    J_i^{\mathrm{RMS}}[k] \;=\; \sqrt{\,\frac{1}{N} \sum_{j \in \mathcal{W}[k]} \dddot{\tilde{q}}_i[j]^2\,},
+    \qquad
+    J^{\mathrm{RMS}}[k] \;=\; \sqrt{\,\sum_{i=1}^{6} \big(J_i^{\mathrm{RMS}}[k]\big)^2\,}.
+\end{equation}
+
+\subsection{Spectral Arc Length (SPARC)}
+
+\textbf{Motivation.} RMS jerk is sensitive to movement scale and duration,
+which makes cross-trajectory comparison brittle. SPARC, the negated arc
+length of the normalised speed spectrum, is dimensionless and approximately
+invariant to amplitude and time-scale changes. It is the most reliable
+single-trajectory smoothness statistic in the motor-control literature and
+provides a complementary view to RMS jerk: trajectories that look smooth in
+RMS but contain narrow-band oscillations are penalised by SPARC.
+
+Define the speed profile
+\begin{equation}
+    v[k] \;=\; \big\|\, \dot{\tilde{\mathbf{q}}}[k] \,\big\|_2,
+\end{equation}
+and let $V(\omega)$ denote the discrete-time Fourier transform of $v$ over
+the window $\mathcal{W}[k]$, with $\hat{V}(\omega) = V(\omega)/V(0)$ its
+normalised magnitude. SPARC is then
+\begin{equation}
+    \eta_{\mathrm{SPARC}}[k]
+    \;=\;
+    -\int_{0}^{\omega_c}
+    \sqrt{\left(\frac{1}{\omega_c}\right)^{\!2} \!+\! \left(\frac{d\hat{V}(\omega)}{d\omega}\right)^{\!2}}
+    \, d\omega,
+\end{equation}
+with the adaptive cutoff
+\begin{equation}
+    \omega_c \;=\; \min\!\Big\{\, \omega_c^{\max}, \; \min\!\big\{\omega \,\big|\, \hat{V}(r) < \bar{V}\ \forall\, r > \omega \big\} \,\Big\}.
+\end{equation}
+At $f_s = 30$~Hz the Nyquist frequency is $15$~Hz, so we use
+$\omega_c^{\max} = 12$~Hz and $\bar{V} = 0.05$. Smoother trajectories yield
+$\eta_{\mathrm{SPARC}}$ closer to zero from below; rougher motion drives it
+more negative.
+
+\subsection{High-Frequency Power Ratio of the Tracking Error}
+
+\textbf{Motivation.} When a position controller cannot follow its setpoint,
+the error signal develops oscillatory content well above the bandwidth of the
+intended motion---the spectral fingerprint of chatter, limit-cycling, and
+incipient instability. On a torque-controlled arm this is conventionally
+detected on the commanded torque; lacking torque telemetry, we apply the same
+analysis to $e_i[k]$, which carries the same information because closed-loop
+oscillation manifests as periodic error around the setpoint.
+
+Let $S_{e_i}(\omega, k)$ denote the Welch power spectral density estimate of
+$e_i$ computed on $\mathcal{W}[k]$, with crossover frequency $\omega_h$:
+\begin{equation}
+    \rho_i^{\mathrm{HF}}[k]
+    \;=\;
+    \frac{\displaystyle \int_{\omega_h}^{\omega_{\mathrm{Nyq}}} S_{e_i}(\omega, k)\, d\omega}{\displaystyle \int_{0}^{\omega_{\mathrm{Nyq}}} S_{e_i}(\omega, k)\, d\omega}.
+\end{equation}
+The aggregate is the worst-joint ratio,
+\begin{equation}
+    \rho^{\mathrm{HF}}[k] \;=\; \max_{i \in \{1,\ldots,6\}} \rho_i^{\mathrm{HF}}[k].
+\end{equation}
+For SO-101 we use $\omega_h = 5$~Hz and $\omega_{\mathrm{Nyq}} = 15$~Hz.
+Sustained $\rho^{\mathrm{HF}} > 0.2$ is a strong chatter indicator on
+arm-scale dynamics.
+
+\subsection{Stall Indicator and Joint-Limit Clipping}
+
+\textbf{Motivation.} On a torque-instrumented arm we would threshold the
+commanded torque against the motor's torque limit. Without that telemetry we
+detect saturation behaviourally: when the policy commands meaningful motion
+but the joint fails to move, the motor is effectively at its load limit. We
+combine this with a separate detector for action saturation against the
+calibrated joint range.
+
+Let $\delta_a^{(i)}, \delta_q^{(i)}$ be per-joint command and motion
+thresholds, calibrated as the 95th percentile of the corresponding magnitudes
+on a corpus of successful teacher rollouts. Over a short look-back of $M$
+samples, the instantaneous stall indicator is
+\begin{equation}
+    \sigma_i^{\mathrm{stall}}[k] \;=\; \mathbbm{1}\!\left[\; |a_i[k] - a_i[k-M]| > \delta_a^{(i)} \;\wedge\; |q_i[k] - q_i[k-M]| < \delta_q^{(i)} \;\right].
+\end{equation}
+With calibrated joint range $[a_i^{\min}, a_i^{\max}]$ and tolerance
+$\epsilon_i = 0.02 \cdot (a_i^{\max} - a_i^{\min})$, the clipping indicator is
+\begin{equation}
+    \sigma_i^{\mathrm{clip}}[k] \;=\; \mathbbm{1}\!\left[\; a_i[k] \le a_i^{\min} + \epsilon_i \;\vee\; a_i[k] \ge a_i^{\max} - \epsilon_i \;\right].
+\end{equation}
+The combined per-joint flag and its windowed aggregate are
+\begin{align}
+    \sigma_i[k] &\;=\; \sigma_i^{\mathrm{stall}}[k] \;\vee\; \sigma_i^{\mathrm{clip}}[k], \\
+    \bar{\sigma}[k] &\;=\; \frac{1}{N} \sum_{j \in \mathcal{W}[k]} \mathbbm{1}\!\left[\, \max_{i} \sigma_i[j] = 1 \,\right].
+\end{align}
+We use $M = 5$ ($\approx 167$~ms at 30~Hz), short enough to react to abrupt
+stalls but long enough to ignore single-frame quantisation jitter.
+
+\subsection{Combined Intervention Rule}
+
+We assemble the five sign-aligned signals (larger means worse) into a single
+monitor vector,
+\begin{equation}
+    \mathbf{m}[k] \;=\; \big[\, E^{\mathrm{RMS}}[k], \; J^{\mathrm{RMS}}[k], \; -\eta_{\mathrm{SPARC}}[k], \; \rho^{\mathrm{HF}}[k], \; \bar{\sigma}[k] \,\big]^\top \in \mathbb{R}^5.
+\end{equation}
+A threshold vector $\bm{\theta} \in \mathbb{R}^5$ is calibrated as the 95th
+percentile of each component over a held-out corpus of successful teacher
+rollouts. The any-of intervention rule fires when any single channel
+exceeds its threshold,
+\begin{equation}
+    \mathcal{I}^{\mathrm{any}}[k]
+    \;=\;
+    \mathbbm{1}\!\left[\, \exists\, \ell \in \{1,\ldots,5\} : m_\ell[k] > \theta_\ell \,\right],
+\end{equation}
+while the weighted-sum rule, with non-negative weights
+$\mathbf{w} \in \mathbb{R}_{\ge 0}^{5}$ and aggregate threshold
+$\theta_{\Sigma}$, integrates evidence across channels:
+\begin{equation}
+    \mathcal{I}^{\Sigma}[k]
+    \;=\;
+    \mathbbm{1}\!\left[\, \sum_{\ell=1}^{5} w_\ell \, \frac{m_\ell[k]}{\theta_\ell} > \theta_{\Sigma} \,\right].
+\end{equation}
+The any-of rule fires earlier and is easier to attribute when debugging; the
+weighted-sum rule is more robust to single-channel noise. To suppress
+single-frame artefacts, we additionally require the chosen rule to remain
+active for $P$ consecutive samples before triggering an intervention,
+\begin{equation}
+    \mathcal{I}^{\star}[k] \;=\; \prod_{p = 0}^{P-1} \mathcal{I}[k - p],
+\end{equation}
+with $P = 3$ at 30~Hz ($\approx 100$~ms persistence).
+
+\paragraph{Optional extension.} If \texttt{Present\_Load} or
+\texttt{Present\_Current} is added to the recorded observation features by
+extending the LeRobot \texttt{Robot} interface, the stall indicator
+$\sigma_i^{\mathrm{stall}}$ can be replaced by the conventional torque
+saturation rate, and the high-frequency power ratio can be recomputed on the
+load signal directly, recovering the full classical signal set without
+modifying the rest of the pipeline.
