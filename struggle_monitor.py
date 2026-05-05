@@ -681,15 +681,17 @@ class LiveStruggleMonitor:
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
         ema_alpha: float = 0.4,
+        median_window: int = 3,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
         self._client         = genai.Client(api_key=load_api_key(key_file))
         self._model          = model
         self._check_interval = check_interval
-        self._n_sample       = n_sample_frames
+        self._n_sample       = int(n_sample_frames)
         self._threshold      = interrupt_threshold
         self._ema_alpha      = ema_alpha
+        self._median_window  = max(1, int(median_window))
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
 
@@ -702,6 +704,7 @@ class LiveStruggleMonitor:
         self._signal: dict          = _DEFAULT_SIGNAL.copy()
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
         self._struggle_score: float = 0.0
+        self._p_history: list       = []   # last 3 raw p values for median filter
         self._stop_event            = threading.Event()
         self._transfer_active       = threading.Event()
         self._transfer_epoch: int   = 0
@@ -711,6 +714,7 @@ class LiveStruggleMonitor:
 
         self._state_tracker: EpisodeStateTracker = EpisodeStateTracker()
         self._episode_start: float               = time.time()
+        self._last_check_t: float                = 0.0   # wall time of last Gemini assessment
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -768,6 +772,7 @@ class LiveStruggleMonitor:
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
+        self._p_history      = []
         self._state_tracker.reset()
         self._episode_start  = time.time()
 
@@ -790,6 +795,19 @@ class LiveStruggleMonitor:
     def transfer_active(self) -> bool:
         """True while a policy transfer is in progress."""
         return self._transfer_active.is_set()
+
+    @property
+    def buf_len(self) -> int:
+        """Number of frames currently in the rolling buffer."""
+        with self._lock:
+            return len(self._buffer)
+
+    @property
+    def secs_since_last_check(self) -> float:
+        """Seconds elapsed since the last completed Gemini assessment (0 if never)."""
+        if self._last_check_t == 0.0:
+            return 0.0
+        return time.time() - self._last_check_t
 
     def start(self) -> None:
         """Start the background Gemini monitoring thread."""
@@ -876,7 +894,15 @@ class LiveStruggleMonitor:
                     # Discard if a transfer started while the panel was running.
                     if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
                         self._interrupt = result
-                        p = float(result["interrupt_probability"])
+                        self._last_check_t = time.time()
+                        p_raw = float(result["interrupt_probability"])
+                        # Rolling median over last N calls — kills isolated spikes.
+                        # A single bad call (p=0.70 among [0.10, 0.10]) gives median=0.10
+                        # so EMA only rises when multiple consecutive calls agree.
+                        self._p_history.append(p_raw)
+                        if len(self._p_history) > self._median_window:
+                            self._p_history.pop(0)
+                        p = sorted(self._p_history)[len(self._p_history) // 2]
                         self._struggle_score = (
                             self._ema_alpha * p
                             + (1 - self._ema_alpha) * self._struggle_score
@@ -888,7 +914,7 @@ class LiveStruggleMonitor:
                             f"[StruggleMonitor] {status}"
                             f"  t={ep_elapsed:.0f}s"
                             f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
-                            f"  p={p:.2f}  ema={self._struggle_score:.2f}"
+                            f"  p={p_raw:.2f}→med={p:.2f}  ema={self._struggle_score:.2f}"
                             f"  picks={result['pickup_attempts']}"
                             f"  drops={result['drop_attempts']}"
                             f"  done={result.get('task_accomplished', False)}"

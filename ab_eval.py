@@ -460,26 +460,54 @@ def _live_display_loop(
     stats_queue=None,           # multiprocessing.Queue to the GUI process
     window_name: str = "A/B Live Eval",
 ) -> None:
-    """Push stats to the isolated GUI process every 0.5 s.
+    """Print live stats to terminal every second; push to GUI every 0.5 s."""
+    _gui_interval   = 0.5   # seconds between GUI pushes
+    _print_interval = 1.0   # seconds between terminal prints
+    _last_gui_push  = 0.0
+    _last_print     = 0.0
 
-    No cv2, no rerun — just a dict into the queue.  The GUI process does all
-    rendering independently so this thread is near-zero overhead.
-    """
     while not stop_evt.is_set():
-        if stats_queue is not None and not monitor.transfer_active:
-            intr = monitor.get_interrupt()
+        now   = _time.monotonic()
+        intr  = monitor.get_interrupt()
+        ema   = monitor.get_struggle_score()
+        prob  = intr.get("interrupt_probability", 0.0)
+        picks = intr.get("pickup_attempts", 0)
+        drops = intr.get("drop_attempts", 0)
+        label = label_ref[0]
+        status = "STRUGGLING" if ema >= interrupt_threshold else "ok"
+
+        # Print a new line to terminal every _print_interval seconds
+        if now - _last_print >= _print_interval:
+            t = _time.strftime("%H:%M:%S")
+            bar_filled = int(ema / max(interrupt_threshold, 1e-6) * 20)
+            bar = "#" * min(bar_filled, 20) + "-" * max(20 - bar_filled, 0)
+            buf   = monitor.buf_len
+            age   = monitor.secs_since_last_check
+            age_s = f"{age:.0f}s ago" if age > 0 else "no check yet"
+            print(
+                f"[{t}] policy={label}  [{bar}] ema={ema:.3f}/{interrupt_threshold:.2f}"
+                f"  p={prob:.3f}  picks={picks}  drops={drops}"
+                f"  buf={buf}fr  last_check={age_s}  {status}",
+                flush=True,
+            )
+            _last_print = now
+
+        # Push to GUI at its own rate
+        if stats_queue is not None and not monitor.transfer_active and (now - _last_gui_push) >= _gui_interval:
             try:
                 stats_queue.put_nowait({
-                    "label":     label_ref[0],
-                    "ema":       monitor.get_struggle_score(),
+                    "label":     label,
+                    "ema":       ema,
                     "threshold": interrupt_threshold,
-                    "prob":      intr.get("interrupt_probability", 0.0),
-                    "picks":     intr.get("pickup_attempts", 0),
-                    "drops":     intr.get("drop_attempts", 0),
+                    "prob":      prob,
+                    "picks":     picks,
+                    "drops":     drops,
                 })
+                _last_gui_push = now
             except Exception:
                 pass   # queue full — GUI subprocess hasn't drained yet, skip
-        stop_evt.wait(0.5)
+
+        stop_evt.wait(0.1)
 
 
 class _MonitorFeedingRobot:
@@ -559,6 +587,9 @@ def do_ab_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
+    struggle_model="gemini-2.5-flash",
+    struggle_n_frames=12,
+    struggle_median=3,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -816,9 +847,11 @@ def do_ab_eval(
         from struggle_monitor import LiveStruggleMonitor
         monitor = LiveStruggleMonitor(
             key_file=struggle_key_file,
-            model="gemini-2.5-flash",
+            model=struggle_model,
             check_interval=struggle_check_interval,
             interrupt_threshold=struggle_threshold,
+            n_sample_frames=struggle_n_frames,
+            median_window=struggle_median,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
