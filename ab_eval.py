@@ -832,14 +832,6 @@ def do_ab_eval(
                             except Exception:
                                 pass
 
-                    # Per-episode watcher thread: ends episode early if struggling.
-                    watcher_stop = threading.Event()
-                    if monitor:
-                        watcher = threading.Thread(
-                            target=_struggle_watcher, args=(watcher_stop,), daemon=True
-                        )
-                        watcher.start()
-
                     # ── GO HOME (skipped after q) ──────────────────────────────
                     # Normally the arm returns home so every episode starts from
                     # the same known pose. If the previous episode ended with 'q',
@@ -853,6 +845,17 @@ def do_ab_eval(
 
                     print(f"\n  Episode {i + 1}/{num_episodes} — "
                           f"Policy {label} (ep {counts[label]} for {label})")
+
+                    # Per-episode watcher thread: ends episode early if struggling.
+                    # Started AFTER go_home so stale frames in the rolling buffer
+                    # (from the previous episode) don't trigger a false positive
+                    # while the arm is returning home.
+                    watcher_stop = threading.Event()
+                    if monitor:
+                        watcher = threading.Thread(
+                            target=_struggle_watcher, args=(watcher_stop,), daemon=True
+                        )
+                        watcher.start()
 
                     # ── RUN EPISODE ───────────────────────────────────────────
                     # record_loop runs at 30 Hz: read obs -> policy forward pass

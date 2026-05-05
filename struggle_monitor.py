@@ -667,7 +667,16 @@ class LiveStruggleMonitor:
         return self._state_tracker.get_state()
 
     def reset_signal(self) -> None:
-        """Clear all signals, EMA score, and episode state. Call at the start of each episode."""
+        """Clear all signals, EMA score, frame buffer, and episode state.
+
+        Call at the start of each episode. Clearing the frame buffer prevents
+        stale frames from the previous episode being used in the first Gemini
+        call of the new episode (which would cause false-positive interrupts).
+        """
+        with self._lock:
+            self._buffer.clear()
+            self._action_buf.clear()
+            self._state_buf.clear()
         self._signal         = _DEFAULT_SIGNAL.copy()
         self._interrupt      = _DEFAULT_INTERRUPT.copy()
         self._struggle_score = 0.0
