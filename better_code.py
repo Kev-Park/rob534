@@ -316,7 +316,7 @@ def do_smol_vla_eval(
             key_file=struggle_key_file,
             model="gemini-2.5-flash",
             check_interval=struggle_check_interval,
-            struggle_threshold=struggle_threshold,
+            interrupt_threshold=struggle_threshold,
         )
         monitor.start()
         monitor.start_capture(camera_index=1)
