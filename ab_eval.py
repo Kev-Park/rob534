@@ -522,11 +522,126 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
 
     _redraw_chart(0.0, 0.6)
 
+    # ── Per-channel metrics window ─────────────────────────────────────────────
+    _CHANNELS = ("E_RMS", "J_RMS", "neg_SPARC", "rho_HF", "sigma_bar")
+    MCW       = 310   # mini-chart canvas width
+    MCH       = 58    # mini-chart canvas height
+    MC_PAD_L  = 26
+    MC_PAD_R  = 4
+    MC_PAD_T  = 4
+    MC_PAD_B  = 4
+    MC_PLOT_W = MCW - MC_PAD_L - MC_PAD_R
+    MC_PLOT_H = MCH - MC_PAD_T  - MC_PAD_B
+    MC_Y_MAX  = 1.25  # y-axis ceiling (ratio is [0,1]; extra headroom for spikes)
+
+    metrics_win = tk.Toplevel(root)
+    metrics_win.title("Channel Metrics")
+    metrics_win.configure(bg=BG)
+    metrics_win.geometry("360x470+415+0")
+    metrics_win.resizable(False, False)
+    metrics_win.attributes("-topmost", True)
+
+    tk.Label(metrics_win, text="CHANNEL METRICS  (m / θ)",
+             bg=BG, fg="#aaaaaa", font=("Consolas", 9)).pack(pady=(8, 2))
+
+    ch_histories:       dict = {ch: collections.deque(maxlen=MAX_PTS) for ch in _CHANNELS}
+    ch_label_histories: dict = {ch: collections.deque(maxlen=MAX_PTS) for ch in _CHANNELS}
+    ch_canvases:        dict = {}
+    ch_val_vars:        dict = {}
+
+    def _ratio_to_y(r):
+        frac = max(0.0, min(r / MC_Y_MAX, 1.0))
+        return MC_PAD_T + (1.0 - frac) * MC_PLOT_H
+
+    def _mc_x(i, n):
+        return MC_PAD_L + (i / max(n - 1, 1)) * MC_PLOT_W
+
+    for _ch in _CHANNELS:
+        _fr = tk.Frame(metrics_win, bg=BG)
+        _fr.pack(fill=tk.X, padx=10, pady=(3, 0))
+        _hdr = tk.Frame(_fr, bg=BG)
+        _hdr.pack(fill=tk.X)
+        tk.Label(_hdr, text=_ch, bg=BG, fg="#aaaaaa",
+                 font=("Consolas", 8, "bold"), width=11, anchor="w").pack(side=tk.LEFT)
+        _vv = tk.StringVar(value="--")
+        ch_val_vars[_ch] = _vv
+        tk.Label(_hdr, textvariable=_vv, bg=BG, fg=FG,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        _cv = tk.Canvas(_fr, width=MCW, height=MCH,
+                        bg="#0d1117", highlightthickness=1,
+                        highlightbackground="#333333")
+        _cv.pack()
+        ch_canvases[_ch] = _cv
+        # Y-axis labels and grid
+        for _v, _t in ((0.0, "0"), (0.5, ".5"), (1.0, "1")):
+            _yy = _ratio_to_y(_v)
+            _cv.create_text(MC_PAD_L - 3, _yy, text=_t, anchor="e",
+                            fill="#555566", font=("Consolas", 6))
+        for _v in (0.25, 0.5, 0.75):
+            _cv.create_line(MC_PAD_L, _ratio_to_y(_v),
+                            MC_PAD_L + MC_PLOT_W, _ratio_to_y(_v),
+                            fill="#1a2030", width=1)
+        # P95 threshold line at ratio = 1.0
+        _y1 = _ratio_to_y(1.0)
+        _cv.create_line(MC_PAD_L, _y1, MC_PAD_L + MC_PLOT_W, _y1,
+                        fill="#ff8800", width=1, dash=(4, 3))
+
+    def _redraw_channels(ratios: dict, label: str):
+        counter = _chart_state["counter"]
+        for ch in _CHANNELS:
+            ratio = ratios.get(ch, 0.0)
+            ch_histories[ch].append(ratio)
+            ch_label_histories[ch].append(label)
+            ch_val_vars[ch].set(f"{ratio:.3f}")
+            cv_ch = ch_canvases[ch]
+            cv_ch.delete("mc_plot")
+            hist  = ch_histories[ch]
+            lhist = ch_label_histories[ch]
+            n = len(hist)
+            if n < 2:
+                continue
+            # Segmented line by policy color
+            seg_pts:   list = []
+            seg_lbl:   str | None = None
+            for i, (v, lbl) in enumerate(zip(hist, lhist)):
+                x, y = _mc_x(i, n), _ratio_to_y(v)
+                if lbl != seg_lbl:
+                    if len(seg_pts) >= 4:
+                        cv_ch.create_line(*seg_pts,
+                                          fill=_POLICY_COLOR.get(seg_lbl, "#00ffff"),
+                                          width=1, smooth=True, tags="mc_plot")
+                    seg_pts = ([seg_pts[-2], seg_pts[-1]] if seg_pts else []) + [x, y]
+                    seg_lbl = lbl
+                else:
+                    seg_pts += [x, y]
+            if len(seg_pts) >= 4:
+                cv_ch.create_line(*seg_pts,
+                                  fill=_POLICY_COLOR.get(seg_lbl, "#00ffff"),
+                                  width=1, smooth=True, tags="mc_plot")
+            # Tip dot
+            cx, cy = _mc_x(n - 1, n), _ratio_to_y(ratio)
+            cv_ch.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
+                              fill=_POLICY_COLOR.get(label, "#00ffff"),
+                              outline="", tags="mc_plot")
+            # Switch markers (shared with main chart via switch_markers list)
+            for sc in switch_markers:
+                idx = n - 1 - (counter - sc)
+                if 0 <= idx < n:
+                    sx = _mc_x(idx, n)
+                    cv_ch.create_line(sx, MC_PAD_T, sx, MC_PAD_T + MC_PLOT_H,
+                                      fill="#ffdd00", width=1, dash=(2, 2),
+                                      tags="mc_plot")
+
     def _reset_display():
         """Clear chart history, switch markers, and all text widgets."""
         ema_history.clear()
         label_history.clear()
         switch_markers.clear()
+        for ch in _CHANNELS:
+            ch_histories[ch].clear()
+            ch_label_histories[ch].clear()
+            ch_canvases[ch].delete("mc_plot")
+            ch_val_vars[ch].set("--")
         _chart_state["counter"] = 0
         cv.delete("ema_plot")
         v_timer.set("0:00")
@@ -579,6 +694,7 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                 thr = data.get("threshold", 0.6)
                 struggling = ema >= thr
                 _redraw_chart(ema, thr, label)
+                _redraw_channels(data.get("ratios", {}), label)
                 ep_s = data.get("ep_elapsed", 0.0)
                 mins, secs = divmod(int(ep_s), 60)
                 v_timer.set(f"{mins}:{secs:02d}")
