@@ -1211,6 +1211,7 @@ def do_ab_eval(
                                     pass
                             monitor.pause_for_transfer()
                             monitor.reset_signal(keep_timer=True)
+                            monitor.resume_from_transfer()  # allow S+GUI updates during B's run
                         _t0 = _time.perf_counter()
                         record_loop(
                             robot=robot,
