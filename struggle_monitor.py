@@ -115,7 +115,7 @@ def compute_struggle_score(
     states: np.ndarray,
     thresholds: Thresholds | None = None,
     cfg: Config | None = None,
-    score_mode: str = "max",
+    score_mode: str = "mean",
 ) -> dict:
     """Compute a struggle score from buffered actions/states using calibrated metrics.
 
@@ -171,14 +171,17 @@ def compute_struggle_score(
         theta_i = thresholds.theta[i]
         thetas[ch_name] = float(theta_i)
         if ch_name == "sigma_bar":
-            # theta=0 by design; display ratio is binary but S uses the raw value.
+            # sigma_bar cannot be normalised (theta=0 by design — any stall is a
+            # violation). Use the raw windowed stall rate, which is already in [0, 1].
             ratios[ch_name] = 1.0 if val > 0 else 0.0
             scores[ch_name] = val
         elif theta_i > 0:
-            ratios[ch_name] = val / theta_i
-            scores[ch_name] = val / theta_i
+            # Normalise by P95 calibration threshold, then clip to [0, 1] so every
+            # channel contributes equally to the mean regardless of scale.
+            normalised = min(val / theta_i, 1.0)
+            ratios[ch_name] = normalised
+            scores[ch_name] = normalised
         else:
-            # Shouldn't happen for other channels, but guard against it
             ratios[ch_name] = 0.0
             scores[ch_name] = 0.0
 
@@ -192,7 +195,7 @@ def compute_struggle_score_series(
     states: np.ndarray,
     thresholds: Thresholds | None = None,
     cfg: Config | None = None,
-    score_mode: str = "max",
+    score_mode: str = "mean",
 ) -> np.ndarray:
     """Compute a time-series of S values over an episode using the same
     normalization logic as :func:`compute_struggle_score`.
@@ -228,11 +231,13 @@ def compute_struggle_score_series(
         arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
         theta_i = thresholds.theta[i]
         if ch_name == "sigma_bar":
-            # Mirror compute_struggle_score: S uses the raw stall rate, not binary.
+            # Raw stall rate — already in [0, 1], theta=0 by design.
             score_matrix[i] = arr
         elif theta_i > 0:
-            score_matrix[i] = arr / theta_i
-        # else: leave as NaN (theta_i == 0 for non-sigma_bar would be a calibration bug)
+            # Normalise by P95 threshold then clip to [0, 1], matching
+            # the scalar compute_struggle_score() logic.
+            score_matrix[i] = np.clip(arr / theta_i, 0.0, 1.0)
+        # else: leave as NaN (theta_i == 0 for non-sigma_bar = calibration bug)
 
     # NaN in any channel at time t means the metric hadn't warmed up yet;
     # preserve those NaNs so the caller can skip warmup windows.
