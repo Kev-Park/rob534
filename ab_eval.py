@@ -1252,8 +1252,6 @@ def do_ab_eval(
                                         "votes":     _peak_intr.get("votes", []),
                                     })
                                     stats_queue.put_nowait({"switch_marker": True})
-                                    # Delayed reset — keep the marker visible for 1.5 s
-                                    stats_queue.put_nowait({"reset": True, "delay_ms": 1500})
                                 except Exception:
                                     pass
                             monitor.pause_for_transfer()
