@@ -728,7 +728,8 @@ class LiveStruggleMonitor:
         n_sample_frames: int = 12,
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
-        score_mode: str = "max",
+        score_mode: str = "mean",
+        alpha_ramp_s: float = 10.0,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
@@ -738,6 +739,10 @@ class LiveStruggleMonitor:
         self._check_interval = check_interval
         self._n_sample       = int(n_sample_frames)
         self._threshold      = interrupt_threshold
+        # alpha_ramp_s > 0: linearly ramp alpha 0→1 over this many seconds so
+        # the monitor cannot trigger in the first few seconds of an episode.
+        # 0 disables the ramp (alpha = 1.0 always).
+        self._alpha_ramp_s   = max(0.0, alpha_ramp_s)
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
 
@@ -952,11 +957,16 @@ class LiveStruggleMonitor:
                     self._channel_values  = score_result["channels"]
                     self._channel_thetas  = score_result["thetas"]
                     ep_elapsed = time.time() - self._episode_start
+                    alpha_t = (
+                        min(ep_elapsed / self._alpha_ramp_s, 1.0)
+                        if self._alpha_ramp_s > 0 else 1.0
+                    )
 
-                    if S < self._threshold:
+                    if alpha_t * S < self._threshold:
                         print(
                             f"[StruggleMonitor] ok      t={ep_elapsed:.0f}s"
-                            f"  S={S:.2f} < {self._threshold}  (skipping Gemini)"
+                            f"  alpha={alpha_t:.2f}  S={S:.2f}"
+                            f"  scaled={alpha_t * S:.2f} < {self._threshold}  (skipping Gemini)"
                         )
                     else:
                         frames = self._subsample(buf, self._n_sample)
@@ -1541,8 +1551,10 @@ if __name__ == "__main__":
     p_live.add_argument("--interval",  type=float, default=2.0)
     p_live.add_argument("--threshold", type=float, default=0.5,
                         help="S score threshold above which is_struggling() fires")
-    p_live.add_argument("--score-mode", default="max", choices=list(_SCORE_MODES),
-                        help="Aggregation for S: max (default), mean, median, mode")
+    p_live.add_argument("--score-mode", default="mean", choices=list(_SCORE_MODES),
+                        help="Aggregation for S: mean (default), max, median, mode")
+    p_live.add_argument("--alpha-ramp", type=float, default=10.0,
+                        help="Seconds to ramp alpha 0→1; 0 disables ramp (alpha=1 always)")
 
     p_batch = sub.add_parser("batch", help="Run batch test on a full LeRobot dataset.")
     p_batch.add_argument("--dataset",      default="nc8304/eval_smolvla-phase-split_combined")
@@ -1557,8 +1569,10 @@ if __name__ == "__main__":
                          help="If set, render 3-panel interrupt videos here.")
     p_batch.add_argument("--max-episodes", type=int, default=None,
                          help="Stop after this many episodes.")
-    p_batch.add_argument("--score-mode", default="max", choices=list(_SCORE_MODES),
-                         help="Aggregation for S: max (default), mean, median, mode")
+    p_batch.add_argument("--score-mode", default="mean", choices=list(_SCORE_MODES),
+                         help="Aggregation for S: mean (default), max, median, mode")
+    p_batch.add_argument("--alpha-ramp", type=float, default=10.0,
+                         help="Seconds to ramp alpha 0→1; 0 disables ramp (alpha=1 always)")
 
     args = parser.parse_args()
 
@@ -1574,6 +1588,7 @@ if __name__ == "__main__":
             check_interval=args.interval,
             interrupt_threshold=args.threshold,
             score_mode=args.score_mode,
+            alpha_ramp_s=args.alpha_ramp,
         )
         monitor.start()
 
