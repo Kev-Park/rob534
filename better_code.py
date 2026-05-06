@@ -451,8 +451,11 @@ if __name__ == "__main__":
     parser.add_argument("--model",           type=str,   default="gemini-2.5-pro",   help="Gemini model for struggle monitor (default gemini-2.5-pro)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
-    parser.add_argument("--score-mode",      type=str,   default="mean", choices=["max", "mean", "median", "mode"],
-                        help="How to aggregate channel scores into S (default: mean)")
+    parser.add_argument("--score-mode",      type=str,   default="mean",
+                        help="How to aggregate channel scores into S: max | mean | median | mode | "
+                             "weighted:Ch=w,Ch=w,...  e.g. 'weighted:sigma_bar=3,E_RMS=2'. "
+                             "Channels: E_RMS J_RMS neg_SPARC rho_HF sigma_bar. "
+                             "Unspecified channels default to weight 1. (default: mean)")
     parser.add_argument("--judges",          type=float, nargs="+",
                         default=[0.10, 0.40, 0.70],
                         help="Judge temperatures — one float per judge, e.g. --judges 0.1 0.4 0.7  (default: 3 judges)")
@@ -568,7 +571,7 @@ if __name__ == "__main__":
         episode_time_s=60,
         use_struggle_monitor=True,
         auto_switch=True,
-        struggle_threshold=0.55,
+        struggle_threshold=0.6,
         struggle_check_interval=args.interval,
         struggle_model="gemini-2.5-pro",
         struggle_n_frames=args.frames,

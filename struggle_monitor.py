@@ -86,14 +86,24 @@ def _get_pooled_thresholds() -> Thresholds:
 
 
 _SCORE_MODES = ("max", "mean", "median", "mode")
+# Weighted mode is also supported via the string "weighted:<spec>" where
+# <spec> is a comma-separated list of  ChannelName=multiplier  pairs.
+# Channels not mentioned default to multiplier 1.  Examples:
+#   "weighted:sigma_bar=3,E_RMS=2"
+#   "weighted:J_RMS=0.5,neg_SPARC=0,rho_HF=0"  (focus on jerk only)
+# Channel names (in order): E_RMS, J_RMS, neg_SPARC, rho_HF, sigma_bar
 
 
 def _aggregate_scores(scores: list[float], mode: str) -> float:
     """Aggregate a list of per-channel scores into a single S value.
 
     Args:
-        scores: Per-channel contribution values (already normalized or raw).
-        mode:   One of "max", "mean", "median", "mode".
+        scores: Per-channel contribution values (already normalized or raw),
+                in M_CHANNELS order.
+        mode:   "max", "mean", "median", "mode", or "weighted:<spec>".
+                Weighted spec: comma-separated ChannelName=multiplier pairs;
+                missing channels default to 1.  Multipliers are normalized
+                to sum to 1 before computing the weighted mean.
 
     Returns:
         Scalar S value.
@@ -107,6 +117,22 @@ def _aggregate_scores(scores: list[float], mode: str) -> float:
     if mode == "mode":
         # Round to 2 dp to create discrete buckets for continuous values
         return float(_stats.mode(round(s, 2) for s in scores))
+    if mode.startswith("weighted:"):
+        weights = [1.0] * len(scores)
+        for part in mode[len("weighted:"):].split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            ch_name, w_str = part.split("=", 1)
+            ch_name = ch_name.strip()
+            try:
+                idx = list(M_CHANNELS).index(ch_name)
+                if idx < len(weights):
+                    weights[idx] = max(0.0, float(w_str.strip()))
+            except (ValueError, IndexError):
+                pass  # unknown channel — silently ignore
+        total_w = sum(weights) or 1.0
+        return sum(s * w for s, w in zip(scores, weights)) / total_w
     return max(scores)   # "max" (default)
 
 
