@@ -746,7 +746,9 @@ class LiveStruggleMonitor:
         temperatures: tuple[float, ...] | list[float] | None = None,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
+        thresholds: "Thresholds | None" = None,
     ):
+        self._thresholds     = thresholds   # None → pooled.json inside compute_struggle_score
         self._client         = genai.Client(api_key=load_api_key(key_file))
         self._score_mode     = score_mode
         self._model          = model
@@ -851,6 +853,14 @@ class LiveStruggleMonitor:
     def get_episode_state(self) -> EpisodeState:
         """Return the accumulated episode state summary (safe to call at any time)."""
         return self._state_tracker.get_state()
+
+    def set_thresholds(self, thresholds: "Thresholds | None") -> None:
+        """Swap the calibration thresholds used for S normalization.
+
+        Safe to call from any thread — Python's GIL makes the attribute
+        assignment atomic.  Pass None to fall back to pooled.json.
+        """
+        self._thresholds = thresholds
 
     def reset_signal(self, keep_timer: bool = False) -> None:
         """Clear all signals, EMA score, frame buffer, and episode state.
@@ -996,7 +1006,7 @@ class LiveStruggleMonitor:
                         self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
                         continue
 
-                    score_result = compute_struggle_score(actions, states, score_mode=self._score_mode)
+                    score_result = compute_struggle_score(actions, states, thresholds=self._thresholds, score_mode=self._score_mode)
                     S = score_result["S"]
                     self._struggle_score  = S
                     self._channel_ratios  = score_result["ratios"]

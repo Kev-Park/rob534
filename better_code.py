@@ -557,6 +557,7 @@ if __name__ == "__main__":
     # ── Live A/B eval on real robot ───────────────────────────────────────────
     from ab_eval import do_ab_eval
 
+    _THRESHOLDS = _BASE / "thresholds"
     do_ab_eval(
         policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
         policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
@@ -564,16 +565,18 @@ if __name__ == "__main__":
         repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
         single_task=args.task,
         num_episodes=args.episodes,
-        episode_time_s=90,
+        episode_time_s=60,
         use_struggle_monitor=True,
         auto_switch=True,
-        struggle_threshold=0.6,
+        struggle_threshold=0.55,
         struggle_check_interval=args.interval,
-        struggle_model="gemini-2.5-flash",
+        struggle_model="gemini-2.5-pro",
         struggle_n_frames=args.frames,
         struggle_score_mode=args.score_mode,
         struggle_warmup_s=10.0,
-        struggle_temperatures=[0.1,0.2,0.3],
+        struggle_temperatures=[0,0.1,0.1],
+        struggle_thresholds_a=str(_THRESHOLDS / "eval_smolvla-aug.json"),
+        struggle_thresholds_b=str(_THRESHOLDS / "eval_smolvla-phase-split-new-prompts.json"),
         switch_duration=0,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )

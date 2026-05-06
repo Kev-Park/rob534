@@ -767,6 +767,8 @@ def do_ab_eval(
     struggle_score_mode="mean",
     struggle_warmup_s=10.0,
     struggle_temperatures=None,
+    struggle_thresholds_a=None,
+    struggle_thresholds_b=None,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -1022,6 +1024,17 @@ def do_ab_eval(
     current_label = "A"         # start on A; 'q' flips this each time
 
     # ── Struggle monitor (optional) ───────────────────────────────────────────
+    # Load per-policy threshold objects once at startup.  Paths may be None
+    # (falls back to pooled.json inside compute_struggle_score) or a str path.
+    def _load_thresholds(path):
+        if path is None:
+            return None
+        from struggle_monitor import Thresholds
+        return Thresholds.load(path)
+
+    _thresholds_a = _load_thresholds(struggle_thresholds_a)
+    _thresholds_b = _load_thresholds(struggle_thresholds_b)
+
     monitor = None
     if use_struggle_monitor:
         from struggle_monitor import LiveStruggleMonitor
@@ -1034,6 +1047,7 @@ def do_ab_eval(
             score_mode=struggle_score_mode,
             warmup_s=struggle_warmup_s,
             temperatures=struggle_temperatures,
+            thresholds=_thresholds_a,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
@@ -1188,6 +1202,8 @@ def do_ab_eval(
                         print(f"\n  [AutoSwitch] Policy B intervening for {b_time_s:.0f}s "
                               f"from current position...")
                         label_ref[0] = "B"
+                        if monitor:
+                            monitor.set_thresholds(_thresholds_b)
                         events["exit_early"]    = False
                         events["auto_switched"] = False
                         if monitor:
@@ -1231,6 +1247,7 @@ def do_ab_eval(
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
                         label_ref[0] = "A"   # display resets for next episode
                         if monitor:
+                            monitor.set_thresholds(_thresholds_a)
                             monitor.resume_from_transfer()
                             b_ep_state = monitor.get_episode_state()
                             print(f"  [EpisodeState B] {b_ep_state}")
@@ -1308,6 +1325,8 @@ def do_ab_eval(
                     if events["switch_policy"]:
                         current_label = "B" if current_label == "A" else "A"
                         label_ref[0]  = current_label
+                        if monitor:
+                            monitor.set_thresholds(_thresholds_b if current_label == "B" else _thresholds_a)
                         print(f"  Now on Policy {current_label}.")
                     elif events.get("auto_switched"):
                         current_label = "B" if current_label == "A" else "A"
