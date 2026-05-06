@@ -1,0 +1,4 @@
+model,n_episodes,n_labeled,n_success,success_rate,gripper_det_rate,S_min,S_max,S_mean,S_std,S_median,S_p95,S_mean_success,S_mean_failure,pickup_time_mean_s,pickup_time_std_s,pickup_time_min_s,pickup_time_max_s,drop_time_mean_s,drop_time_std_s,hold_time_mean_s,hold_time_std_s,hold_time_min_s,hold_time_max_s
+phase-split combined,50,50,20,0.4,0.96,0.6893,3.3393,0.9943,0.0269,1.0,1.0411,0.9849,1.0005,8.997,5.059,4.467,21.933,19.63,6.849,10.633,5.402,2.7,33.133
+aug,41,41,1,0.024,1.0,0.7655,2.7172,1.0652,0.0293,1.0,1.1144,1.0629,1.0652,15.003,6.588,2.7,31.167,22.827,6.816,7.824,3.049,3.0,14.867
+phase-split new-prompts,50,50,21,0.42,0.84,0.6774,2.5533,0.9975,0.0344,1.0,1.0497,1.0101,0.9884,9.152,6.274,2.8,30.033,18.929,9.666,9.778,7.14,0.133,31.133
