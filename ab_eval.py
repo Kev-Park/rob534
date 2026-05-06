@@ -1277,7 +1277,10 @@ def do_ab_eval(
                             display_data=True,
                         )
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
-                        label_ref[0] = "A"   # display resets for next episode
+                        # Keep label_ref as "B" until the next episode iteration
+                        # sets it to "A" together with reset_signal + chart reset.
+                        # Flipping early makes the display loop push cyan (A) with
+                        # B's stale S value → flat ghost line after episode ends.
                         if monitor:
                             monitor.suppress_judges(False)  # re-enable for next A episode
                             monitor.set_thresholds(_thresholds_a)
