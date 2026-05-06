@@ -575,7 +575,7 @@ if __name__ == "__main__":
         struggle_check_interval=args.interval,
         struggle_model="gemini-2.5-pro",
         struggle_n_frames=args.frames,
-        struggle_score_mode=args.score_mode,
+        struggle_score_mode="weighted:E_RMS=1,J_RMS=2,neg_SPARC=1,rho_HF=1,sigma_bar=2",   #args.score_mode,
         struggle_warmup_s=10.0,
         struggle_temperatures=[0,0.1,0.1],
         struggle_thresholds_a=str(_THRESHOLDS / "eval_smolvla-aug.json"),
