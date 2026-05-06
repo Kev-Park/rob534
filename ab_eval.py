@@ -590,6 +590,11 @@ def _live_display_loop(
     _print_interval = 1.0   # seconds between terminal prints
     _last_gui_push  = 0.0
     _last_print     = 0.0
+    # Last non-empty channel data — kept across resets so the GUI doesn't go
+    # blank during the brief window after a policy switch clears the monitor.
+    _cached_ratios: dict = {}
+    _cached_values: dict = {}
+    _cached_thetas: dict = {}
 
     while not stop_evt.is_set():
         now     = _time.monotonic()
@@ -598,9 +603,18 @@ def _live_display_loop(
         import math as _math
         if _math.isnan(ema) or _math.isinf(ema):
             ema = 0.0
-        ratios  = monitor.get_channel_ratios()
-        values  = monitor.get_channel_values()
-        thetas  = monitor.get_channel_thetas()
+        _r = monitor.get_channel_ratios()
+        _v = monitor.get_channel_values()
+        _t = monitor.get_channel_thetas()
+        if _r:
+            _cached_ratios = _r
+        if _v:
+            _cached_values = _v
+        if _t:
+            _cached_thetas = _t
+        ratios = _cached_ratios
+        values = _cached_values
+        thetas = _cached_thetas
         prob    = intr.get("interrupt_probability", 0.0)
         votes   = intr.get("votes", [])
         label   = label_ref[0]
@@ -1196,7 +1210,7 @@ def do_ab_eval(
                                 except Exception:
                                     pass
                             monitor.pause_for_transfer()
-                            monitor.reset_signal()
+                            monitor.reset_signal(keep_timer=True)
                         _t0 = _time.perf_counter()
                         record_loop(
                             robot=robot,

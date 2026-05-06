@@ -771,6 +771,9 @@ class LiveStruggleMonitor:
         self._action_buf: deque = deque(maxlen=buffer_size)
         self._state_buf: deque  = deque(maxlen=buffer_size)
         self._lock              = threading.Lock()
+        # Flag to prevent overlapping Gemini calls — set True when a panel
+        # call is in-flight, cleared when it completes or errors.
+        self._gemini_in_flight: bool = False
 
         self._signal: dict          = _DEFAULT_SIGNAL.copy()
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
@@ -849,23 +852,28 @@ class LiveStruggleMonitor:
         """Return the accumulated episode state summary (safe to call at any time)."""
         return self._state_tracker.get_state()
 
-    def reset_signal(self) -> None:
+    def reset_signal(self, keep_timer: bool = False) -> None:
         """Clear all signals, EMA score, frame buffer, and episode state.
 
         Call at the start of each episode. Clearing the frame buffer prevents
         stale frames from the previous episode being used in the first Gemini
         call of the new episode (which would cause false-positive interrupts).
+
+        keep_timer: when True, preserve _episode_start so the GUI timer
+            continues uninterrupted across a mid-episode policy switch.
         """
         with self._lock:
             self._buffer.clear()
             self._action_buf.clear()
             self._state_buf.clear()
-        self._signal         = _DEFAULT_SIGNAL.copy()
-        self._interrupt      = _DEFAULT_INTERRUPT.copy()
-        self._struggle_score = 0.0
-        self._channel_ratios = {}
+        self._signal           = _DEFAULT_SIGNAL.copy()
+        self._interrupt        = _DEFAULT_INTERRUPT.copy()
+        self._struggle_score   = 0.0
+        self._channel_ratios   = {}
+        self._gemini_in_flight = False
         self._state_tracker.reset()
-        self._episode_start  = time.time()
+        if not keep_timer:
+            self._episode_start = time.time()
 
     def pause_for_transfer(self) -> None:
         """Suspend Gemini polling during a policy transfer and clear stale state.
@@ -1005,43 +1013,48 @@ class LiveStruggleMonitor:
                             f"  alpha={alpha_t:.2f}  S={S:.2f}"
                             f"  scaled={alpha_t * S:.2f} < {self._threshold}  (skipping Gemini)"
                         )
-                    else:
-                        frames = self._subsample(buf, self._n_sample)
+                    elif not self._gemini_in_flight:
+                        # Fire the panel asynchronously so _run never blocks on
+                        # Gemini. S checks continue every check_interval regardless
+                        # of how long the API takes to respond.
+                        frames         = self._subsample(buf, self._n_sample)
                         epoch_snapshot = self._transfer_epoch
-                        try:
-                            result = assess_interrupt_panel(
-                                frames, self._client, self._model,
-                                temperatures=self._temperatures,
-                            )
-                            # Discard if a transfer started while the panel was running.
-                            if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
-                                # Latch: once interrupt_probability crosses the threshold
-                                # never overwrite it with a lower value — prevents a
-                                # subsequent panel call from clearing a trigger before
-                                # the watcher thread has a chance to act on it.
-                                prev_p = self._interrupt.get("interrupt_probability", 0.0)
-                                new_p  = result.get("interrupt_probability", 0.0)
-                                if new_p >= prev_p or new_p >= self._threshold:
-                                    self._interrupt = result
-                                self._last_check_t = time.time()
-                                self._state_tracker.update(result, ep_elapsed)
-                                status = "INTERRUPT" if self.is_struggling() else "ok     "
-                                vote_str = " ".join(
-                                    f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
-                                    for v in result.get("votes", [])
+                        self._gemini_in_flight = True
+
+                        def _gemini_worker(frames=frames, epoch=epoch_snapshot,
+                                           S=S, ep_t=ep_elapsed):
+                            try:
+                                result = assess_interrupt_panel(
+                                    frames, self._client, self._model,
+                                    temperatures=self._temperatures,
                                 )
-                                p_raw = float(result["interrupt_probability"])
-                                print(
-                                    f"[StruggleMonitor] {status}"
-                                    f"  t={ep_elapsed:.0f}s"
-                                    f"  S={S:.2f}"
-                                    f"  votes={result['vote_count']}/{len(JUDGE_TEMPERATURES)}"
-                                    f"  [{vote_str}]"
-                                    f"  gemini_p={p_raw:.2f}"
-                                    f"  | {result['reason']}"
-                                )
-                        except Exception as e:
-                            print(f"[StruggleMonitor] Gemini error: {e}")
+                                if not self._transfer_active.is_set() and self._transfer_epoch == epoch:
+                                    prev_p = self._interrupt.get("interrupt_probability", 0.0)
+                                    new_p  = result.get("interrupt_probability", 0.0)
+                                    if new_p >= prev_p or new_p >= self._threshold:
+                                        self._interrupt = result
+                                    self._last_check_t = time.time()
+                                    self._state_tracker.update(result, ep_t)
+                                    status   = "INTERRUPT" if self.is_struggling() else "ok     "
+                                    vote_str = " ".join(
+                                        f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
+                                        for v in result.get("votes", [])
+                                    )
+                                    print(
+                                        f"[StruggleMonitor] {status}"
+                                        f"  t={ep_t:.0f}s"
+                                        f"  S={S:.2f}"
+                                        f"  votes={result['vote_count']}/{len(self._temperatures)}"
+                                        f"  [{vote_str}]"
+                                        f"  gemini_p={result['interrupt_probability']:.2f}"
+                                        f"  | {result['reason']}"
+                                    )
+                            except Exception as e:
+                                print(f"[StruggleMonitor] Gemini error: {e}")
+                            finally:
+                                self._gemini_in_flight = False
+
+                        threading.Thread(target=_gemini_worker, daemon=True).start()
 
             elapsed = time.time() - start
             self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
