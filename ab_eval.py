@@ -751,6 +751,7 @@ def do_ab_eval(
     struggle_model="gemini-pro",
     struggle_n_frames=12,
     struggle_score_mode="mean",
+    struggle_warmup_s=10.0,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -1016,6 +1017,7 @@ def do_ab_eval(
             interrupt_threshold=struggle_threshold,
             n_sample_frames=struggle_n_frames,
             score_mode=struggle_score_mode,
+            warmup_s=struggle_warmup_s,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor

@@ -198,6 +198,7 @@ def do_smol_vla_eval(
     struggle_key_file=r"C:\Users\calle\Desktop\gem.txt",
     struggle_check_interval=2.0,
     struggle_threshold=0.6,
+    struggle_warmup_s=10.0,
 ):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.configs.policies import PreTrainedConfig
@@ -329,6 +330,7 @@ def do_smol_vla_eval(
             model="gemini-2.5-flash",
             check_interval=struggle_check_interval,
             interrupt_threshold=struggle_threshold,
+            warmup_s=struggle_warmup_s,
         )
         monitor.start()
         monitor.start_capture(camera_index=1)
@@ -559,14 +561,15 @@ if __name__ == "__main__":
         repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
         single_task=args.task,
         num_episodes=args.episodes,
-        episode_time_s=args.time,
+        episode_time_s=90,
         use_struggle_monitor=True,
         auto_switch=True,
-        struggle_threshold=2.0,
+        struggle_threshold=0.8,
         struggle_check_interval=args.interval,
         struggle_model=args.model,
         struggle_n_frames=args.frames,
         struggle_score_mode=args.score_mode,
+        struggle_warmup_s=10.0,
         switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )

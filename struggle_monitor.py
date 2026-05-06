@@ -733,6 +733,7 @@ class LiveStruggleMonitor:
         interrupt_threshold: float = 0.5,
         score_mode: str = "mean",
         alpha_ramp_s: float = 10.0,
+        warmup_s: float = 0.0,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
@@ -746,6 +747,9 @@ class LiveStruggleMonitor:
         # the monitor cannot trigger in the first few seconds of an episode.
         # 0 disables the ramp (alpha = 1.0 always).
         self._alpha_ramp_s   = max(0.0, alpha_ramp_s)
+        # warmup_s > 0: hard skip — do not compute S or call Gemini at all
+        # for the first warmup_s seconds of each episode.
+        self._warmup_s       = max(0.0, warmup_s)
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
 
@@ -789,8 +793,14 @@ class LiveStruggleMonitor:
             self._state_buf.append(np.asarray(state, dtype=np.float32))
 
     def is_struggling(self) -> bool:
-        """True when the S score exceeds the interrupt threshold."""
-        return self._struggle_score >= self._threshold
+        """True when the Gemini panel vote fraction meets the interrupt threshold.
+
+        S is used only as a gate to trigger a Gemini call; the actual interrupt
+        decision is made by the panel of judges via assess_interrupt_panel().
+        Before the first Gemini call the interrupt_probability is 0.0, so this
+        returns False until Gemini has had a chance to assess the episode.
+        """
+        return self._interrupt.get("interrupt_probability", 0.0) >= self._threshold
 
     def get_signal(self) -> dict:
         """Return the legacy signal dict: {struggling, confidence, reason}."""
@@ -953,13 +963,24 @@ class LiveStruggleMonitor:
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
                 if actions is not None and states is not None:
+                    ep_elapsed = time.time() - self._episode_start
+
+                    # Hard warmup skip: don't compute S or call Gemini at all.
+                    if self._warmup_s > 0 and ep_elapsed < self._warmup_s:
+                        print(
+                            f"[StruggleMonitor] warmup   t={ep_elapsed:.0f}s"
+                            f"  (skipping for {self._warmup_s - ep_elapsed:.0f}s more)"
+                        )
+                        elapsed = time.time() - start
+                        self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
+                        continue
+
                     score_result = compute_struggle_score(actions, states, score_mode=self._score_mode)
                     S = score_result["S"]
                     self._struggle_score  = S
                     self._channel_ratios  = score_result["ratios"]
                     self._channel_values  = score_result["channels"]
                     self._channel_thetas  = score_result["thetas"]
-                    ep_elapsed = time.time() - self._episode_start
                     alpha_t = (
                         min(ep_elapsed / self._alpha_ramp_s, 1.0)
                         if self._alpha_ramp_s > 0 else 1.0
