@@ -1067,14 +1067,30 @@ def do_ab_eval(
 
     def _load_cfg(policy_path):
         """Load policy config and fix any cluster-specific paths baked into it."""
-        cfg = PreTrainedConfig.from_pretrained(policy_path)
+        _is_local = Path(policy_path).is_dir()
+        cfg = PreTrainedConfig.from_pretrained(
+            policy_path, local_files_only=_is_local
+        )
         cfg.pretrained_path = policy_path
         cfg.device = "cuda"
         # Policies trained on a compute cluster may have an absolute path like
         # /scratch/gpfs/... baked into config.json for the VLM backbone.
-        # Override it to the public HF model ID so it resolves locally.
+        # Prefer the local HF cache snapshot; fall back to the hub ID only if
+        # no cached snapshot is present.
         if hasattr(cfg, "vlm_model_name") and cfg.vlm_model_name.startswith("/"):
-            cfg.vlm_model_name = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+            _vlm_hf_id = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+            _vlm_cache = (
+                Path.home()
+                / ".cache/huggingface/hub"
+                / "models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct"
+                / "snapshots"
+            )
+            _resolved = _vlm_hf_id  # default: resolve via hub
+            if _vlm_cache.exists():
+                _snaps = sorted(_vlm_cache.iterdir())
+                if _snaps and any(_snaps[-1].glob("*.safetensors")):
+                    _resolved = str(_snaps[-1])
+            cfg.vlm_model_name = _resolved
         return cfg
 
     def _open_dataset(repo_id, policy_cfg):
@@ -1220,7 +1236,11 @@ def do_ab_eval(
         affected.
         """
         while not stop_evt.is_set():
-            if monitor and monitor.is_struggling():
+            if (
+                monitor
+                and monitor.is_struggling()
+                and monitor.episode_elapsed >= struggle_warmup_s
+            ):
                 if auto_switch:
                     print(f"\n  [StruggleMonitor] STRUGGLING — auto-switching policy after episode")
                     events["auto_switched"] = True
