@@ -428,12 +428,16 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
 
     # EMA history and switch marker tracking
     ema_history   = collections.deque(maxlen=MAX_PTS)
+    label_history = collections.deque(maxlen=MAX_PTS)   # "A" or "B" per point
     _chart_state  = {"thr": 0.6, "counter": 0}
     switch_markers: list[int] = []   # data-point counter values at each switch
 
-    def _redraw_chart(ema, thr):
+    _POLICY_COLOR = {"A": "#00ffff", "B": "#ff44ff"}   # cyan / magenta
+
+    def _redraw_chart(ema, thr, label="A"):
         _chart_state["thr"] = thr
         ema_history.append(ema)
+        label_history.append(label)
         _chart_state["counter"] += 1
         n = len(ema_history)
 
@@ -481,11 +485,29 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
             cv.create_polygon(poly_pts, fill="#3a0000", outline="",
                               tags="ema_plot")
 
-        # Draw EMA line — green below threshold, red above
-        struggling = ema >= thr
-        line_color = "#ff3333" if struggling else "#00e676"
-        cv.create_line(*pts, fill=line_color, width=2,
-                       smooth=True, tags="ema_plot")
+        # Draw EMA line segmented by policy — cyan (A) / magenta (B).
+        # Consecutive same-label points form one create_line call; the
+        # transition point is shared between segments for a clean join.
+        seg_pts:   list[float] = []
+        seg_label: str | None  = None
+        for i, (v, lbl) in enumerate(zip(ema_history, label_history)):
+            x, y = _idx_to_x(i, n), _ema_to_y(v)
+            if lbl != seg_label:
+                if len(seg_pts) >= 4:
+                    cv.create_line(*seg_pts,
+                                   fill=_POLICY_COLOR.get(seg_label, "#00ffff"),
+                                   width=2, smooth=True, tags="ema_plot")
+                # overlap one point at the boundary for visual continuity
+                seg_pts   = ([seg_pts[-2], seg_pts[-1]] if seg_pts else []) + [x, y]
+                seg_label = lbl
+            else:
+                seg_pts += [x, y]
+        if len(seg_pts) >= 4:
+            cv.create_line(*seg_pts,
+                           fill=_POLICY_COLOR.get(seg_label, "#00ffff"),
+                           width=2, smooth=True, tags="ema_plot")
+
+        line_color = _POLICY_COLOR.get(label, "#00ffff")
 
         # Dot at current value (rightmost point)
         cx = _idx_to_x(n - 1, n)
@@ -503,6 +525,7 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
     def _reset_display():
         """Clear chart history, switch markers, and all text widgets."""
         ema_history.clear()
+        label_history.clear()
         switch_markers.clear()
         _chart_state["counter"] = 0
         cv.delete("ema_plot")
@@ -555,7 +578,7 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                 ema = data.get("ema", 0.0)
                 thr = data.get("threshold", 0.6)
                 struggling = ema >= thr
-                _redraw_chart(ema, thr)
+                _redraw_chart(ema, thr, label)
                 ep_s = data.get("ep_elapsed", 0.0)
                 mins, secs = divmod(int(ep_s), 60)
                 v_timer.set(f"{mins}:{secs:02d}")
