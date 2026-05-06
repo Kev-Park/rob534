@@ -241,15 +241,18 @@ def compute_struggle_score_series(
 
     # NaN in any channel at time t means the metric hadn't warmed up yet;
     # preserve those NaNs so the caller can skip warmup windows.
-    # Suppress the "All-NaN slice" warning — it is expected for warmup frames.
+    # Suppress the "All-NaN slice" warning — expected for warmup frames where
+    # every channel is still NaN; numpy raises it even inside errstate on some
+    # builds, so we also filter at the warnings module level.
     if T == 0:
         return np.array([])
-    with np.errstate(all="ignore"):
+    import warnings
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
         if score_mode == "mean":
             return np.nanmean(score_matrix, axis=0)
         if score_mode == "median":
             return np.nanmedian(score_matrix, axis=0)
-        # "max" (default) and "mode" fallback
         return np.nanmax(score_matrix, axis=0)
 
 
