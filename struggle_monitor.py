@@ -51,6 +51,7 @@ Batch evaluation
 """
 
 import concurrent.futures
+import statistics as _stats
 import glob
 import json
 import threading
@@ -84,11 +85,37 @@ def _get_pooled_thresholds() -> Thresholds:
     return _POOLED_THRESHOLDS
 
 
+_SCORE_MODES = ("max", "mean", "median", "mode")
+
+
+def _aggregate_scores(scores: list[float], mode: str) -> float:
+    """Aggregate a list of per-channel scores into a single S value.
+
+    Args:
+        scores: Per-channel contribution values (already normalized or raw).
+        mode:   One of "max", "mean", "median", "mode".
+
+    Returns:
+        Scalar S value.
+    """
+    if not scores:
+        return 0.0
+    if mode == "mean":
+        return _stats.mean(scores)
+    if mode == "median":
+        return _stats.median(scores)
+    if mode == "mode":
+        # Round to 2 dp to create discrete buckets for continuous values
+        return float(_stats.mode(round(s, 2) for s in scores))
+    return max(scores)   # "max" (default)
+
+
 def compute_struggle_score(
     actions: np.ndarray,
     states: np.ndarray,
     thresholds: Thresholds | None = None,
     cfg: Config | None = None,
+    score_mode: str = "max",
 ) -> dict:
     """Compute a struggle score from buffered actions/states using calibrated metrics.
 
@@ -98,17 +125,24 @@ def compute_struggle_score(
 
     Parameters
     ----------
-    actions : (T, 6) float array of recent commanded actions.
-    states  : (T, 6) float array of recent observation states.
+    actions    : (T, 6) float array of recent commanded actions.
+    states     : (T, 6) float array of recent observation states.
     thresholds : Calibrated Thresholds; defaults to pooled.json.
-    cfg : Monitor Config; defaults to Config().
+    cfg        : Monitor Config; defaults to Config().
+    score_mode : How to aggregate per-channel scores into S.
+                 One of "max" (default), "mean", "median", "mode".
+                 The sigma_bar (Stall) channel always contributes its raw value;
+                 all other channels contribute their normalized ratio (m / theta).
 
     Returns
     -------
     dict with keys:
         channels : dict mapping channel name -> raw metric value (last time step)
         ratios   : dict mapping channel name -> normalized ratio (m / theta)
-        S        : float, max ratio across channels (worst-case normalized metric)
+        thetas   : dict mapping channel name -> calibration threshold theta
+        scores   : dict mapping channel name -> per-channel S contribution
+                   (raw for sigma_bar, normalized ratio for all others)
+        S        : float, aggregated score across channels
     """
     if thresholds is None:
         thresholds = _get_pooled_thresholds()
@@ -120,6 +154,8 @@ def compute_struggle_score(
 
     channels: dict[str, float] = {}
     ratios: dict[str, float] = {}
+    thetas: dict[str, float] = {}
+    scores: dict[str, float] = {}   # per-channel S contribution
 
     for i, ch_name in enumerate(M_CHANNELS):
         arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
@@ -133,18 +169,83 @@ def compute_struggle_score(
         val = 0.0 if (raw != raw) else raw   # nan != nan
 
         theta_i = thresholds.theta[i]
+        thetas[ch_name] = float(theta_i)
         if ch_name == "sigma_bar":
-            # theta=0 by design: any nonzero value is a violation
+            # theta=0 by design; display ratio is binary but S uses the raw value.
             ratios[ch_name] = 1.0 if val > 0 else 0.0
+            scores[ch_name] = val
         elif theta_i > 0:
             ratios[ch_name] = val / theta_i
+            scores[ch_name] = val / theta_i
         else:
             # Shouldn't happen for other channels, but guard against it
             ratios[ch_name] = 0.0
+            scores[ch_name] = 0.0
 
-    S = max(ratios.values()) if ratios else 0.0
+    S = _aggregate_scores(list(scores.values()), score_mode) if scores else 0.0
 
-    return {"channels": channels, "ratios": ratios, "S": S}
+    return {"channels": channels, "ratios": ratios, "thetas": thetas, "scores": scores, "S": S}
+
+
+def compute_struggle_score_series(
+    actions: np.ndarray,
+    states: np.ndarray,
+    thresholds: Thresholds | None = None,
+    cfg: Config | None = None,
+    score_mode: str = "max",
+) -> np.ndarray:
+    """Compute a time-series of S values over an episode using the same
+    normalization logic as :func:`compute_struggle_score`.
+
+    Each element S[t] is the aggregated struggle score at window t, computed
+    from the five-channel m-vector normalized by the calibrated P95 thresholds.
+    NaN windows (metric warmup period) are preserved as NaN so callers can
+    mask them.
+
+    Parameters
+    ----------
+    actions, states : (T, 6) arrays for a full episode.
+    thresholds      : Calibrated Thresholds; defaults to pooled.json.
+    cfg             : Monitor Config; defaults to Config().
+    score_mode      : Aggregation mode passed to :func:`_aggregate_scores`
+                      ("max", "mean", "median", "mode"). Default "max".
+
+    Returns
+    -------
+    np.ndarray of shape (T,) with one S value per window.
+    """
+    if thresholds is None:
+        thresholds = _get_pooled_thresholds()
+    if cfg is None:
+        cfg = Config()
+
+    ch_arrays = _per_channel_batch(actions, states, cfg, thresholds)
+
+    T = len(next(iter(ch_arrays.values())))
+    score_matrix = np.full((len(M_CHANNELS), T), np.nan, dtype=np.float64)
+
+    for i, ch_name in enumerate(M_CHANNELS):
+        arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
+        theta_i = thresholds.theta[i]
+        if ch_name == "sigma_bar":
+            # Mirror compute_struggle_score: S uses the raw stall rate, not binary.
+            score_matrix[i] = arr
+        elif theta_i > 0:
+            score_matrix[i] = arr / theta_i
+        # else: leave as NaN (theta_i == 0 for non-sigma_bar would be a calibration bug)
+
+    # NaN in any channel at time t means the metric hadn't warmed up yet;
+    # preserve those NaNs so the caller can skip warmup windows.
+    # Suppress the "All-NaN slice" warning — it is expected for warmup frames.
+    if T == 0:
+        return np.array([])
+    with np.errstate(all="ignore"):
+        if score_mode == "mean":
+            return np.nanmean(score_matrix, axis=0)
+        if score_mode == "median":
+            return np.nanmedian(score_matrix, axis=0)
+        # "max" (default) and "mode" fallback
+        return np.nanmax(score_matrix, axis=0)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -622,10 +723,12 @@ class LiveStruggleMonitor:
         n_sample_frames: int = 12,
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
+        score_mode: str = "max",
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
         self._client         = genai.Client(api_key=load_api_key(key_file))
+        self._score_mode     = score_mode
         self._model          = model
         self._check_interval = check_interval
         self._n_sample       = int(n_sample_frames)
@@ -644,6 +747,7 @@ class LiveStruggleMonitor:
         self._struggle_score: float = 0.0
         self._channel_ratios: dict  = {}   # latest per-channel ratios from compute_struggle_score
         self._channel_values: dict  = {}   # latest raw (un-normalised) channel values
+        self._channel_thetas: dict  = {}   # calibration thresholds (theta) per channel
         self._stop_event            = threading.Event()
         self._transfer_active       = threading.Event()
         self._transfer_epoch: int   = 0
@@ -694,6 +798,10 @@ class LiveStruggleMonitor:
     def get_channel_values(self) -> dict:
         """Return the latest raw (un-normalised) channel values."""
         return self._channel_values.copy()
+
+    def get_channel_thetas(self) -> dict:
+        """Return the calibration threshold (theta) per channel."""
+        return self._channel_thetas.copy()
 
     @property
     def latest_frame(self):
@@ -771,6 +879,7 @@ class LiveStruggleMonitor:
             f"  interval={self._check_interval}s"
             f"  panel={len(JUDGE_TEMPERATURES)} judges"
             f"  s_threshold={self._threshold}"
+            f"  s_mode={self._score_mode}"
         )
 
     def stop(self) -> None:
@@ -831,11 +940,12 @@ class LiveStruggleMonitor:
 
             if len(buf) >= self._n_sample and not self._transfer_active.is_set():
                 if actions is not None and states is not None:
-                    score_result = compute_struggle_score(actions, states)
+                    score_result = compute_struggle_score(actions, states, score_mode=self._score_mode)
                     S = score_result["S"]
                     self._struggle_score  = S
                     self._channel_ratios  = score_result["ratios"]
                     self._channel_values  = score_result["channels"]
+                    self._channel_thetas  = score_result["thetas"]
                     ep_elapsed = time.time() - self._episode_start
 
                     if S < self._threshold:
@@ -1112,6 +1222,7 @@ def test_on_dataset(
     out_csv: str = "struggle_test_results.csv",
     video_dir: str | None = None,
     max_episodes: int | None = None,
+    score_mode: str = "max",
 ) -> pd.DataFrame:
     """Run the interrupt monitor over every episode in a LeRobot dataset.
 
@@ -1263,7 +1374,7 @@ def test_on_dataset(
                 # Compute S score from buffered sensor data
                 S = 0.0
                 if actions_snap is not None and states_snap is not None:
-                    S = compute_struggle_score(actions_snap, states_snap)["S"]
+                    S = compute_struggle_score(actions_snap, states_snap, score_mode=score_mode)["S"]
                 scorer.update(S)
                 all_s.append(S)
 
@@ -1425,6 +1536,8 @@ if __name__ == "__main__":
     p_live.add_argument("--interval",  type=float, default=2.0)
     p_live.add_argument("--threshold", type=float, default=0.5,
                         help="S score threshold above which is_struggling() fires")
+    p_live.add_argument("--score-mode", default="max", choices=list(_SCORE_MODES),
+                        help="Aggregation for S: max (default), mean, median, mode")
 
     p_batch = sub.add_parser("batch", help="Run batch test on a full LeRobot dataset.")
     p_batch.add_argument("--dataset",      default="nc8304/eval_smolvla-phase-split_combined")
@@ -1439,6 +1552,8 @@ if __name__ == "__main__":
                          help="If set, render 3-panel interrupt videos here.")
     p_batch.add_argument("--max-episodes", type=int, default=None,
                          help="Stop after this many episodes.")
+    p_batch.add_argument("--score-mode", default="max", choices=list(_SCORE_MODES),
+                         help="Aggregation for S: max (default), mean, median, mode")
 
     args = parser.parse_args()
 
@@ -1453,6 +1568,7 @@ if __name__ == "__main__":
             model=args.model,
             check_interval=args.interval,
             interrupt_threshold=args.threshold,
+            score_mode=args.score_mode,
         )
         monitor.start()
 

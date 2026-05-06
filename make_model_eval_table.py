@@ -28,12 +28,9 @@ import pandas as pd
 from huggingface_hub import snapshot_download
 
 # --siblings in this repo ────────────────────────────────────────────────────
-from stability_monitor.calibration import (
-    Thresholds,
-    _per_channel_batch,
-    M_CHANNELS,
-)
+from stability_monitor.calibration import Thresholds
 from stability_monitor.config import Config
+from struggle_monitor import compute_struggle_score_series
 from batch_detect_phases import detect_phases, FPS, GRIPPER_COL_IDX, DEFAULT_THRESHOLD
 
 
@@ -89,31 +86,6 @@ def _load_parquet(dataset_id: str) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(p) for p in parquets], ignore_index=True)
 
 
-def _compute_S_series(
-    actions: np.ndarray,
-    states: np.ndarray,
-    thresholds: Thresholds,
-    cfg: Config,
-) -> np.ndarray:
-    """Per-window normalised struggle score S (shape (T,)).
-
-    S[t] = max over channels of (m[t] / theta).
-    S > 1.0 means at least one channel exceeds the P95 calibration threshold.
-    """
-    ch_arrays = _per_channel_batch(actions, states, cfg, thresholds)
-    ratio_stack = []
-    for i, ch_name in enumerate(M_CHANNELS):
-        arr = np.asarray(ch_arrays[ch_name], dtype=np.float64)
-        theta_i = thresholds.theta[i]
-        if ch_name == "sigma_bar":
-            ratio_stack.append((arr > 0).astype(np.float64))
-        elif theta_i > 0:
-            ratio_stack.append(arr / theta_i)
-        else:
-            ratio_stack.append(np.zeros_like(arr))
-    return np.stack(ratio_stack, axis=0).max(axis=0)   # (T,)
-
-
 def _episode_row(
     dataset_id: str,
     short_name: str,
@@ -134,7 +106,7 @@ def _episode_row(
 
     # --Struggle score S ─────────────────────────────────────────────────────
     try:
-        S_series = _compute_S_series(actions, states, thresholds, cfg)
+        S_series = compute_struggle_score_series(actions, states, thresholds, cfg)
         valid = S_series[~np.isnan(S_series)]
         if valid.size > 0:
             row["S_min"]    = round(float(valid.min()),              4)

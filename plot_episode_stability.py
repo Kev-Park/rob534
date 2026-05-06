@@ -32,6 +32,7 @@ from huggingface_hub import snapshot_download
 
 from stability_monitor.calibration import Thresholds, _per_channel_batch, M_CHANNELS
 from stability_monitor.config import Config
+from struggle_monitor import compute_struggle_score_series
 from batch_detect_phases import FPS
 
 THRESHOLDS_PATH = Path(__file__).parent / "thresholds" / "pooled.json"
@@ -71,19 +72,13 @@ DROP_COLOR     = "#E53935"
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _compute_arrays(actions, states, thresholds, cfg):
-    """Return S_series (T,) and {ch_name: array (T,)} of raw channel values."""
+    """Return S_series (T,) and {ch_name: array (T,)} of raw channel values.
+
+    S_series uses compute_struggle_score_series() — the same normalization
+    as the live rollout monitor — so offline analysis matches live behaviour.
+    """
+    S_series = compute_struggle_score_series(actions, states, thresholds, cfg)
     ch = _per_channel_batch(actions, states, cfg, thresholds)
-    ratio_stack = []
-    for i, name in enumerate(M_CHANNELS):
-        arr = np.asarray(ch[name], dtype=np.float64)
-        theta_i = thresholds.theta[i]
-        if name == "sigma_bar":
-            ratio_stack.append((arr > 0).astype(np.float64))
-        elif theta_i > 0:
-            ratio_stack.append(arr / theta_i)
-        else:
-            ratio_stack.append(np.zeros_like(arr))
-    S_series = np.stack(ratio_stack, axis=0).max(axis=0)
     raw = {name: np.asarray(ch[name], dtype=np.float64) for name in M_CHANNELS}
     return S_series, raw
 
