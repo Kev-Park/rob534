@@ -1,121 +1,110 @@
 episode_index,pick_quality,drop_quality,overall_success,confidence,reasoning,description
-0,clean,clean_with_correction,True,0.95,The robot achieved a clean grasp on the first attempt and successfully pushed the block through the target hole after making a slight rotational correction.,"Based on the video, here is a factual description of the robotic arm's actions.
+0,clean,clean,True,1.0,The robot achieved a stable grasp on the first attempt and released the block smoothly through the target hole without any corrections.,"Based on the video, here is a factual description of the robotic arm's actions.
+
+**PICK:**
+The video starts with the two-jawed gripper positioned directly over an orange cube. The gripper moves straight down, and its jaws close around the cube, grasping it on the first attempt. As the arm lifts the cube, the block does not visibly shift or rotate within the jaws; the grip appears stable.
+
+**TRANSPORT:**
+Once the cube is grasped, the arm lifts it vertically and then moves it smoothly in an upward arc toward a vertical black panel with geometric cutouts. The cube remains securely held in the gripper during the entire transport motion.
+
+**DROP:**
+The arm arrives in front of the black panel, aligning the cube with a square-shaped cutout. Without any observable corrections or retries, the arm moves the cube forward, pushing it completely through the square hole. The gripper jaws open to release the block as it passes through the opening. The block goes through the target hole.
+
+At the end of the video, the block has passed through the square hole and is no longer visible."
+1,clean,clean,False,0.95,"The robot performed a clean pick in one attempt and a clean drop without corrections, but the overall attempt failed because the block landed near the target region rather than directly on it.","Based on the video provided, here is a factual description of the robotic arm's actions.
 
 ### PICK
-The video starts with a two-fingered black gripper approaching an orange cube from below. The gripper closes and grasps the cube on the first attempt. The cube does not appear to move or rotate within the gripper's jaws upon being grasped. The grip looks stable.
+The robotic gripper approaches the orange block from directly above. It successfully grasps the block on its first attempt by closing on two opposite faces. After the grasp, the block does not noticeably move or rotate within the gripper. The grip appears stable.
 
 ### TRANSPORT
-Once the cube is grasped, the arm lifts it vertically and then moves it upwards and towards the left of the frame. The motion is continuous. The cube remains securely held in the gripper throughout the movement.
+Once the block is grasped, the arm lifts it vertically. It then transports the block in a path that involves significant rotation and tilting of the arm. The movement is not perfectly smooth and has some visible shaking. Throughout the transport phase, the block remains securely held in the gripper.
 
 ### DROP
-The arm brings the cube to a black panel with several geometric cutouts. It aligns the cube with a square-shaped hole. The arm rotates the cube slightly to match the orientation of the hole before pushing it forward. The arm pushes the cube completely through the square hole without opening its gripper. The block goes through the target hole.
+The arm positions the block over an area to the right and slightly below its original starting position. Without any visible corrections or retries, the gripper opens and releases the block. The block falls a short distance and lands on the white surface, close to the target region but not on a specific dot.
 
-At the end of the video, the block has passed through the square hole and is no longer in view."
-1,messy,failed,False,0.95,"The robot required multiple attempts to secure the block and ultimately failed to place it on the target, ending the video holding the block after an initial failed drop.","Based on the video, here is a factual description of the robot's actions.
+At the end of the video, the block is stationary on the white dotted surface, having been moved from its initial position."
+2,clean,clean,True,1.0,The robot grasped the block cleanly on the first attempt and released it smoothly into the target cutout without any visible corrections.,"Based on the video, here is a factual description of the robotic arm's actions.
 
 ### PICK
-The gripper approaches the orange block from directly above. It successfully grasps the block on its first attempt by closing on two opposite faces. As the gripper closes, the block rotates slightly clockwise. The grip appears stable enough to lift the block. After an initial drop, the arm attempts to pick the block again. The first re-grasp attempt fails, pushing the block slightly. The subsequent attempt successfully grasps the block.
+The two-fingered gripper approaches the orange block from above with its fingers open. It descends vertically and closes around the block, grasping it successfully on the first attempt. The block does not appear to move or rotate within the gripper's fingers once grasped; the grip looks stable.
 
 ### TRANSPORT
-Once the block is grasped, the arm lifts it vertically. The transport motion is not smooth; it consists of a series of small, jerky adjustments. Throughout the movement, the block remains securely held within the gripper.
+The arm lifts the block straight up and then moves it smoothly to the left and forward. It carries the block toward a black vertical board that has several geometric shapes cut out of it. The block remains secure in the gripper throughout the movement.
 
 ### DROP
-The arm moves the block over a different area of the dotted surface and makes several small, shaky adjustments to its position. It then opens the gripper, releasing the block. The block lands on the white surface, slightly tilted. The arm does not move away but immediately attempts to re-grasp the block, and the video ends before a final placement is completed.
+The arm arrives in front of the square-shaped cutout on the board and positions the block to align with the opening. Without any visible corrections, the arm pushes the block partway into the hole and then opens its gripper to release it. The block falls forward and passes cleanly through the square hole.
 
-At the end of the video, the block is held in the gripper, hovering above the white surface."
-2,clean,clean,True,0.95,The robot successfully grasped the cube on the first attempt and smoothly pushed it through the target square hole without any corrections.,"Based on the video provided, here is a factual description of the robotic arm's actions.
-
-**1. PICK:**
-The video begins with the black two-fingered gripper positioned above and approaching an orange cube. The gripper descends and closes on the cube, grasping it successfully on the first attempt. The cube is held by two opposing faces. The block does not appear to move or rotate within the gripper's jaws, and the grip looks stable.
-
-**2. TRANSPORT:**
-Once the cube is grasped, the arm lifts it vertically and then moves it toward the left of the frame. The motion is somewhat unsteady. The arm carries the block toward a black vertical board that has several geometric shapes cut out of it, including a square, a triangle, and a circle. The block remains securely held in the gripper throughout the transport phase.
-
-**3. DROP:**
-The arm arrives at the black board and aligns the orange cube with the square-shaped cutout. It then pushes the cube through the square hole. Once the cube is on the other side of the board, the gripper opens and releases it. The block successfully passes through the target hole. There are no visible corrections or retries before the release.
-
-The block ends up behind the black board after being dropped through the square hole."
-3,messy,failed,False,0.95,"Although the initial grasp was clean, the grip became unstable during transport, and the drop failed because the block slipped out prematurely onto the wrong part of the target.","Based on the video provided, here is a factual description of the robotic arm's actions.
-
-### PICK
-The video begins with the black, two-fingered gripper already moving toward an orange block on a white surface. The gripper approaches from the bottom of the frame and closes around the block's opposing faces. The grasp is successful on the first attempt. Initially, the block appears to be held firmly without any noticeable movement or rotation within the gripper.
-
-### TRANSPORT
-After grasping the block, the arm lifts it vertically and then moves it toward the top-left of the frame, carrying it toward a black structure. The arm's movement is generally smooth. However, as the arm transports the block, the block begins to rotate and slip inside the gripper. By the time it nears the destination, the block has rotated significantly and is held insecurely by one corner and an edge.
-
-### DROP
-The arm arrives over the top edge of the black structure. Before the gripper opens to intentionally release the block, the unstable block slips completely out of the grasp and falls. The block lands and comes to rest on the top edge of the black structure, not inside any of the intended target cutouts. There are no corrective movements or retries before the block is dropped.
-
-At the end of the video, the block is resting on the top edge of the black target structure."
-4,failed,not_attempted,False,1.0,"The robot failed to secure the block during its single grasp attempt, so it never proceeded to the transport or drop phases.","Based on the video provided, here is a factual description of the robotic arm's actions.
-
-### PICK
-The video starts with a two-fingered gripper positioned over an orange block. The gripper descends vertically towards the block. It attempts to grasp the block, but the grasp is not successful on the first attempt. The arm immediately moves away to the left without the block. The block is never secured in the gripper, so its stability cannot be assessed.
-
-### TRANSPORT
-Since the block was not picked up, there is no transport phase. The arm moves away from the block's initial location without carrying anything.
-
-### DROP
-A human hand enters the frame and pushes the block to a new location at the top edge of the dotted surface. The robotic arm does not approach this new target region or attempt to release a block, as it is not holding one. There are no corrections or retries to place the block.
-
-At the end of the video, the block remains at the top edge of the white surface where the hand left it."
-5,clean,clean,True,1.0,The robot achieved a stable grasp on the first attempt and released the block smoothly into the target region without any corrections.,"Based on the video provided, here is a factual description of the robotic arm's actions.
+At the end of the video, the block is on the other side of the black board, having successfully passed through the square cutout."
+3,clean,clean,True,1.0,"The robot grasped the block cleanly on the first attempt and released it smoothly over the target in one continuous motion, successfully placing it on the panel.","Based on the video, here is a factual description of the robot's actions.
 
 **PICK**
-The video starts with a two-fingered black gripper already approaching a small, orange cube resting on a white surface with blue dots. The gripper descends and closes on two opposite faces of the cube, successfully grasping it on the first visible attempt. The cube does not appear to move or rotate within the gripper's fingers as it is lifted. The grip looks stable.
+The two-fingered gripper approaches the orange block from directly above. It closes its fingers and grasps the block successfully on the first attempt. As the arm lifts the block, the block remains stationary within the gripper without any visible movement or rotation. The grip appears stable.
 
 **TRANSPORT**
-Once the cube is grasped, the arm lifts it vertically and then moves it in a single, smooth motion toward a black panel. During this transport phase, the cube remains securely held in the same orientation within the gripper.
+Once the block is grasped, the arm lifts it vertically and then moves it forward and to the left. The motion is continuous as it carries the block towards and then over a black vertical panel. The block stays securely in the gripper during the entire transport phase.
 
 **DROP**
-The arm arrives directly in front of the target region, aligning the orange cube with a square-shaped cutout in the black panel. Without any visible pauses, corrections, or retries, the arm moves forward, pushing the cube into and through the square hole. The block is successfully released by being pushed through the target opening.
+The arm positions the block directly over the top edge of the black panel. It lowers the block until it makes contact with the panel's edge and then opens the gripper to release it. The block lands on the top edge of the panel, tilted slightly. The arm does not make any adjustments or retries before the release.
 
-At the end of the video, the block is passing through the square cutout in the panel."
-6,messy,failed,False,0.95,"Although the block was grasped on the first attempt, the resulting grip was unstable and tilted, and the subsequent drop completely missed the target hole.","Based on the video, here is a factual description of the robotic arm's actions.
+At the end of the video, the block is resting on the top edge of the black panel."
+4,ERROR,ERROR,False,,"503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}",
+5,clean,clean,True,0.95,The robot grasped the block in one stable attempt and released it smoothly through the target hole without requiring any positional corrections.,"Based on the video, here is a factual description of the robotic arm's actions.
 
 **PICK**
-The two-fingered gripper approaches an orange cube from the front. It closes on the block and grasps it on the first attempt. As the gripper closes, the cube rotates significantly within the grasp, becoming tilted so that it is held by its corners/edges rather than its flat faces. The resulting grip does not look stable.
+The video starts with the two-fingered gripper already aligned and open around an orange block. The gripper closes on the block in one attempt. As the fingers make contact and close, the block rotates slightly counter-clockwise. Once grasped, the grip appears stable.
 
 **TRANSPORT**
-The arm lifts the block and moves it upwards and to the left. The movement is slow and deliberate. The block remains in the same tilted, precarious position within the gripper throughout the transport phase.
+The arm lifts the block vertically, then moves it smoothly to the left and forward. The block remains securely held in the gripper throughout the transport phase without any noticeable slipping or rotation.
 
 **DROP**
-The arm positions the block in front of a black plate with a square cut-out. Without making any fine adjustments, the gripper opens. The block fails to go through the target hole; it strikes the surface to the right of the square cut-out and falls.
+The arm arrives over a target region, which is a black panel with various shape cutouts. It positions the block directly in front of the square-shaped cutout. Without any further adjustments, the gripper opens and releases the block. The block falls forward and passes through the square hole.
 
-At the end of the video, the block is out of view, having fallen behind the black plate."
-7,clean,failed,False,1.0,The robot successfully grasped the block in one attempt but failed the drop because it never opened its gripper to release the block at the target location.,"Based on the video provided, here is a factual description of the robotic arm's actions.
+At the end of the video, the block has gone through the square hole in the panel and is no longer visible."
+6,clean,clean_with_correction,True,0.95,The robot grasped the block cleanly on the first attempt and successfully inserted it into the target hole after making minor positional corrections.,"Based on the video provided, here is a factual description of the robotic arm's actions.
 
-### PICK
-The robotic gripper begins with the orange block positioned between its two open fingers. It moves forward slightly to center itself on the block before closing its fingers, successfully grasping the block on the first attempt. As the arm lifts the block vertically, the block does not appear to move or rotate within the gripper. The grip looks stable.
+**1. PICK**
+The two-fingered gripper approaches the orange block from the bottom of the frame. It successfully grasps the block on its first attempt by closing its fingers on two opposite corners. As the arm lifts the block, the block rotates slightly counter-clockwise within the gripper. The grip appears stable throughout the lift.
 
-### TRANSPORT
-After lifting the block, the arm moves it smoothly and directly toward a black structure in the background. During this transport phase, the block remains securely held in the gripper without any noticeable shifting.
+**2. TRANSPORT**
+Once the block is grasped, the arm lifts it vertically and then moves it smoothly to the left. The block remains secure in the gripper, held in the same orientation it was in after the initial lift, during the entire transport phase.
 
-### DROP
-The arm arrives over the target region, which is a square-shaped cutout in the black structure. It attempts to push the block through the opening but makes contact with the top edge of the hole. The arm then makes multiple small, repeated adjustments, moving the block back, forth, and side-to-side, nudging it against the edges of the cutout in an attempt to align it. The arm never opens its gripper to release the block.
+**3. DROP**
+The arm arrives in front of a vertical black plate with several geometric shapes cut out of it. It aligns the block with the square-shaped cutout, making minor adjustments to its position. The arm does not open its gripper to release the block; instead, it pushes the block forward, inserting it directly through the square hole. The block lands on target on the other side of the plate. There are no retries before the release.
 
-At the end of the video, the block is still held firmly by the gripper, pressed against the front of the black structure at the location of the square cutout."
-8,clean,clean,True,0.95,The robot grasped the cube cleanly on the first attempt and released it smoothly and accurately into the target hole without any corrections.,"Based on the video provided, here is a factual description of the robotic arm's actions.
+At the end of the video, the block is on the other side of the black plate, having passed through the square hole."
+7,clean,clean_with_correction,True,0.95,The robot grasped the block cleanly on the first attempt and successfully placed it on the target after making a few small side-to-side adjustments.,"Based on the video provided, here is a factual description of the robotic arm's actions.
+
+**PICK:**
+The video starts with a two-fingered gripper moving toward a stationary orange block. The gripper approaches from below and closes around the block, grasping it successfully on the first attempt. The block does not appear to move or rotate within the gripper's jaws once they are closed. The grip looks stable.
+
+**TRANSPORT:**
+Once the block is grasped, the arm lifts it and moves it forward toward a black panel with different shapes cut out of it. The movement is somewhat shaky, as seen from the gripper's point-of-view camera. The block remains secure in the gripper throughout the transport phase.
+
+**DROP:**
+The arm arrives in front of the black panel and aligns the orange block with the square-shaped cutout. It makes a few small side-to-side adjustments before moving forward. The arm then pushes the block through the square hole and the gripper opens to release it. The block lands on target, passing through the cutout.
+
+At the end of the video, the block is on the other side of the black panel, having been pushed through the square hole."
+8,clean,clean,True,1.0,The robot grasped the cube cleanly on the first attempt and released it smoothly through the target cutout without any corrections.,"Based on the video, here is a factual description of the robotic arm's actions.
+
+**PICK:**
+The video starts with a two-fingered gripper open and positioned over an orange cube on a white surface. The gripper descends and closes around the cube, successfully grasping it on the first attempt. As the cube is lifted, it does not visibly move or rotate within the gripper. The grip appears stable.
+
+**TRANSPORT:**
+Once the cube is grasped, the arm lifts it vertically and then moves it forward in a single, smooth motion. It transports the cube towards a black vertical plate with various shaped cutouts. The block remains securely in the gripper throughout the transport phase.
+
+**DROP:**
+The arm arrives over a square-shaped cutout in the black plate and positions the cube directly above it. There are no visible corrections or retries before the release. The gripper opens, and the block falls straight down, passing cleanly through the square hole.
+
+At the end of the video, the block has passed through the square cutout and is out of sight."
+9,clean,clean,True,1.0,The robot grasped the block cleanly on the first attempt and released it smoothly through the target hole without any corrections.,"Based on the video provided, here is a factual description of the robotic arm's actions.
 
 **PICK**
-The video starts with a black, two-fingered gripper already centered over an orange cube on a white surface. The gripper moves straight down and closes around the cube, grasping it on the first attempt. The cube does not appear to shift or rotate as the fingers close, and the resulting grip looks stable.
+The video begins with the two-fingered gripper already moving towards an orange block on a white surface with blue dots. The gripper descends and closes on the block, grasping it successfully on the first attempt. The block does not noticeably move or rotate within the gripper as it is being secured. The grip appears stable.
 
 **TRANSPORT**
-After grasping the cube, the arm lifts it vertically and then moves it smoothly upward and to the left. The cube remains securely held in the gripper during this motion.
+Once the block is grasped, the arm lifts it straight up and then moves it horizontally to the left. The movement is generally smooth, with some minor camera jitter. The block remains securely held in the gripper throughout the transport phase without any slipping or change in orientation.
 
 **DROP**
-The arm carries the cube over a black plate with various geometric cutouts and positions it directly above a square-shaped hole. Without any visible adjustments or retries, the gripper opens and releases the cube. The cube falls straight down and passes cleanly through the square hole.
+The arm carries the block towards a black vertical panel with shape cutouts. It aligns the block with the square-shaped hole. Without pausing for correction, the arm pushes the block forward, releasing it as it passes through the square hole. The block successfully goes through the target hole.
 
-At the end of the video, the block has fallen through the square hole and is no longer in view."
-9,clean,clean,True,1.0,The robot grasped the block securely on the first attempt and released it directly through the target hole without any corrective motions.,"Based on the video, here is a factual description of the robotic arm's actions.
-
-### PICK
-The robot's two-fingered gripper approaches the orange block from directly above, descending vertically. It successfully grasps the block on the first attempt by closing its fingers on two opposite faces. The block does not visibly move or rotate within the gripper once grasped, and the grip appears stable.
-
-### TRANSPORT
-After grasping the block, the arm lifts it straight up and then moves it horizontally toward a black vertical panel with various shape cutouts. The motion is smooth and direct. The block remains securely held in the gripper throughout the movement.
-
-### DROP
-The arm arrives over the target region, aligning the orange block with a square-shaped hole in the black panel. Without any apparent corrections, the gripper opens, releasing the block. The block falls directly through the square hole.
-
-At the end of the video, the block has passed through the square hole and is on the other side of the panel."
+At the end of the video, the block has passed through the square hole and is out of sight behind the black panel."

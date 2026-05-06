@@ -225,7 +225,7 @@ def _start_switch_key_listener(events):
     return listener
 
 
-def _stats_gui_process(queue) -> None:
+def _stats_gui_process(queue, score_mode: str = "max") -> None:
     """Standalone tkinter stats window — runs in its own process, fully isolated.
 
     Receives dicts from the main process via a multiprocessing.Queue and
@@ -323,7 +323,7 @@ def _stats_gui_process(queue) -> None:
              font=("Consolas", 8)).pack(anchor="w")
 
     # Each row: label | raw_val_lbl | bar | ratio_lbl
-    _ch_rows: list[tuple] = []   # (raw_var, bar_cv, bar_id, ratio_var)
+    _ch_rows: list[tuple] = []   # (raw_var, bar_cv, bar_id, ratio_var, theta_var)
     _CH_BAR_W, _CH_BAR_H = 120, 10
     for ch_label in _CH_LABELS:
         row = tk.Frame(ch_frame, bg=BG)
@@ -342,23 +342,26 @@ def _stats_gui_process(queue) -> None:
         ratio_var = tk.StringVar(value="")
         tk.Label(row, textvariable=ratio_var, bg=BG, fg=GREY,
                  font=("Consolas", 8), width=6, anchor="w").pack(side=tk.LEFT)
-        _ch_rows.append((raw_var, bar_cv, bar_id, ratio_var))
+        theta_var = tk.StringVar(value="")
+        tk.Label(row, textvariable=theta_var, bg=BG, fg="#666688",
+                 font=("Consolas", 8), width=8, anchor="w").pack(side=tk.LEFT)
+        _ch_rows.append((raw_var, bar_cv, bar_id, ratio_var, theta_var))
 
     # S score row (prominent, just below channels)
     s_frame = tk.Frame(root, bg=BG)
     s_frame.pack(fill=tk.X, padx=14, pady=(4, 2))
-    tk.Label(s_frame, text="S = max(ratio)", bg=BG, fg=GREY,
+    tk.Label(s_frame, text=f"S = {score_mode}(ratio)", bg=BG, fg=GREY,
              font=("Consolas", 8)).pack(side=tk.LEFT)
     v_s_score = tk.StringVar(value="--")
     lbl_s_score = tk.Label(s_frame, textvariable=v_s_score, bg=BG, fg="#dddddd",
                            font=("Consolas", 10, "bold"))
     lbl_s_score.pack(side=tk.LEFT, padx=(8, 0))
 
-    def _update_channel_bars(ratios: dict, values: dict):
+    def _update_channel_bars(ratios: dict, values: dict, thetas: dict | None = None, s_val: float | None = None):
         thr = _chart_state["thr"]
         dominant = max(ratios, key=ratios.get) if ratios else None
         for i, ch_name in enumerate(_CH_NAMES):
-            raw_var, bar_cv, bar_id, ratio_var = _ch_rows[i]
+            raw_var, bar_cv, bar_id, ratio_var, theta_var = _ch_rows[i]
             raw = values.get(ch_name, float("nan"))
             ratio = ratios.get(ch_name, 0.0)
             if ratio != ratio:  # NaN guard
@@ -372,9 +375,16 @@ def _stats_gui_process(queue) -> None:
             bar_cv.coords(bar_id, 0, 0, filled, _CH_BAR_H)
             bar_cv.itemconfig(bar_id, fill=color)
             ratio_var.set(f"r={ratio:.2f}")
+            # theta (calibration threshold used for normalization)
+            if thetas:
+                theta = thetas.get(ch_name, float("nan"))
+                theta_var.set(f"θ={theta:.4g}" if theta == theta else "θ=--")
+            else:
+                theta_var.set("")
         # S score line
         if ratios:
-            s_val = max(ratios.values())
+            if s_val is None:
+                s_val = max(ratios.values())
             v_s_score.set(f"{s_val:.3f}  ({dominant})")
             lbl_s_score.config(fg="#ff3333" if s_val >= thr else "#44ff44")
         else:
@@ -500,7 +510,7 @@ def _stats_gui_process(queue) -> None:
         v_metric.set("0.000")
         v_prob.set("0.000")
         _update_vote_boxes([])
-        _update_channel_bars({}, {})
+        _update_channel_bars({}, {}, {})
         v_status.set("--")
         l_status.config(fg=FG)
         _redraw_chart(0.0, _chart_state["thr"])
@@ -552,7 +562,7 @@ def _stats_gui_process(queue) -> None:
                 v_metric.set(f"{data.get('ema', 0.0):.3f}")
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
                 _update_vote_boxes(data.get("votes", []))
-                _update_channel_bars(data.get("ratios", {}), data.get("values", {}))
+                _update_channel_bars(data.get("ratios", {}), data.get("values", {}), data.get("thetas", {}), s_val=data.get("ema"))
                 if struggling:
                     v_status.set("STRUGGLING")
                     l_status.config(fg="#ff2222")
@@ -590,6 +600,7 @@ def _live_display_loop(
             ema = 0.0
         ratios  = monitor.get_channel_ratios()
         values  = monitor.get_channel_values()
+        thetas  = monitor.get_channel_thetas()
         prob    = intr.get("interrupt_probability", 0.0)
         votes   = intr.get("votes", [])
         label   = label_ref[0]
@@ -632,6 +643,7 @@ def _live_display_loop(
                     "ep_elapsed": monitor.episode_elapsed,
                     "ratios":     ratios,
                     "values":     values,
+                    "thetas":     thetas,
                 })
                 _last_gui_push = now
             except Exception:
@@ -738,6 +750,7 @@ def do_ab_eval(
     struggle_threshold=0.6,
     struggle_model="gemini-pro",
     struggle_n_frames=12,
+    struggle_score_mode="mean",
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -1002,6 +1015,7 @@ def do_ab_eval(
             check_interval=struggle_check_interval,
             interrupt_threshold=struggle_threshold,
             n_sample_frames=struggle_n_frames,
+            score_mode=struggle_score_mode,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
@@ -1017,7 +1031,7 @@ def do_ab_eval(
         import queue as _q
         stats_queue  = _q.Queue(maxsize=4)
         gui_proc     = threading.Thread(
-            target=_stats_gui_process, args=(stats_queue,), daemon=True,
+            target=_stats_gui_process, args=(stats_queue, struggle_score_mode), daemon=True,
         )
         gui_proc.start()
         display_thread = threading.Thread(

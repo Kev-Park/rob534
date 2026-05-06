@@ -449,6 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--model",           type=str,   default="gemini-2.5-flash", help="Gemini model for struggle monitor (default gemini-2.5-flash)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
+    parser.add_argument("--score-mode",      type=str,   default="mean", choices=["max", "mean", "median", "mode"],
+                        help="How to aggregate channel scores into S (default: mean)")
     args = parser.parse_args()
 
     if args.simulate:
@@ -555,15 +557,16 @@ if __name__ == "__main__":
         policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
         repo_id_a="Rollout/smolvla-aug_policyA",
         repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
-        single_task="drop cube in the target region",
+        single_task=args.task,
         num_episodes=args.episodes,
-        episode_time_s=90,
+        episode_time_s=args.time,
         use_struggle_monitor=True,
-        auto_switch=False,
-        struggle_threshold=0.2,
+        auto_switch=True,
+        struggle_threshold=2.0,
         struggle_check_interval=args.interval,
         struggle_model=args.model,
         struggle_n_frames=args.frames,
+        struggle_score_mode=args.score_mode,
         switch_duration=args.switch_duration,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )
