@@ -850,6 +850,10 @@ class LiveStruggleMonitor:
         """
         return self._interrupt.get("interrupt_probability", 0.0) >= self._threshold
 
+    def is_vote_in_flight(self) -> bool:
+        """True while a Gemini panel call is currently in-flight."""
+        return self._gemini_in_flight
+
     def get_signal(self) -> dict:
         """Return the legacy signal dict: {struggling, confidence, reason}."""
         return self._signal.copy()

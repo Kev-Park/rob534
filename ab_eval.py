@@ -1261,12 +1261,6 @@ def do_ab_eval(
 
                     _t_ep_start = _time.perf_counter()
                     _timings: dict[str, float] = {}
-                    # Wait for the previous episode's saves to finish before
-                    # starting the next record_loop.  Saves run in a background
-                    # thread so they overlap with go_home (see below).
-                    if _pending_save is not None:
-                        _pending_save.join()
-                        _pending_save = None
                     _b_ran = False   # set True if policy-B intervention fires
 
                     # ── PICK ACTIVE POLICY ────────────────────────────────────
@@ -1309,6 +1303,17 @@ def do_ab_eval(
                         _go_home_with_robot(robot)
                     _timings["go_home"] = _time.perf_counter() - _t0
 
+                    # Wait for the previous episode's saves to finish. Joining
+                    # AFTER go_home lets saves run in parallel with the arm
+                    # return, cutting the inter-episode dead time.
+                    if _pending_save is not None:
+                        _t0 = _time.perf_counter()
+                        _pending_save.join()
+                        _pending_save = None
+                        _join_wait = _time.perf_counter() - _t0
+                        if _join_wait > 0.5:
+                            print(f"  [saves] waited {_join_wait:.1f}s for background saves to finish")
+
                     print(f"\n  Episode {i + 1}/{num_episodes} — "
                           f"Policy {label} (ep {counts[label]} for {label})")
 
@@ -1348,6 +1353,30 @@ def do_ab_eval(
                     # Stop watcher thread and collect episode stats.
                     if monitor:
                         watcher_stop.set()
+                        # ── VOTE-WAIT ───────────────────────────────────────────
+                        # If S is above threshold but a Gemini vote is still
+                        # in-flight (e.g. episode timer expired just as it fired),
+                        # pause up to 2 × check_interval for the vote to land.
+                        # This prevents missing a valid interrupt when A's time
+                        # runs out a few seconds before Gemini responds.
+                        if (
+                            auto_switch
+                            and not events.get("auto_switched")
+                            and monitor.get_struggle_score() >= struggle_threshold
+                            and monitor.is_vote_in_flight()
+                        ):
+                            _vote_deadline = _time.perf_counter() + struggle_check_interval * 2
+                            print(
+                                "  [VoteWait] S above threshold — waiting for in-flight vote...",
+                                flush=True,
+                            )
+                            while monitor.is_vote_in_flight() and _time.perf_counter() < _vote_deadline:
+                                _time.sleep(0.15)
+                            if monitor.is_struggling():
+                                events["auto_switched"] = True
+                                print("  [VoteWait] Vote landed → INTERRUPT — switching to B.")
+                            else:
+                                print("  [VoteWait] Vote landed → no interrupt.")
                         ep_state = monitor.get_episode_state()
                         print(f"  [EpisodeState] {ep_state}")
 
@@ -1360,12 +1389,13 @@ def do_ab_eval(
                     # the NEXT episode always resets to A from home.
                     if events.get("auto_switched") and auto_switch:
                         # How long B runs: fixed switch_duration, or the remainder
-                        # of the episode budget when switch_duration=0.
+                        # of the episode budget — but always at least 20s so B
+                        # gets a meaningful attempt even when the switch fires late.
                         if switch_duration > 0:
                             b_time_s = switch_duration
                         else:
                             elapsed_ep = _time.perf_counter() - _t_ep_start
-                            b_time_s = max(1.0, episode_time_s - elapsed_ep)
+                            b_time_s = max(20.0, episode_time_s - elapsed_ep)
                         print(f"\n  [AutoSwitch] Policy B intervening for {b_time_s:.0f}s "
                               f"from current position...")
                         label_ref[0] = "B"
