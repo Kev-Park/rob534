@@ -1091,6 +1091,7 @@ def do_ab_eval(
                     print(f"\n  [StruggleMonitor] STRUGGLING (passive — press q to switch)", flush=True)
             stop_evt.wait(timeout=0.25)
 
+    _pending_save: threading.Thread | None = None
     try:
         # Both VideoEncodingManagers stay open for the full run so their
         # background video-writing threads are always ready, regardless of
@@ -1101,6 +1102,13 @@ def do_ab_eval(
 
                     _t_ep_start = _time.perf_counter()
                     _timings: dict[str, float] = {}
+                    # Wait for the previous episode's saves to finish before
+                    # starting the next record_loop.  Saves run in a background
+                    # thread so they overlap with go_home (see below).
+                    if _pending_save is not None:
+                        _pending_save.join()
+                        _pending_save = None
+                    _b_ran = False   # set True if policy-B intervention fires
 
                     # ── PICK ACTIVE POLICY ────────────────────────────────────
                     # Every episode always starts on Policy A.
@@ -1251,75 +1259,78 @@ def do_ab_eval(
                             monitor.resume_from_transfer()
                             b_ep_state = monitor.get_episode_state()
                             print(f"  [EpisodeState B] {b_ep_state}")
-                        # save B's frames (writer flush + save)
-                        _t0 = _time.perf_counter()
-                        _time.sleep(2.5)
-                        _timings["sleep_before_save_B"] = _time.perf_counter() - _t0
+                        # B's frames will be saved in the background thread below.
                         b_frames = (
                             dataset_b.episode_buffer is not None
                             and dataset_b.episode_buffer.get("size", 0) > 0
                         )
-                        _t0 = _time.perf_counter()
-                        if b_frames:
-                            dataset_b.save_episode()
-                            if stats_csv and monitor:
-                                _append_episode_stats_ab(
-                                    stats_csv, dataset_b.num_episodes - 1, "B", b_ep_state)
-                        else:
-                            print("  WARNING: Policy B collected no frames — skipping save.")
-                            if dataset_b.episode_buffer is not None:
-                                dataset_b.clear_episode_buffer()
-                        _timings["save_episode_B"] = _time.perf_counter() - _t0
+                        _b_ran = True
                         # clear the auto_switched flag so the flip logic below
                         # doesn't also trigger
                         events["auto_switched"] = False
 
-                    # ── SAVE EPISODE ──────────────────────────────────────────
-                    # Brief pause so background image-writer threads finish
-                    # flushing PNGs before the video encoder reads them.
-                    _t0 = _time.perf_counter()
-                    _time.sleep(2.5)
-                    _timings["sleep_before_save"] = _time.perf_counter() - _t0
+                    # ── SAVE EPISODES (background) ────────────────────────────
+                    # Capture everything the thread needs by value so the next
+                    # iteration can freely update local variables.
+                    _sv_b_ran      = _b_ran
+                    _sv_b_frames   = b_frames   if _b_ran else False
+                    _sv_b_ep_state = b_ep_state if _b_ran else None
+                    _sv_dataset    = dataset
+                    _sv_label      = label
+                    _sv_ep_state   = ep_state
+                    _sv_switch_pol = events["switch_policy"]
+                    _sv_ep_idx     = i + 1
 
-                    # Guard against empty buffer — can happen if 'q' was pressed
-                    # during go_home before the record_loop captured any frames.
-                    frames_collected = (
-                        dataset.episode_buffer is not None
-                        and dataset.episode_buffer.get("size", 0) > 0
-                    )
-                    _t0 = _time.perf_counter()
-                    if frames_collected:
-                        if events["switch_policy"]:
-                            # 'q' pressed mid-episode: copy frames to the OTHER
-                            # dataset before saving so both get the full trajectory.
-                            # Must happen before save_episode() clears the buffer.
-                            other_label   = "B" if label == "A" else "A"
-                            other_dataset = dataset_b if label == "A" else dataset_a
-                            n_copied = _duplicate_buffer(dataset, other_dataset)
-                            print(f"  [switch] Saving {n_copied} frames to both datasets.")
-                            dataset.save_episode()        # clears source buffer
-                            other_dataset.save_episode()  # saves the copied frames
-                            # Write stats for both datasets (same episode, both policies)
-                            if stats_csv and monitor:
-                                _append_episode_stats_ab(
-                                    stats_csv, dataset.num_episodes - 1, label, ep_state)
-                                _append_episode_stats_ab(
-                                    stats_csv, other_dataset.num_episodes - 1, other_label, ep_state)
+                    def _bg_saves(
+                        _b=_sv_b_ran, _bf=_sv_b_frames, _be=_sv_b_ep_state,
+                        _ds=_sv_dataset, _lbl=_sv_label, _ep=_sv_ep_state,
+                        _sw=_sv_switch_pol, _idx=_sv_ep_idx,
+                    ):
+                        # B's frames
+                        if _b:
+                            _time.sleep(2.5)
+                            if _bf:
+                                dataset_b.save_episode()
+                                if stats_csv and monitor:
+                                    _append_episode_stats_ab(
+                                        stats_csv, dataset_b.num_episodes - 1, "B", _be)
+                            else:
+                                print("  WARNING: Policy B collected no frames — skipping save.")
+                                if dataset_b.episode_buffer is not None:
+                                    dataset_b.clear_episode_buffer()
+                        # A's frames
+                        _time.sleep(2.5)
+                        a_ok = _ds.episode_buffer is not None and _ds.episode_buffer.get("size", 0) > 0
+                        if a_ok:
+                            if _sw:
+                                # 'q' pressed mid-episode: copy to OTHER dataset too.
+                                _other_lbl = "B" if _lbl == "A" else "A"
+                                _other_ds  = dataset_b if _lbl == "A" else dataset_a
+                                n_copied = _duplicate_buffer(_ds, _other_ds)
+                                print(f"  [switch] Saving {n_copied} frames to both datasets.")
+                                _ds.save_episode()
+                                _other_ds.save_episode()
+                                if stats_csv and monitor:
+                                    _append_episode_stats_ab(
+                                        stats_csv, _ds.num_episodes - 1, _lbl, _ep)
+                                    _append_episode_stats_ab(
+                                        stats_csv, _other_ds.num_episodes - 1, _other_lbl, _ep)
+                            else:
+                                _ds.save_episode()
+                                if stats_csv and monitor:
+                                    _append_episode_stats_ab(
+                                        stats_csv, _ds.num_episodes - 1, _lbl, _ep)
                         else:
-                            # Normal end — save only to the active policy's dataset.
-                            dataset.save_episode()
-                            if stats_csv and monitor:
-                                _append_episode_stats_ab(
-                                    stats_csv, dataset.num_episodes - 1, label, ep_state)
-                    else:
-                        print(f"  WARNING: Episode {i + 1} (Policy {label}) collected no frames — skipping save.")
-                        if dataset.episode_buffer is not None:
-                            dataset.clear_episode_buffer()
-                    _timings["save_episode"] = _time.perf_counter() - _t0
+                            print(f"  WARNING: Episode {_idx} (Policy {_lbl}) collected no frames — skipping save.")
+                            if _ds.episode_buffer is not None:
+                                _ds.clear_episode_buffer()
+
+                    _pending_save = threading.Thread(target=_bg_saves, daemon=True)
+                    _pending_save.start()
 
                     _t_ep_total = _time.perf_counter() - _t_ep_start
                     _timing_str = "  ".join(f"{k}={v:.1f}s" for k, v in _timings.items())
-                    print(f"  [TIMING ep {i+1}] total={_t_ep_total:.1f}s  |  {_timing_str}")
+                    print(f"  [TIMING ep {i+1}] total={_t_ep_total:.1f}s  |  {_timing_str}  (saves async)")
 
                     # ── FLIP POLICY IF q WAS PRESSED OR MONITOR TRIGGERED ─────
                     if events["switch_policy"]:
@@ -1343,6 +1354,9 @@ def do_ab_eval(
         display_stop.set()  # stop live cv2 display thread
         if monitor:
             monitor.stop()
+        # Ensure any in-flight background save completes before finalize().
+        if _pending_save is not None:
+            _pending_save.join()
         # Park arm at home and clean up regardless of how the run ended.
         _go_home_with_robot(robot)
         robot.disconnect()
