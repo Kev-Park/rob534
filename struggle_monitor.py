@@ -801,7 +801,11 @@ class LiveStruggleMonitor:
         self._lock              = threading.Lock()
         # Flag to prevent overlapping Gemini calls — set True when a panel
         # call is in-flight, cleared when it completes or errors.
-        self._gemini_in_flight: bool = False
+        self._gemini_in_flight: bool  = False
+        # When True, S is still computed every check_interval but the Gemini
+        # judge panel is skipped entirely.  Set during policy-B interventions
+        # where a vote can't trigger anything and would just waste API quota.
+        self._suppress_judges: bool   = False
 
         self._signal: dict          = _DEFAULT_SIGNAL.copy()
         self._interrupt: dict       = _DEFAULT_INTERRUPT.copy()
@@ -887,6 +891,15 @@ class LiveStruggleMonitor:
         assignment atomic.  Pass None to fall back to pooled.json.
         """
         self._thresholds = thresholds
+
+    def suppress_judges(self, suppress: bool = True) -> None:
+        """Enable or disable the Gemini judge panel.
+
+        When suppressed, S is still computed and displayed every
+        check_interval but no panel calls are made.  Use this during
+        policy-B interventions where a vote can't trigger anything.
+        """
+        self._suppress_judges = suppress
 
     def reset_signal(self, keep_timer: bool = False) -> None:
         """Clear all signals, EMA score, frame buffer, and episode state.
@@ -1043,7 +1056,9 @@ class LiveStruggleMonitor:
                         if self._alpha_ramp_s > 0 else 1.0
                     )
 
-                    if alpha_t * S < self._threshold:
+                    if self._suppress_judges:
+                        pass  # S updated above; judges suppressed (post-switch)
+                    elif alpha_t * S < self._threshold:
                         print(
                             f"[StruggleMonitor] ok      t={ep_elapsed:.0f}s"
                             f"  alpha={alpha_t:.2f}  S={S:.2f}"

@@ -1235,6 +1235,7 @@ def do_ab_eval(
                                     pass
                             monitor.pause_for_transfer()
                             monitor.reset_signal(keep_timer=True)
+                            monitor.suppress_judges(True)   # no votes needed after switch
                             monitor.resume_from_transfer()  # allow S+GUI updates during B's run
                         _t0 = _time.perf_counter()
                         record_loop(
@@ -1255,6 +1256,7 @@ def do_ab_eval(
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
                         label_ref[0] = "A"   # display resets for next episode
                         if monitor:
+                            monitor.suppress_judges(False)  # re-enable for next A episode
                             monitor.set_thresholds(_thresholds_a)
                             monitor.resume_from_transfer()
                             b_ep_state = monitor.get_episode_state()
