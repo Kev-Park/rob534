@@ -267,9 +267,12 @@ JUDGE_TEMPERATURES: tuple[float, ...] = (0.10, 0.25, 0.40, 0.55, 0.70)
 # ── Prompts & schemas ─────────────────────────────────────────────────────────
 
 # Legacy prompt — used by assess_frames (binary struggling judgment).
-STRUGGLE_PROMPT = """You are watching a sequence of frames from a live robot arm
+# ── Judge prompts ─────────────────────────────────────────────────────────────
+# Switch between prompts by setting STRUGGLE_PROMPT = PROMPT_<name> below.
+
+# v1 — original: visual + injected sensor metrics (jerk, Lyapunov)
+PROMPT_V1 = """You are watching a sequence of frames from a live robot arm
 doing a pick-and-place task. The frames are evenly sampled from the last few seconds.
-{stability_block}
 Is the robot currently struggling?
 Struggling signals:
   - Gripper missed the block or has an unstable / tilted grip
@@ -277,17 +280,33 @@ Struggling signals:
   - Arm making repeated small corrections without making progress
   - Arm oscillating, stuck, or moving erratically
   - Block has been dropped or is about to fall
-  - Lyapunov V trend is DIVERGING (state moving away from goal) — strong signal
   - Jerk is elevated far above baseline — arm is erratic
 
 Not struggling:
   - Arm moving smoothly and purposefully toward a clear goal
   - Block held firmly and stably
   - Clean, confident approach to pick or drop point
-  - Lyapunov V trend is CONVERGING — state closing in on goal
 
 Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
 """
+
+# v2 — visual only: pure movement smoothness, no task-specific cues
+PROMPT_V2 = """You are watching a sequence of frames from a robot arm performing a task.
+Judge purely on the smoothness and quality of the arm's movement.
+
+Vote struggling=true if:
+  - Movement is jerky, erratic, or oscillating
+  - The arm is making small repeated corrections without making clear progress
+  - The arm appears stuck, frozen, or going in circles
+
+Vote struggling=false if:
+  - Movement is smooth, fluid, and deliberate
+  - The arm is making clear, continuous progress toward a goal
+
+Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
+"""
+
+STRUGGLE_PROMPT = PROMPT_V2   # ← swap here to compare prompts
 
 # JSON schema for structured Gemini output — matches STRUGGLE_PROMPT.
 JUDGE_SCHEMA = {
@@ -443,8 +462,6 @@ def assess_interrupt(
     client: genai.Client,
     model: str = "gemini-2.5-flash",
     jpeg_quality: int = 75,
-    actions: np.ndarray | None = None,
-    states:  np.ndarray | None = None,
     temperature: float = 0.40,
 ) -> dict:
     """Single-judge binary struggle assessment.
@@ -461,17 +478,11 @@ def assess_interrupt(
     if not frames:
         return _DEFAULT_SIGNAL.copy()
 
-    stability_block = ""
-    if actions is not None and states is not None and len(actions) >= 5:
-        stability_block = _build_stability_block(actions, states)
-
     parts = _encode_frames(frames, jpeg_quality)
     if not parts:
         return _DEFAULT_SIGNAL.copy()
 
-    parts.append(types.Part.from_text(text=STRUGGLE_PROMPT.format(
-        stability_block=stability_block,
-    )))
+    parts.append(types.Part.from_text(text=STRUGGLE_PROMPT))
 
     response = client.models.generate_content(
         model=model,
@@ -490,8 +501,6 @@ def assess_interrupt_panel(
     client: genai.Client,
     model: str = "gemini-2.5-flash",
     jpeg_quality: int = 75,
-    actions: np.ndarray | None = None,
-    states:  np.ndarray | None = None,
     temperatures: tuple[float, ...] = JUDGE_TEMPERATURES,
 ) -> dict:
     """Panel of N judges voting in parallel on whether to interrupt.
@@ -513,7 +522,7 @@ def assess_interrupt_panel(
         future_to_temp = {
             pool.submit(
                 assess_interrupt, frames, client, model,
-                jpeg_quality, actions, states, temp,
+                jpeg_quality, temp,
             ): temp
             for temp in temperatures
         }
@@ -734,6 +743,7 @@ class LiveStruggleMonitor:
         score_mode: str = "mean",
         alpha_ramp_s: float = 10.0,
         warmup_s: float = 0.0,
+        temperatures: tuple[float, ...] | list[float] | None = None,
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
     ):
@@ -750,6 +760,9 @@ class LiveStruggleMonitor:
         # warmup_s > 0: hard skip — do not compute S or call Gemini at all
         # for the first warmup_s seconds of each episode.
         self._warmup_s       = max(0.0, warmup_s)
+        # Judge temperatures — controls panel size and conservatism spectrum.
+        # None falls back to the module-level JUDGE_TEMPERATURES default.
+        self._temperatures   = tuple(temperatures) if temperatures is not None else JUDGE_TEMPERATURES
         self._gripper_col    = gripper_col_idx
         self._gripper_thresh = gripper_threshold
 
@@ -900,7 +913,7 @@ class LiveStruggleMonitor:
         print(
             f"[StruggleMonitor] started  model={self._model}"
             f"  interval={self._check_interval}s"
-            f"  panel={len(JUDGE_TEMPERATURES)} judges"
+            f"  panel={len(self._temperatures)} judges {list(self._temperatures)}"
             f"  s_threshold={self._threshold}"
             f"  s_mode={self._score_mode}"
         )
@@ -998,11 +1011,18 @@ class LiveStruggleMonitor:
                         try:
                             result = assess_interrupt_panel(
                                 frames, self._client, self._model,
-                                actions=actions, states=states,
+                                temperatures=self._temperatures,
                             )
                             # Discard if a transfer started while the panel was running.
                             if not self._transfer_active.is_set() and self._transfer_epoch == epoch_snapshot:
-                                self._interrupt = result
+                                # Latch: once interrupt_probability crosses the threshold
+                                # never overwrite it with a lower value — prevents a
+                                # subsequent panel call from clearing a trigger before
+                                # the watcher thread has a chance to act on it.
+                                prev_p = self._interrupt.get("interrupt_probability", 0.0)
+                                new_p  = result.get("interrupt_probability", 0.0)
+                                if new_p >= prev_p or new_p >= self._threshold:
+                                    self._interrupt = result
                                 self._last_check_t = time.time()
                                 self._state_tracker.update(result, ep_elapsed)
                                 status = "INTERRUPT" if self.is_struggling() else "ok     "

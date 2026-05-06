@@ -752,6 +752,7 @@ def do_ab_eval(
     struggle_n_frames=12,
     struggle_score_mode="mean",
     struggle_warmup_s=10.0,
+    struggle_temperatures=None,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
@@ -1018,6 +1019,7 @@ def do_ab_eval(
             n_sample_frames=struggle_n_frames,
             score_mode=struggle_score_mode,
             warmup_s=struggle_warmup_s,
+            temperatures=struggle_temperatures,
         )
         monitor.start()
         # Wrap the robot so get_observation() feeds frames to the monitor
@@ -1161,8 +1163,15 @@ def do_ab_eval(
                     # dataset buffer as a separate episode. After B's stint the
                     # episode loop falls through to save both episodes and then
                     # the NEXT episode always resets to A from home.
-                    if events.get("auto_switched") and auto_switch and switch_duration > 0:
-                        print(f"\n  [AutoSwitch] Policy B intervening for {switch_duration:.0f}s "
+                    if events.get("auto_switched") and auto_switch:
+                        # How long B runs: fixed switch_duration, or the remainder
+                        # of the episode budget when switch_duration=0.
+                        if switch_duration > 0:
+                            b_time_s = switch_duration
+                        else:
+                            elapsed_ep = _time.perf_counter() - _t_ep_start
+                            b_time_s = max(1.0, episode_time_s - elapsed_ep)
+                        print(f"\n  [AutoSwitch] Policy B intervening for {b_time_s:.0f}s "
                               f"from current position...")
                         label_ref[0] = "B"
                         events["exit_early"]    = False
@@ -1200,7 +1209,7 @@ def do_ab_eval(
                             preprocessor=pre_b,
                             postprocessor=post_b,
                             dataset=dataset_b,
-                            control_time_s=switch_duration,
+                            control_time_s=b_time_s,
                             single_task=single_task,
                             display_data=True,
                         )

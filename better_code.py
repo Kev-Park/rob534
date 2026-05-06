@@ -448,11 +448,14 @@ if __name__ == "__main__":
     parser.add_argument("--interval",        type=float, default=0.5,  help="Seconds between metric checks (default 0.5)")
     parser.add_argument("--switch-duration", type=float, default=15.0, help="Seconds policy B runs after auto-switch (default 15.0)")
     parser.add_argument("--task",            type=str,   default="Grab the cube and drop it", help="Task instruction string sent to the policy")
-    parser.add_argument("--model",           type=str,   default="gemini-2.5-flash", help="Gemini model for struggle monitor (default gemini-2.5-flash)")
+    parser.add_argument("--model",           type=str,   default="gemini-2.5-pro",   help="Gemini model for struggle monitor (default gemini-2.5-pro)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
     parser.add_argument("--score-mode",      type=str,   default="mean", choices=["max", "mean", "median", "mode"],
                         help="How to aggregate channel scores into S (default: mean)")
+    parser.add_argument("--judges",          type=float, nargs="+",
+                        default=[0.10, 0.40, 0.70],
+                        help="Judge temperatures — one float per judge, e.g. --judges 0.1 0.4 0.7  (default: 3 judges)")
     args = parser.parse_args()
 
     if args.simulate:
@@ -564,12 +567,13 @@ if __name__ == "__main__":
         episode_time_s=90,
         use_struggle_monitor=True,
         auto_switch=True,
-        struggle_threshold=0.8,
+        struggle_threshold=0.6,
         struggle_check_interval=args.interval,
-        struggle_model=args.model,
+        struggle_model="gemini-2.5-flash",
         struggle_n_frames=args.frames,
         struggle_score_mode=args.score_mode,
         struggle_warmup_s=10.0,
-        switch_duration=args.switch_duration,
+        struggle_temperatures=[0.1,0.2,0.3],
+        switch_duration=0,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
     )
