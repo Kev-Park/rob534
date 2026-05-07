@@ -451,6 +451,7 @@ if __name__ == "__main__":
     parser.add_argument("--model",           type=str,   default="gemini-2.5-pro",   help="Gemini model for struggle monitor (default gemini-2.5-pro)")
     parser.add_argument("--frames",          type=int,   default=12,   help="Frames sampled per Gemini call (default 12, try 6 for faster)")
     parser.add_argument("--median",          type=int,   default=3,    help="Median filter window over last N Gemini calls (default 3, set 1 to disable)")
+    parser.add_argument("--dwell",           type=float, default=1.0,  help="Seconds a vote must persist before triggering a switch (default 1.0)")
     parser.add_argument("--score-mode",      type=str,   default="mean",
                         help="How to aggregate channel scores into S: max | mean | median | mode | "
                              "weighted:Ch=w,Ch=w,...  e.g. 'weighted:sigma_bar=3,E_RMS=2'. "
@@ -559,15 +560,20 @@ if __name__ == "__main__":
     print("=" * 50)
     # ── Live A/B eval on real robot ───────────────────────────────────────────
     from ab_eval import do_ab_eval
+    from ab_eval_timeline import AbEvalTimeline
 
     _THRESHOLDS = _BASE / "thresholds"
+    _timeline = AbEvalTimeline(
+        n_episodes=args.episodes,
+        out_path=str(_BASE / "ab_eval_timeline.png"),
+    )
     do_ab_eval(
         policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
         policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
         repo_id_a="Rollout/smolvla-aug_policyA",
         repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
-        single_task=args.task,
-        num_episodes=args.episodes,
+        single_task="Grab thok. e cube and drop it",
+        num_episodes=5,
         episode_time_s=60,
         use_struggle_monitor=True,
         auto_switch=True,
@@ -575,11 +581,13 @@ if __name__ == "__main__":
         struggle_check_interval=args.interval,
         struggle_model="gemini-2.5-pro",
         struggle_n_frames=args.frames,
-        struggle_score_mode="weighted:E_RMS=1,J_RMS=2,neg_SPARC=1,rho_HF=1,sigma_bar=2",   #args.score_mode,
+        struggle_score_mode="weighted:E_RMS=1,J_RMS=5,neg_SPARC=1,rho_HF=5,sigma_bar=1",   #args.score_mode,
         struggle_warmup_s=10.0,
-        struggle_temperatures=[0,0.1,0.1],
+        struggle_temperatures=[0,0.05,0.05],
         struggle_thresholds_a=str(_THRESHOLDS / "eval_smolvla-aug.json"),
         struggle_thresholds_b=str(_THRESHOLDS / "eval_smolvla-phase-split-new-prompts.json"),
         switch_duration=0,
+        struggle_vote_dwell_s=0.1,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
+        timeline=_timeline,
     )

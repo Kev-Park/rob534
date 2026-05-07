@@ -426,11 +426,12 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                                text="", anchor="se",
                                fill="#ff8800", font=("Consolas", 7, "bold"))
 
-    # EMA history and switch marker tracking
+    # EMA history and switch/vote marker tracking
     ema_history   = collections.deque(maxlen=MAX_PTS)
     label_history = collections.deque(maxlen=MAX_PTS)   # "A" or "B" per point
     _chart_state  = {"thr": 0.6, "counter": 0}
     switch_markers: list[int] = []   # data-point counter values at each switch
+    vote_markers:  list[int] = []    # data-point counter values at each completed vote
 
     _POLICY_COLOR = {"A": "#00ffff", "B": "#ff44ff"}   # cyan / magenta
 
@@ -465,6 +466,19 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                 cv.create_text(sx + 2, PAD_TOP + 1, text="switch",
                                anchor="nw", fill="#ffdd00",
                                font=("Consolas", 6, "bold"), tags="ema_plot")
+
+        # ── Vote marker vertical lines ──────────────────────────────────────
+        for vc in vote_markers:
+            offset = _chart_state["counter"] - vc
+            idx    = n - 1 - offset
+            if 0 <= idx < n:
+                vx = _idx_to_x(idx, n)
+                cv.create_line(vx, PAD_TOP, vx, PAD_TOP + PLOT_H,
+                               fill="#cc88ff", width=1, dash=(2, 4),
+                               tags="ema_plot")
+                cv.create_text(vx + 2, PAD_TOP + PLOT_H - 2, text="vote",
+                               anchor="sw", fill="#cc88ff",
+                               font=("Consolas", 6), tags="ema_plot")
 
         # Build point list
         pts = []
@@ -631,12 +645,23 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                     cv_ch.create_line(sx, MC_PAD_T, sx, MC_PAD_T + MC_PLOT_H,
                                       fill="#ffdd00", width=1, dash=(2, 2),
                                       tags="mc_plot")
+            # Vote markers
+            for vc in vote_markers:
+                idx = n - 1 - (counter - vc)
+                if 0 <= idx < n:
+                    vx = _mc_x(idx, n)
+                    cv_ch.create_line(vx, MC_PAD_T, vx, MC_PAD_T + MC_PLOT_H,
+                                      fill="#cc88ff", width=1, dash=(1, 3),
+                                      tags="mc_plot")
+
+    _ep_total = [60.0]   # current episode budget; updated from stats pushes
 
     def _reset_display():
-        """Clear chart history, switch markers, and all text widgets."""
+        """Clear chart history, switch/vote markers, and all text widgets."""
         ema_history.clear()
         label_history.clear()
         switch_markers.clear()
+        vote_markers.clear()
         for ch in _CHANNELS:
             ch_histories[ch].clear()
             ch_label_histories[ch].clear()
@@ -644,7 +669,8 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
             ch_val_vars[ch].set("--")
         _chart_state["counter"] = 0
         cv.delete("ema_plot")
-        v_timer.set("0:00")
+        mins_r, secs_r = divmod(int(_ep_total[0]), 60)
+        v_timer.set(f"{mins_r}:{secs_r:02d}")
         v_metric.set("0.000")
         v_prob.set("0.000")
         _update_vote_boxes([])
@@ -685,6 +711,17 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                     # on subsequent redraws as the history scrolls.
                     switch_markers.append(_chart_state["counter"])
                     continue
+                if data.get("vote_marker"):
+                    vote_markers.append(_chart_state["counter"])
+                    continue
+                if data.get("ep_stopped"):
+                    elapsed = data.get("elapsed", 0.0)
+                    total   = data.get("episode_time_s", _ep_total[0])
+                    _ep_total[0] = total
+                    v_timer.set(f"{int(elapsed)}/{int(total)}s")
+                    continue
+                if "episode_time_s" in data:
+                    _ep_total[0] = data["episode_time_s"]
                 label = data.get("label", "A")
                 color = "#00ffff" if label == "A" else "#ff44ff"
                 v_policy.set("STUDENT (A)" if label == "A" else "TEACHER (B)")
@@ -695,8 +732,9 @@ def _stats_gui_process(queue, score_mode: str = "max") -> None:
                 struggling = ema >= thr
                 _redraw_chart(ema, thr, label)
                 _redraw_channels(data.get("ratios", {}), label)
-                ep_s = data.get("ep_elapsed", 0.0)
-                mins, secs = divmod(int(ep_s), 60)
+                ep_s      = data.get("ep_elapsed", 0.0)
+                remaining = max(0.0, _ep_total[0] - ep_s)
+                mins, secs = divmod(int(remaining), 60)
                 v_timer.set(f"{mins}:{secs:02d}")
                 v_metric.set(f"{data.get('ema', 0.0):.3f}")
                 v_prob.set(f"{data.get('prob', 0.0):.3f}")
@@ -722,6 +760,7 @@ def _live_display_loop(
     stop_evt: threading.Event,
     interrupt_threshold: float = 0.5,
     stats_queue=None,           # multiprocessing.Queue to the GUI process
+    episode_time_s: float = 60.0,
     window_name: str = "A/B Live Eval",
 ) -> None:
     """Print live stats to terminal every second; push to GUI every 0.5 s."""
@@ -729,6 +768,7 @@ def _live_display_loop(
     _print_interval = 1.0   # seconds between terminal prints
     _last_gui_push  = 0.0
     _last_print     = 0.0
+    _last_vote_seq  = monitor.interrupt_seq   # detect completed votes
     # Last non-empty channel data — kept across resets so the GUI doesn't go
     # blank during the brief window after a policy switch clears the monitor.
     _cached_ratios: dict = {}
@@ -766,7 +806,9 @@ def _live_display_loop(
             bar = "#" * min(bar_filled, 20) + "-" * max(20 - bar_filled, 0)
             buf   = monitor.buf_len
             age   = monitor.secs_since_last_check
-            age_s = f"{age:.0f}s ago" if age > 0 else "no check yet"
+            age_s     = f"{age:.0f}s ago" if age > 0 else "no check yet"
+            ep_s      = monitor.episode_elapsed
+            remaining = max(0.0, episode_time_s - ep_s)
             vote_str = " ".join(
                 f"{'Y' if v['struggling'] else 'N'}@{v['temp']:.2f}"
                 for v in votes
@@ -778,25 +820,35 @@ def _live_display_loop(
             print(
                 f"[{t}] policy={label}  [{bar}] S={ema:.3f}/{interrupt_threshold:.2f}"
                 f"  gemini_p={prob:.3f}  [{vote_str}]"
-                f"  buf={buf}fr  last_check={age_s}  {status}",
+                f"  buf={buf}fr  last_check={age_s}  t-{remaining:.0f}s  {status}",
                 flush=True,
             )
             print(f"         channels: {ch_str}", flush=True)
             _last_print = now
 
+        # Detect a completed vote and push a marker before the regular data push
+        cur_seq = monitor.interrupt_seq
+        if stats_queue is not None and cur_seq != _last_vote_seq:
+            _last_vote_seq = cur_seq
+            try:
+                stats_queue.put_nowait({"vote_marker": True})
+            except Exception:
+                pass
+
         # Push to GUI at its own rate
         if stats_queue is not None and not monitor.transfer_active and (now - _last_gui_push) >= _gui_interval:
             try:
                 stats_queue.put_nowait({
-                    "label":      label,
-                    "ema":        ema,
-                    "threshold":  interrupt_threshold,
-                    "prob":       prob,
-                    "votes":      votes,
-                    "ep_elapsed": monitor.episode_elapsed,
-                    "ratios":     ratios,
-                    "values":     values,
-                    "thetas":     thetas,
+                    "label":          label,
+                    "ema":            ema,
+                    "threshold":      interrupt_threshold,
+                    "prob":           prob,
+                    "votes":          votes,
+                    "ep_elapsed":     monitor.episode_elapsed,
+                    "episode_time_s": episode_time_s,
+                    "ratios":         ratios,
+                    "values":         values,
+                    "thetas":         thetas,
                 })
                 _last_gui_push = now
             except Exception:
@@ -889,6 +941,151 @@ class _MonitorFeedingRobot:
         return obs
 
 
+class _MotionTimerRobot:
+    """Wraps robot to start the episode timer on the first ``send_action`` call.
+
+    ``record_loop`` is given a generous ``control_time_s`` safety ceiling.
+    This wrapper fires ``events["exit_early"]`` exactly ``episode_time_s``
+    seconds after the policy sends its first action — i.e. when the arm
+    actually begins moving, not when the episode loop starts.
+
+    Call ``reset()`` at the top of each episode to re-arm and cancel any
+    stale timer thread left over from the previous episode.
+    """
+
+    def __init__(self, robot, events, episode_time_s, timeline=None, on_first_action=None):
+        object.__setattr__(self, "_robot",            robot)
+        object.__setattr__(self, "_events",           events)
+        object.__setattr__(self, "_episode_time_s",   episode_time_s)
+        object.__setattr__(self, "_armed",            True)
+        object.__setattr__(self, "_cancel_evt",       None)
+        object.__setattr__(self, "_tl",               timeline)
+        object.__setattr__(self, "_motion_span",      None)
+        object.__setattr__(self, "_on_first_action",  on_first_action)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_robot"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_robot"), name, value)
+
+    def reset(self):
+        """Re-arm timer and cancel any stale timer from the previous episode."""
+        old = object.__getattribute__(self, "_cancel_evt")
+        if old is not None:
+            old.set()   # cancel stale sleeper so it cannot fire on this episode
+        # Do NOT call span_end here — we are at the top of a new iteration and
+        # episode_start() has already advanced _cur to the new episode's log.
+        # Closing the span here would timestamp it relative to the new episode
+        # (negative duration → invisible).  close_motion_span() is called
+        # right after record_loop() returns, still within the correct episode.
+        object.__setattr__(self, "_motion_span", None)
+        object.__setattr__(self, "_cancel_evt", threading.Event())
+        object.__setattr__(self, "_armed", True)
+
+    def close_motion_span(self):
+        """Close the motion_active span if still open (episode ended early).
+
+        Call this right after record_loop() returns, while _cur still points
+        to the current episode's log.  If the timer already fired and closed
+        the span, t_end > 0 and this is a no-op.
+        """
+        tl          = object.__getattribute__(self, "_tl")
+        motion_span = object.__getattribute__(self, "_motion_span")
+        if tl is not None and motion_span is not None and motion_span.t_end == 0.0:
+            tl.span_end(motion_span)
+
+    def send_action(self, action):
+        if object.__getattribute__(self, "_armed"):
+            object.__setattr__(self, "_armed", False)
+            events         = object.__getattribute__(self, "_events")
+            episode_time_s = object.__getattribute__(self, "_episode_time_s")
+            cancel         = object.__getattribute__(self, "_cancel_evt")
+            tl             = object.__getattribute__(self, "_tl")
+
+            # Notify monitor that robot has started moving (resets warmup clock).
+            on_first = object.__getattribute__(self, "_on_first_action")
+            if on_first is not None:
+                try:
+                    on_first()
+                except Exception:
+                    pass
+
+            # Mark first action and open motion_active span
+            motion_span = None
+            if tl is not None:
+                tl.mark_first_action()
+                from ab_eval_timeline import SPAN_COLORS
+                motion_span = tl.span_start("motion", "motion_active", SPAN_COLORS["motion_active"])
+                object.__setattr__(self, "_motion_span", motion_span)
+
+            def _timer(cancel=cancel, episode_time_s=episode_time_s,
+                       tl=tl, motion_span=motion_span):
+                cancel.wait(timeout=episode_time_s)
+                if not cancel.is_set():
+                    print(
+                        f"\n  [MotionTimer] {episode_time_s:.0f}s since first action"
+                        " — ending episode",
+                        flush=True,
+                    )
+                    events["exit_early"] = True
+                    if tl is not None and motion_span is not None:
+                        tl.span_end(motion_span)
+                        tl.mark_motion_fire()
+
+            threading.Thread(target=_timer, daemon=True).start()
+
+        return object.__getattribute__(self, "_robot").send_action(action)
+
+
+def _pre_flight_checks(policy_path_a, policy_path_b):
+    """Sanity checks that run before do_ab_eval allocates any resources.
+
+    Prints a labelled report for each check.  Does not raise — the caller
+    continues even if a check fails so all issues are visible at once.
+
+    Checks
+    ------
+    a) Rerun web viewer — warn if already open (avoids launching a second one).
+    b) Policy weight paths — warn if A and B resolve to the same directory
+       (weights would be loaded from disk twice for no reason).
+    """
+    issues = []
+
+    # ── (a) Web viewer ────────────────────────────────────────────────────────
+    if _rerun_is_running():
+        print("  [pre-flight a] Rerun viewer already running on :9090 — will skip restart.")
+    else:
+        print("  [pre-flight a] Rerun viewer not running — will start fresh.")
+
+    # ── (b) Policy weight paths ───────────────────────────────────────────────
+    try:
+        # Resolve symlinks / relative paths so e.g. "." and an absolute path
+        # to the same folder compare equal.
+        resolved_a = Path(policy_path_a).resolve()
+        resolved_b = Path(policy_path_b).resolve()
+        if resolved_a == resolved_b:
+            msg = (
+                f"  [pre-flight b] WARNING: policy A and B resolve to the same path "
+                f"({resolved_a}) — weights will be loaded from disk twice."
+            )
+            print(msg)
+            issues.append(msg)
+        else:
+            print(
+                f"  [pre-flight b] Policy paths are distinct:\n"
+                f"      A: {resolved_a}\n"
+                f"      B: {resolved_b}"
+            )
+    except Exception as exc:
+        print(f"  [pre-flight b] Could not resolve policy paths: {exc}")
+
+    if issues:
+        print(f"\n  [pre-flight] {len(issues)} issue(s) found — review output above.\n")
+    else:
+        print("  [pre-flight] All checks passed.\n")
+
+
 def do_ab_eval(
     policy_path_a,
     policy_path_b,
@@ -905,12 +1102,15 @@ def do_ab_eval(
     struggle_n_frames=12,
     struggle_score_mode="mean",
     struggle_warmup_s=10.0,
+    struggle_vote_dwell_s=1.0,
     struggle_temperatures=None,
     struggle_thresholds_a=None,
     struggle_thresholds_b=None,
+    struggle_prompt=None,
     auto_switch=False,
     switch_duration=15.0,
     stats_csv=None,
+    timeline=None,
 ):
     """
     A/B policy eval driven by manual q-key switches.
@@ -975,6 +1175,10 @@ def do_ab_eval(
         repo_id_a = repo_id_from_policy(policy_path_a)
     if repo_id_b is None:
         repo_id_b = repo_id_from_policy(policy_path_b)
+
+    # Run pre-flight sanity checks before touching any hardware or VRAM.
+    print("\n[pre-flight checks]")
+    _pre_flight_checks(policy_path_a, policy_path_b)
 
     # Warn if CPU/RAM looks stressed before we open the camera
     _check_starvation()
@@ -1198,17 +1402,35 @@ def do_ab_eval(
             model=struggle_model,
             check_interval=struggle_check_interval,
             interrupt_threshold=struggle_threshold,
+            vote_dwell_s=struggle_vote_dwell_s,
             n_sample_frames=struggle_n_frames,
             score_mode=struggle_score_mode,
             warmup_s=struggle_warmup_s,
             temperatures=struggle_temperatures,
             thresholds=_thresholds_a,
+            struggle_prompt=struggle_prompt,
         )
         monitor.start()
+        if timeline is not None:
+            monitor.set_timeline(timeline)
         # Wrap the robot so get_observation() feeds frames to the monitor
         # instead of opening a competing VideoCapture on the same camera.
         robot = _MonitorFeedingRobot(robot, monitor)
         print("  [StruggleMonitor] watching robot camera feed — will flag struggling episodes")
+
+    # Pre-import timeline colours once so the episode loop doesn't repeat it.
+    if timeline is not None:
+        from ab_eval_timeline import SPAN_COLORS as _TL_COLORS
+    else:
+        _TL_COLORS = None
+
+    # Wrap with motion timer so the episode clock starts on first action,
+    # not when record_loop is called (which includes first-inference latency).
+    motion_robot = _MotionTimerRobot(
+        robot, events, episode_time_s,
+        timeline=timeline,
+        on_first_action=monitor.note_first_action if monitor else None,
+    )
 
     # Shared mutable label — display thread reads this, main loop writes it.
     label_ref    = ["A"]
@@ -1223,7 +1445,7 @@ def do_ab_eval(
         gui_proc.start()
         display_thread = threading.Thread(
             target=_live_display_loop,
-            args=(monitor, label_ref, display_stop, struggle_threshold, stats_queue),
+            args=(monitor, label_ref, display_stop, struggle_threshold, stats_queue, episode_time_s),
             daemon=True,
         )
         display_thread.start()
@@ -1251,6 +1473,7 @@ def do_ab_eval(
             stop_evt.wait(timeout=0.25)
 
     _pending_save: threading.Thread | None = None
+    _t_data_end: float | None = None   # perf_counter() right after last record_loop
     try:
         # Both VideoEncodingManagers stay open for the full run so their
         # background video-writing threads are always ready, regardless of
@@ -1283,6 +1506,10 @@ def do_ab_eval(
                     events["switch_policy"] = False
                     events["auto_switched"] = False
 
+                    # Re-arm motion timer (also cancels any stale timer thread
+                    # left over from the previous episode ending early).
+                    motion_robot.reset()
+
                     if monitor:
                         monitor.resume_from_transfer()   # ensure never stuck paused
                         monitor.reset_signal()
@@ -1306,6 +1533,7 @@ def do_ab_eval(
                     # Wait for the previous episode's saves to finish. Joining
                     # AFTER go_home lets saves run in parallel with the arm
                     # return, cutting the inter-episode dead time.
+                    _join_wait = 0.0
                     if _pending_save is not None:
                         _t0 = _time.perf_counter()
                         _pending_save.join()
@@ -1314,8 +1542,27 @@ def do_ab_eval(
                         if _join_wait > 0.5:
                             print(f"  [saves] waited {_join_wait:.1f}s for background saves to finish")
 
+                    # ── INTER-EPISODE TIMING ───────────────────────────────────
+                    if _t_data_end is not None:
+                        _inter_gap = _time.perf_counter() - _t_data_end
+                        print(
+                            f"  [INTER-EP] dead time = {_inter_gap:.2f}s  "
+                            f"(go_home={_timings.get('go_home', 0.0):.2f}s  "
+                            f"save_wait={_join_wait:.2f}s  "
+                            f"other={_inter_gap - _timings.get('go_home', 0.0) - _join_wait:.2f}s)"
+                        )
+
                     print(f"\n  Episode {i + 1}/{num_episodes} — "
                           f"Policy {label} (ep {counts[label]} for {label})")
+
+                    # Episode timeline starts here — after go_home + save_wait —
+                    # so all marks/spans are relative to recording start, not
+                    # loop-iteration start.  go_home and save_wait overhead is
+                    # reported in the [INTER-EP] console print instead.
+                    if timeline is not None:
+                        timeline.episode_start(i + 1)
+                        if monitor:
+                            timeline.mark_monitor_reset()
 
                     # Per-episode watcher thread: ends episode early if struggling.
                     # Started AFTER go_home so stale frames in the rolling buffer
@@ -1330,11 +1577,16 @@ def do_ab_eval(
 
                     # ── RUN EPISODE ───────────────────────────────────────────
                     # record_loop runs at 30 Hz: read obs -> policy forward pass
-                    # -> send action -> store frame. Exits when control_time_s
-                    # is reached or events["exit_early"] is set (d or q key).
+                    # -> send action -> store frame. Exits when motion_robot
+                    # fires exit_early (episode_time_s after first action) or
+                    # events["exit_early"] is set (d / q key / struggle monitor).
+                    # control_time_s is a 5 s safety ceiling only — covers the
+                    # max realistic first-inference latency; keeps inter-episode
+                    # idle time negligible if the motion timer fails to fire.
                     _t0 = _time.perf_counter()
+                    _tl_rec_a = timeline.span_start("phase", "record_A", _TL_COLORS["record_A"]) if timeline else None
                     record_loop(
-                        robot=robot,
+                        robot=motion_robot,
                         events=events,
                         fps=30,
                         teleop_action_processor=teleop_action_processor,
@@ -1344,11 +1596,27 @@ def do_ab_eval(
                         preprocessor=pre,
                         postprocessor=post,
                         dataset=dataset,
-                        control_time_s=episode_time_s,
+                        control_time_s=episode_time_s + 5,
                         single_task=single_task,
                         display_data=True,
                     )
+                    if timeline is not None:
+                        timeline.span_end(_tl_rec_a)
+                        # Close motion_active span if timer didn't fire
+                        # (episode ended early via auto_switch / d-key).
+                        # Must be done here while _cur still points to this episode.
+                        motion_robot.close_motion_span()
                     _timings[f"record_loop_{label}"] = _time.perf_counter() - _t0
+                    _t_data_end = _time.perf_counter()   # data collection finished for A
+                    if stats_queue is not None:
+                        try:
+                            stats_queue.put_nowait({
+                                "ep_stopped":     True,
+                                "elapsed":        _timings[f"record_loop_{label}"],
+                                "episode_time_s": episode_time_s,
+                            })
+                        except Exception:
+                            pass
 
                     # Stop watcher thread and collect episode stats.
                     if monitor:
@@ -1370,8 +1638,11 @@ def do_ab_eval(
                                 "  [VoteWait] S above threshold — waiting for in-flight vote...",
                                 flush=True,
                             )
+                            _tl_vote_wait = timeline.span_start("monitor", "vote_wait", _TL_COLORS["vote_wait"]) if timeline else None
                             while monitor.is_vote_in_flight() and _time.perf_counter() < _vote_deadline:
                                 _time.sleep(0.15)
+                            if timeline is not None:
+                                timeline.span_end(_tl_vote_wait)
                             if monitor.is_struggling():
                                 events["auto_switched"] = True
                                 print("  [VoteWait] Vote landed → INTERRUPT — switching to B.")
@@ -1394,10 +1665,14 @@ def do_ab_eval(
                         if switch_duration > 0:
                             b_time_s = switch_duration
                         else:
-                            elapsed_ep = _time.perf_counter() - _t_ep_start
-                            b_time_s = max(20.0, episode_time_s - elapsed_ep)
+                            # Use actual A-phase recording duration (not loop wall
+                            # time which includes go_home + save_wait overhead).
+                            a_recorded = _timings.get(f"record_loop_{label}", 0.0)
+                            b_time_s = max(20.0, episode_time_s - a_recorded)
                         print(f"\n  [AutoSwitch] Policy B intervening for {b_time_s:.0f}s "
                               f"from current position...")
+                        if timeline is not None:
+                            timeline.mark_auto_switch()
                         label_ref[0] = "B"
                         if monitor:
                             monitor.set_thresholds(_thresholds_b)
@@ -1425,6 +1700,7 @@ def do_ab_eval(
                             monitor.suppress_judges(True)   # no votes needed after switch
                             monitor.resume_from_transfer()  # allow S+GUI updates during B's run
                         _t0 = _time.perf_counter()
+                        _tl_rec_b = timeline.span_start("phase", "record_B", _TL_COLORS["record_B"]) if timeline else None
                         record_loop(
                             robot=robot,
                             events=events,
@@ -1440,7 +1716,10 @@ def do_ab_eval(
                             single_task=single_task,
                             display_data=True,
                         )
+                        if timeline is not None:
+                            timeline.span_end(_tl_rec_b)
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
+                        _t_data_end = _time.perf_counter()   # data collection finished for B
                         # Keep label_ref as "B" until the next episode iteration
                         # sets it to "A" together with reset_signal + chart reset.
                         # Flipping early makes the display loop push cyan (A) with
@@ -1478,9 +1757,9 @@ def do_ab_eval(
                         _ds=_sv_dataset, _lbl=_sv_label, _ep=_sv_ep_state,
                         _sw=_sv_switch_pol, _idx=_sv_ep_idx,
                     ):
-                        # B's frames
-                        if _b:
-                            _time.sleep(2.5)
+                        def _save_b():
+                            if not _b:
+                                return
                             if _bf:
                                 dataset_b.save_episode()
                                 if stats_csv and monitor:
@@ -1490,32 +1769,47 @@ def do_ab_eval(
                                 print("  WARNING: Policy B collected no frames — skipping save.")
                                 if dataset_b.episode_buffer is not None:
                                     dataset_b.clear_episode_buffer()
-                        # A's frames
-                        _time.sleep(2.5)
-                        a_ok = _ds.episode_buffer is not None and _ds.episode_buffer.get("size", 0) > 0
-                        if a_ok:
-                            if _sw:
-                                # 'q' pressed mid-episode: copy to OTHER dataset too.
-                                _other_lbl = "B" if _lbl == "A" else "A"
-                                _other_ds  = dataset_b if _lbl == "A" else dataset_a
-                                n_copied = _duplicate_buffer(_ds, _other_ds)
-                                print(f"  [switch] Saving {n_copied} frames to both datasets.")
-                                _ds.save_episode()
-                                _other_ds.save_episode()
-                                if stats_csv and monitor:
-                                    _append_episode_stats_ab(
-                                        stats_csv, _ds.num_episodes - 1, _lbl, _ep)
-                                    _append_episode_stats_ab(
-                                        stats_csv, _other_ds.num_episodes - 1, _other_lbl, _ep)
+
+                        def _save_a():
+                            a_ok = _ds.episode_buffer is not None and _ds.episode_buffer.get("size", 0) > 0
+                            if a_ok:
+                                if _sw:
+                                    # 'q' pressed mid-episode: copy to OTHER dataset too.
+                                    _other_lbl = "B" if _lbl == "A" else "A"
+                                    _other_ds  = dataset_b if _lbl == "A" else dataset_a
+                                    n_copied = _duplicate_buffer(_ds, _other_ds)
+                                    print(f"  [switch] Saving {n_copied} frames to both datasets.")
+                                    _ds.save_episode()
+                                    _other_ds.save_episode()
+                                    if stats_csv and monitor:
+                                        _append_episode_stats_ab(
+                                            stats_csv, _ds.num_episodes - 1, _lbl, _ep)
+                                        _append_episode_stats_ab(
+                                            stats_csv, _other_ds.num_episodes - 1, _other_lbl, _ep)
+                                else:
+                                    _ds.save_episode()
+                                    if stats_csv and monitor:
+                                        _append_episode_stats_ab(
+                                            stats_csv, _ds.num_episodes - 1, _lbl, _ep)
                             else:
-                                _ds.save_episode()
-                                if stats_csv and monitor:
-                                    _append_episode_stats_ab(
-                                        stats_csv, _ds.num_episodes - 1, _lbl, _ep)
+                                print(f"  WARNING: Episode {_idx} (Policy {_lbl}) collected no frames — skipping save.")
+                                if _ds.episode_buffer is not None:
+                                    _ds.clear_episode_buffer()
+
+                        # When there was a B intervention (and no q-switch), A
+                        # and B are independent datasets — save them in parallel.
+                        # The q-switch case uses _duplicate_buffer which touches
+                        # both datasets, so keep it sequential for safety.
+                        if _b and not _sw:
+                            t_b = threading.Thread(target=_save_b)
+                            t_a = threading.Thread(target=_save_a)
+                            t_b.start()
+                            t_a.start()
+                            t_b.join()
+                            t_a.join()
                         else:
-                            print(f"  WARNING: Episode {_idx} (Policy {_lbl}) collected no frames — skipping save.")
-                            if _ds.episode_buffer is not None:
-                                _ds.clear_episode_buffer()
+                            _save_b()
+                            _save_a()
 
                     _pending_save = threading.Thread(target=_bg_saves, daemon=True)
                     _pending_save.start()
@@ -1523,6 +1817,8 @@ def do_ab_eval(
                     _t_ep_total = _time.perf_counter() - _t_ep_start
                     _timing_str = "  ".join(f"{k}={v:.1f}s" for k, v in _timings.items())
                     print(f"  [TIMING ep {i+1}] total={_t_ep_total:.1f}s  |  {_timing_str}  (saves async)")
+                    if timeline is not None:
+                        timeline.episode_end(i + 1)
 
                     # ── FLIP POLICY IF q WAS PRESSED OR MONITOR TRIGGERED ─────
                     if events["switch_policy"]:
@@ -1558,6 +1854,8 @@ def do_ab_eval(
         # Must be called on both so neither dataset is left incomplete.
         dataset_a.finalize()
         dataset_b.finalize()
+        if timeline is not None and not timeline.done.is_set():
+            timeline.plot()
 
 
 def simulate_ab_on_dataset(

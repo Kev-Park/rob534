@@ -318,17 +318,14 @@ Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one s
 
 # v2 — visual only: pure movement smoothness, no task-specific cues
 PROMPT_V2 = """You are watching a sequence of frames from a robot arm performing a task.
-Judge purely on the smoothness and quality of the arm's movement.
+You will vote is the gripper is holding the block.
 
 Vote struggling=true if:
-  - Movement is jerky, erratic, or oscillating
-  - The arm is making small repeated corrections without making clear progress
-  - The arm appears stuck, frozen, or going in circles
+  - The gripper is either picking up the block ot holding the block. 
 
 Vote struggling=false if:
-  - Movement is smooth, fluid, and deliberate
-  - The arm is making clear, continuous progress toward a goal
-
+  - The gripper is not hodling any objects and making no attempts to pick up. 
+  
 Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
 """
 
@@ -489,14 +486,18 @@ def assess_interrupt(
     model: str = "gemini-2.5-flash",
     jpeg_quality: int = 75,
     temperature: float = 0.40,
+    prompt: str | None = None,
 ) -> dict:
     """Single-judge binary struggle assessment.
 
-    Sends frames to Gemini using STRUGGLE_PROMPT at the given temperature.
+    Sends frames to Gemini using STRUGGLE_PROMPT (or a custom prompt) at the
+    given temperature.
 
     Args:
         temperature: Controls judge conservatism. Low (0.1) = fires only on
             clear failures. High (0.7) = fires on borderline cases too.
+        prompt: Override the module-level STRUGGLE_PROMPT. Pass None to use
+            the default.
 
     Returns:
         {"struggling": bool, "confidence": float, "reason": str}
@@ -508,7 +509,7 @@ def assess_interrupt(
     if not parts:
         return _DEFAULT_SIGNAL.copy()
 
-    parts.append(types.Part.from_text(text=STRUGGLE_PROMPT))
+    parts.append(types.Part.from_text(text=prompt if prompt is not None else STRUGGLE_PROMPT))
 
     response = client.models.generate_content(
         model=model,
@@ -528,6 +529,7 @@ def assess_interrupt_panel(
     model: str = "gemini-2.5-flash",
     jpeg_quality: int = 75,
     temperatures: tuple[float, ...] = JUDGE_TEMPERATURES,
+    prompt: str | None = None,
 ) -> dict:
     """Panel of N judges voting in parallel on whether to interrupt.
 
@@ -544,11 +546,16 @@ def assess_interrupt_panel(
     if not frames:
         return _DEFAULT_INTERRUPT.copy()
 
+    # Each judge gets its own genai.Client so concurrent threads never share
+    # the underlying httpx connection pool — sharing a single client causes
+    # race conditions where 2 of 3 judges silently fail.
+    api_key = client._api_client.api_key
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(temperatures)) as pool:
         future_to_temp = {
             pool.submit(
-                assess_interrupt, frames, client, model,
-                jpeg_quality, temp,
+                assess_interrupt, frames, genai.Client(api_key=api_key), model,
+                jpeg_quality, temp, prompt,
             ): temp
             for temp in temperatures
         }
@@ -560,8 +567,14 @@ def assess_interrupt_panel(
             except Exception as e:
                 print(f"[assess_interrupt_panel] judge temp={temp:.2f} failed: {e}")
 
+    n_expected = len(temperatures)
     if not ordered:
+        print(f"[assess_interrupt_panel] WARNING: all {n_expected} judges failed — returning default")
         return _DEFAULT_INTERRUPT.copy()
+    if len(ordered) < n_expected:
+        print(
+            f"[assess_interrupt_panel] WARNING: only {len(ordered)}/{n_expected} judges responded"
+        )
 
     ordered.sort(key=lambda x: x[0])   # stable order by temperature
     n = len(ordered)
@@ -753,6 +766,10 @@ class LiveStruggleMonitor:
         n_sample_frames:     Frames subsampled per panel call.
         fps:                 Camera frame rate (used for buffer sizing).
         interrupt_threshold: S score above which is_struggling() → True.
+        vote_dwell_s:        Seconds S must stay above threshold before a Gemini
+                             vote is fired.  0 (default) fires immediately.
+                             After a vote fires the timer resets, so the next
+                             vote requires another full dwell period.
         gripper_col_idx:     Index into observation.state for gripper position.
         gripper_threshold:   Degrees above which the gripper is considered closed.
     """
@@ -766,6 +783,7 @@ class LiveStruggleMonitor:
         n_sample_frames: int = 12,
         fps: float = 30.0,
         interrupt_threshold: float = 0.5,
+        vote_dwell_s: float = 0.0,
         score_mode: str = "mean",
         alpha_ramp_s: float = 10.0,
         warmup_s: float = 0.0,
@@ -773,14 +791,22 @@ class LiveStruggleMonitor:
         gripper_col_idx: int = 5,
         gripper_threshold: float = 20.0,
         thresholds: "Thresholds | None" = None,
+        struggle_prompt: str | None = None,
     ):
         self._thresholds     = thresholds   # None → pooled.json inside compute_struggle_score
+        self._prompt         = struggle_prompt  # None → module-level STRUGGLE_PROMPT
         self._client         = genai.Client(api_key=load_api_key(key_file))
         self._score_mode     = score_mode
         self._model          = model
         self._check_interval = check_interval
         self._n_sample       = int(n_sample_frames)
         self._threshold      = interrupt_threshold
+        # vote_dwell_s: S must stay above threshold for this many seconds before
+        # a Gemini vote fires.  0 fires immediately (legacy behaviour).
+        self._vote_dwell_s   = max(0.0, vote_dwell_s)
+        # Wall-clock time when S first exceeded the threshold in the current
+        # dwell window.  None means S is currently below threshold.
+        self._above_threshold_since: float | None = None
         # alpha_ramp_s > 0: linearly ramp alpha 0→1 over this many seconds so
         # the monitor cannot trigger in the first few seconds of an episode.
         # 0 disables the ramp (alpha = 1.0 always).
@@ -802,6 +828,18 @@ class LiveStruggleMonitor:
         # Flag to prevent overlapping Gemini calls — set True when a panel
         # call is in-flight, cleared when it completes or errors.
         self._gemini_in_flight: bool  = False
+        # Incremented each time a panel vote completes (result stored or error).
+        # External threads can watch this to detect new votes without polling
+        # _gemini_in_flight (which can flip too fast to catch reliably).
+        self._interrupt_seq: int      = 0
+
+        # Optional timeline recorder (AbEvalTimeline) — set via set_timeline().
+        self._tl                  = None
+        self._tl_warmup_span      = None   # open span for warmup lane
+        self._tl_dwell_span       = None   # open span for dwell lane
+        self._tl_vote_span        = None   # open span for vote_inflight lane
+        self._tl_status_span      = None   # open span for monitor_active / monitor_suppress
+        self._tl_metrics_started  = False  # True once metrics_start mark fired this episode
         # When True, S is still computed every check_interval but the Gemini
         # judge panel is skipped entirely.  Set during policy-B interventions
         # where a vote can't trigger anything and would just waste API quota.
@@ -854,6 +892,15 @@ class LiveStruggleMonitor:
         """True while a Gemini panel call is currently in-flight."""
         return self._gemini_in_flight
 
+    @property
+    def interrupt_seq(self) -> int:
+        """Monotonically increasing counter incremented after each completed vote.
+
+        Watchers can compare against a cached value to detect a new vote without
+        polling ``_gemini_in_flight`` (which can flip too fast to catch reliably).
+        """
+        return self._interrupt_seq
+
     def get_signal(self) -> dict:
         """Return the legacy signal dict: {struggling, confidence, reason}."""
         return self._signal.copy()
@@ -888,6 +935,10 @@ class LiveStruggleMonitor:
         """Return the accumulated episode state summary (safe to call at any time)."""
         return self._state_tracker.get_state()
 
+    def set_timeline(self, tl) -> None:
+        """Attach an AbEvalTimeline recorder. Pass None to detach."""
+        self._tl = tl
+
     def set_thresholds(self, thresholds: "Thresholds | None") -> None:
         """Swap the calibration thresholds used for S normalization.
 
@@ -895,6 +946,27 @@ class LiveStruggleMonitor:
         assignment atomic.  Pass None to fall back to pooled.json.
         """
         self._thresholds = thresholds
+
+    def note_first_action(self) -> None:
+        """Reset the episode clock to now so warmup/metrics count from first robot motion.
+
+        Call this when the robot sends its first action (via _MotionTimerRobot).
+        Without this, warmup starts from reset_signal() which fires during go_home
+        and save_wait, so metrics would start scoring before the robot has moved.
+        """
+        self._episode_start      = time.time()
+        self._tl_metrics_started = False   # warmup just restarted
+        # Reopen the warmup span at the correct time (first motion, not episode start).
+        tl = self._tl
+        if tl is not None:
+            from ab_eval_timeline import SPAN_COLORS
+            if self._tl_warmup_span is not None:
+                tl.span_end(self._tl_warmup_span)
+                self._tl_warmup_span = None
+            if self._warmup_s > 0:
+                self._tl_warmup_span = tl.span_start(
+                    "monitor", "warmup", SPAN_COLORS["warmup"]
+                )
 
     def suppress_judges(self, suppress: bool = True) -> None:
         """Enable or disable the Gemini judge panel.
@@ -904,6 +976,28 @@ class LiveStruggleMonitor:
         policy-B interventions where a vote can't trigger anything.
         """
         self._suppress_judges = suppress
+        tl = self._tl
+        if tl is None:
+            return
+        from ab_eval_timeline import SPAN_COLORS
+        if suppress:
+            tl.mark_monitor_suppress()
+            # Close active span and open suppress span
+            if self._tl_status_span is not None:
+                tl.span_end(self._tl_status_span)
+            self._tl_status_span = tl.span_start(
+                "monitor", "monitor_suppress", SPAN_COLORS["monitor_suppress"]
+            )
+        else:
+            tl.mark_monitor_resume()
+            # Close suppress span; reopen active only if past warmup
+            if self._tl_status_span is not None:
+                tl.span_end(self._tl_status_span)
+                self._tl_status_span = None
+            if self._tl_warmup_span is None:   # warmup already expired
+                self._tl_status_span = tl.span_start(
+                    "monitor", "monitor_active", SPAN_COLORS["monitor_active"]
+                )
 
     def reset_signal(self, keep_timer: bool = False) -> None:
         """Clear all signals, EMA score, frame buffer, and episode state.
@@ -927,6 +1021,22 @@ class LiveStruggleMonitor:
         self._state_tracker.reset()
         if not keep_timer:
             self._episode_start = time.time()
+
+        self._tl_metrics_started = False   # reset for new episode
+
+        # Close any spans left open from the previous episode.
+        # Warmup span is now opened in note_first_action() (when robot first
+        # moves), not here — so metrics count from first motion, not from
+        # episode start which includes go_home / save_wait dead time.
+        tl = self._tl
+        if tl is not None:
+            for attr in ("_tl_warmup_span", "_tl_dwell_span",
+                         "_tl_vote_span", "_tl_status_span"):
+                old = getattr(self, attr)
+                if old is not None:
+                    tl.span_end(old)
+                    setattr(self, attr, None)
+            tl.mark_monitor_reset()
 
     def pause_for_transfer(self) -> None:
         """Suspend Gemini polling during a policy transfer and clear stale state.
@@ -1049,6 +1159,21 @@ class LiveStruggleMonitor:
                         self._stop_event.wait(timeout=max(0.0, self._check_interval - elapsed))
                         continue
 
+                    # First iteration past warmup — close warmup span, mark
+                    # metrics_start, and open monitor_active span.
+                    if self._tl is not None and self._tl_warmup_span is not None:
+                        self._tl.span_end(self._tl_warmup_span)
+                        self._tl_warmup_span = None
+                    if self._tl is not None and not self._tl_metrics_started:
+                        self._tl_metrics_started = True
+                        self._tl.mark_metrics_start()
+                        # Open active span (green = judges ON) if not suppressed
+                        if not self._suppress_judges and self._tl_status_span is None:
+                            from ab_eval_timeline import SPAN_COLORS
+                            self._tl_status_span = self._tl.span_start(
+                                "monitor", "monitor_active", SPAN_COLORS["monitor_active"]
+                            )
+
                     score_result = compute_struggle_score(actions, states, thresholds=self._thresholds, score_mode=self._score_mode)
                     S = score_result["S"]
                     self._struggle_score  = S
@@ -1068,13 +1193,56 @@ class LiveStruggleMonitor:
                             f"  alpha={alpha_t:.2f}  S={S:.2f}"
                             f"  scaled={alpha_t * S:.2f} < {self._threshold}  (skipping Gemini)"
                         )
+                        self._above_threshold_since = None  # reset dwell when S falls below
+                        # Close dwell span if robot was dwelling above threshold
+                        if self._tl is not None and self._tl_dwell_span is not None:
+                            self._tl.span_end(self._tl_dwell_span)
+                            self._tl_dwell_span = None
                     elif not self._gemini_in_flight:
+                        # S is above threshold — enforce dwell before firing a vote
+                        if self._above_threshold_since is None:
+                            self._above_threshold_since = time.time()
+                            # Open dwell span on first threshold crossing
+                            if self._tl is not None and self._tl_dwell_span is None:
+                                from ab_eval_timeline import SPAN_COLORS
+                                self._tl_dwell_span = self._tl.span_start(
+                                    "vote", "dwell", SPAN_COLORS["dwell"]
+                                )
+                        dwell = time.time() - self._above_threshold_since
+                        if dwell < self._vote_dwell_s:
+                            remaining = self._vote_dwell_s - dwell
+                            print(
+                                f"[StruggleMonitor] dwell   t={ep_elapsed:.0f}s"
+                                f"  alpha={alpha_t:.2f}  S={S:.2f}"
+                                f"  scaled={alpha_t * S:.2f} >= {self._threshold}"
+                                f"  dwell={dwell:.2f}s / {self._vote_dwell_s:.2f}s"
+                                f"  (firing in {remaining:.2f}s)"
+                            )
+                            # Sleep exactly until dwell expires — not a full
+                            # check_interval — so the vote fires immediately
+                            # when the dwell period ends, not at the next
+                            # check_interval boundary.
+                            self._stop_event.wait(timeout=remaining)
+                            continue
+                        # Dwell satisfied — reset timer so next vote needs another full dwell
+                        self._above_threshold_since = None
+                        # Close dwell span (vote is about to fire)
+                        if self._tl is not None and self._tl_dwell_span is not None:
+                            self._tl.span_end(self._tl_dwell_span)
+                            self._tl_dwell_span = None
+                    if not self._gemini_in_flight and not self._suppress_judges and alpha_t * S >= self._threshold:
                         # Fire the panel asynchronously so _run never blocks on
                         # Gemini. S checks continue every check_interval regardless
                         # of how long the API takes to respond.
                         frames         = self._subsample(buf, self._n_sample)
                         epoch_snapshot = self._transfer_epoch
                         self._gemini_in_flight = True
+                        # Open vote_inflight span
+                        if self._tl is not None and self._tl_vote_span is None:
+                            from ab_eval_timeline import SPAN_COLORS
+                            self._tl_vote_span = self._tl.span_start(
+                                "vote", "vote_inflight", SPAN_COLORS["vote_inflight"]
+                            )
 
                         def _gemini_worker(frames=frames, epoch=epoch_snapshot,
                                            S=S, ep_t=ep_elapsed):
@@ -1082,6 +1250,7 @@ class LiveStruggleMonitor:
                                 result = assess_interrupt_panel(
                                     frames, self._client, self._model,
                                     temperatures=self._temperatures,
+                                    prompt=self._prompt,
                                 )
                                 if not self._transfer_active.is_set() and self._transfer_epoch == epoch:
                                     prev_p = self._interrupt.get("interrupt_probability", 0.0)
@@ -1107,6 +1276,13 @@ class LiveStruggleMonitor:
                             except Exception as e:
                                 print(f"[StruggleMonitor] Gemini error: {e}")
                             finally:
+                                # Close vote_inflight span and mark result
+                                if self._tl is not None:
+                                    if self._tl_vote_span is not None:
+                                        self._tl.span_end(self._tl_vote_span)
+                                        self._tl_vote_span = None
+                                    self._tl.mark_vote_result(self.is_struggling())
+                                self._interrupt_seq += 1
                                 self._gemini_in_flight = False
 
                         threading.Thread(target=_gemini_worker, daemon=True).start()
