@@ -1585,21 +1585,33 @@ def do_ab_eval(
                     # idle time negligible if the motion timer fails to fire.
                     _t0 = _time.perf_counter()
                     _tl_rec_a = timeline.span_start("phase", "record_A", _TL_COLORS["record_A"]) if timeline else None
-                    record_loop(
-                        robot=motion_robot,
-                        events=events,
-                        fps=30,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        policy=policy,
-                        preprocessor=pre,
-                        postprocessor=post,
-                        dataset=dataset,
-                        control_time_s=episode_time_s + 5,
-                        single_task=single_task,
-                        display_data=True,
-                    )
+                    _camera_dead = False
+                    try:
+                        record_loop(
+                            robot=motion_robot,
+                            events=events,
+                            fps=30,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            policy=policy,
+                            preprocessor=pre,
+                            postprocessor=post,
+                            dataset=dataset,
+                            control_time_s=episode_time_s + 5,
+                            single_task=single_task,
+                            display_data=True,
+                        )
+                    except RuntimeError as _cam_err:
+                        if "read thread is not running" in str(_cam_err):
+                            print(
+                                f"\n  [CameraError] Camera lost during A recording — "
+                                f"saving partial data and stopping. ({_cam_err})",
+                                flush=True,
+                            )
+                            _camera_dead = True
+                        else:
+                            raise
                     if timeline is not None:
                         timeline.span_end(_tl_rec_a)
                         # Close motion_active span if timer didn't fire
@@ -1617,6 +1629,29 @@ def do_ab_eval(
                             })
                         except Exception:
                             pass
+                    if _camera_dead:
+                        # Camera hardware lost — stop watcher, save whatever was
+                        # recorded, close the timeline episode, and exit gracefully.
+                        if monitor:
+                            watcher_stop.set()
+                        _a_frames = (
+                            dataset.episode_buffer is not None
+                            and dataset.episode_buffer.get("size", 0) > 0
+                        )
+                        if _a_frames:
+                            print(
+                                f"  [CameraError] Saving {dataset.episode_buffer['size']} "
+                                f"partial frames from episode {i + 1}.",
+                                flush=True,
+                            )
+                            dataset.save_episode()
+                        else:
+                            print("  [CameraError] No frames collected — skipping save.", flush=True)
+                            if dataset.episode_buffer is not None:
+                                dataset.clear_episode_buffer()
+                        if timeline is not None:
+                            timeline.episode_end(i + 1)
+                        break
 
                     # Stop watcher thread and collect episode stats.
                     if monitor:
@@ -1701,21 +1736,33 @@ def do_ab_eval(
                             monitor.resume_from_transfer()  # allow S+GUI updates during B's run
                         _t0 = _time.perf_counter()
                         _tl_rec_b = timeline.span_start("phase", "record_B", _TL_COLORS["record_B"]) if timeline else None
-                        record_loop(
-                            robot=robot,
-                            events=events,
-                            fps=30,
-                            teleop_action_processor=teleop_action_processor,
-                            robot_action_processor=robot_action_processor,
-                            robot_observation_processor=robot_observation_processor,
-                            policy=policy_b,
-                            preprocessor=pre_b,
-                            postprocessor=post_b,
-                            dataset=dataset_b,
-                            control_time_s=b_time_s,
-                            single_task=single_task,
-                            display_data=True,
-                        )
+                        _camera_dead = False
+                        try:
+                            record_loop(
+                                robot=robot,
+                                events=events,
+                                fps=30,
+                                teleop_action_processor=teleop_action_processor,
+                                robot_action_processor=robot_action_processor,
+                                robot_observation_processor=robot_observation_processor,
+                                policy=policy_b,
+                                preprocessor=pre_b,
+                                postprocessor=post_b,
+                                dataset=dataset_b,
+                                control_time_s=b_time_s,
+                                single_task=single_task,
+                                display_data=True,
+                            )
+                        except RuntimeError as _cam_err:
+                            if "read thread is not running" in str(_cam_err):
+                                print(
+                                    f"\n  [CameraError] Camera lost during B recording — "
+                                    f"saving partial data and stopping. ({_cam_err})",
+                                    flush=True,
+                                )
+                                _camera_dead = True
+                            else:
+                                raise
                         if timeline is not None:
                             timeline.span_end(_tl_rec_b)
                         _timings["record_loop_B_intervention"] = _time.perf_counter() - _t0
@@ -1739,6 +1786,35 @@ def do_ab_eval(
                         # clear the auto_switched flag so the flip logic below
                         # doesn't also trigger
                         events["auto_switched"] = False
+                        if _camera_dead:
+                            # Save whatever B frames were collected, then stop.
+                            _b_frames_partial = (
+                                dataset_b.episode_buffer is not None
+                                and dataset_b.episode_buffer.get("size", 0) > 0
+                            )
+                            if _b_frames_partial:
+                                print(
+                                    f"  [CameraError] Saving {dataset_b.episode_buffer['size']} "
+                                    f"partial B frames from episode {i + 1}.",
+                                    flush=True,
+                                )
+                                dataset_b.save_episode()
+                            else:
+                                print("  [CameraError] No B frames collected — skipping save.", flush=True)
+                                if dataset_b.episode_buffer is not None:
+                                    dataset_b.clear_episode_buffer()
+                            # Also save A frames (already collected before B started).
+                            _a_frames_ok = (
+                                dataset.episode_buffer is not None
+                                and dataset.episode_buffer.get("size", 0) > 0
+                            )
+                            if _a_frames_ok:
+                                dataset.save_episode()
+                            elif dataset.episode_buffer is not None:
+                                dataset.clear_episode_buffer()
+                            if timeline is not None:
+                                timeline.episode_end(i + 1)
+                            break
 
                     # ── SAVE EPISODES (background) ────────────────────────────
                     # Capture everything the thread needs by value so the next
@@ -1845,8 +1921,11 @@ def do_ab_eval(
         # Ensure any in-flight background save completes before finalize().
         if _pending_save is not None:
             _pending_save.join()
-        # Park arm at home and clean up regardless of how the run ended.
-        _go_home_with_robot(robot)
+        # Park arm at home — camera may be dead so suppress read errors here.
+        try:
+            _go_home_with_robot(robot)
+        except Exception as _e:
+            print(f"  [cleanup] go_home failed ({_e}); skipping.")
         robot.disconnect()
         listener.stop()
         switch_listener.stop()
