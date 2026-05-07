@@ -561,19 +561,35 @@ if __name__ == "__main__":
     # ── Live A/B eval on real robot ───────────────────────────────────────────
     from ab_eval import do_ab_eval
     from ab_eval_timeline import AbEvalTimeline
+    from struggle_monitor import PROMPT_V1, PROMPT_V2, STRUGGLE_PROMPT
 
     _THRESHOLDS = _BASE / "thresholds"
     _timeline = AbEvalTimeline(
         n_episodes=args.episodes,
         out_path=str(_BASE / "ab_eval_timeline.png"),
     )
+
+    PROMPT = """You are watching a sequence of frames from a robot arm performing a task.
+                You will vote is the gripper is holding the block.
+                
+                Vote struggling=true if:
+                  - The gripper is either picking up the block ot holding the block. 
+                
+                Vote struggling=false if:
+                  - The gripper is not hodling any objects and making no attempts to pick up. 
+                  
+                Return ONLY JSON with fields: struggling (bool), confidence (0-1), reason (one sentence).
+                """
+
+
+
     do_ab_eval(
         policy_path_a=resolve_policy_path("SkywalkerLi/smolvla-aug"),
         policy_path_b=resolve_policy_path("SkywalkerLi/smolvla-phase-split-new-prompts"),
         repo_id_a="Rollout/smolvla-aug_policyA",
         repo_id_b="Rollout/smolvla-phase-split-new-prompts_policyB",
         single_task="Grab thok. e cube and drop it",
-        num_episodes=5,
+        num_episodes=100,
         episode_time_s=60,
         use_struggle_monitor=True,
         auto_switch=True,
@@ -588,6 +604,7 @@ if __name__ == "__main__":
         struggle_thresholds_b=str(_THRESHOLDS / "eval_smolvla-phase-split-new-prompts.json"),
         switch_duration=0,
         struggle_vote_dwell_s=0.1,
+        struggle_prompt=PROMPT,
         stats_csv=str(_BASE / "ab_eval_stats.csv"),
         timeline=_timeline,
     )
